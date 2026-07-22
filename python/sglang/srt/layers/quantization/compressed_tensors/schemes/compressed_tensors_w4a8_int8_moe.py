@@ -35,7 +35,8 @@ class NPUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
         self.is_per_channel_weight = self.group_size == 0
         self.tp_size = 1
         self.activation_use_clip = (
-            quantization_config.get("config_groups", {})
+            (quantization_config.config or {})
+            .get("config_groups", {})
             .get("group_1", {})
             .get("activation_use_clip", False)
         )
