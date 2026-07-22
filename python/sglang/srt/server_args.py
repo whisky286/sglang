@@ -1036,6 +1036,14 @@ class ServerArgs:
         Optional[float],
         "Set soft watchdog timeout in seconds. If a forward batch takes longer than this, the server will dump information for debugging.",
     ] = None
+    enable_fault_tolerance: A[
+        bool,
+        "Enable the experimental fault-tolerance control endpoints.",
+    ] = False
+    fault_tolerance_timeout: A[
+        float,
+        "Timeout in seconds for a fault-tolerance control command.",
+    ] = 10.0
     sleep_on_idle: A[bool, "Reduce CPU usage when sglang is idle."] = False
     use_ray: A[bool, "Use Ray actors for scheduler process management."] = False
     custom_sigquit_handler: Optional[Callable] = None
@@ -2971,6 +2979,8 @@ class ServerArgs:
 
         # Handle data parallelism.
         self._handle_data_parallelism()
+
+        self._handle_fault_tolerance()
 
         # Normalize load balancing defaults.
         self._handle_load_balance_method()
@@ -5481,6 +5491,26 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import _dp_lm_head_validation
 
         run_post_process_pass(self, _dp_lm_head_validation)
+
+    def _handle_fault_tolerance(self):
+        if not self.enable_fault_tolerance:
+            return
+
+        assert (
+            self.fault_tolerance_timeout > 0
+        ), "--fault-tolerance-timeout must be greater than zero."
+        assert (
+            self.tokenizer_worker_num == 1
+        ), "Fault-tolerance control currently requires --tokenizer-worker-num 1."
+        assert (
+            not self.use_ray
+        ), "Fault-tolerance control currently does not support --use-ray."
+
+        # Each DP-attention leader must receive the command from DPC directly.
+        # A full TP-group broadcast would couple the control path to ranks that
+        # may be unavailable in the later compacted-view recovery stage.
+        if self._resolved().enable_dp_attention:
+            self.enable_dp_attention_local_control_broadcast = True
 
     def _handle_moe_kernel_config(self):
         # The quantization-driven runner resolutions moved to the pipeline

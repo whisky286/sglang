@@ -1622,6 +1622,17 @@ async def pause_generation(
     )
 
 
+@app.get("/fault_tolerance/status")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def fault_tolerance_status(request: Request):
+    """Query every original Scheduler rank through the existing control path."""
+
+    status_code, content = (
+        await _global_state.tokenizer_manager.fault_tolerance_status()
+    )
+    return ORJSONResponse(content=content, status_code=status_code)
+
+
 @app.post("/continue_generation")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def continue_generation(

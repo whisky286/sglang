@@ -1518,6 +1518,25 @@ class ContinueGenerationReqInput(BaseReq, kw_only=True):
     torch_empty_cache: bool = True
 
 
+class FaultToleranceCommandReqInput(BaseReq, kw_only=True):
+    """Read-only or state-changing command sent to selected original ranks."""
+
+    command_id: str
+    command: str
+    target_original_ranks: List[int]
+
+
+class FaultToleranceCommandReqOutput(BaseReq, kw_only=True):
+    """Per-rank acknowledgement for a fault-tolerance control command."""
+
+    command_id: str
+    command: str
+    original_rank: int
+    success: bool
+    engine_paused: bool
+    message: str = ""
+
+
 class TokenizerWorkerRegistrationReq(BaseReq, kw_only=True):
     """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
 

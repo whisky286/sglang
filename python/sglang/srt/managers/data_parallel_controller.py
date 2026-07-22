@@ -34,6 +34,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
     ElasticScaleUpdateReq,
+    FaultToleranceCommandReqInput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -230,6 +231,28 @@ class DataParallelController:
             if worker is not None:
                 sock_send(worker, obj)
 
+    def send_fault_tolerance_command(self, obj: FaultToleranceCommandReqInput):
+        """Send directly to selected DP leaders without a full-TP broadcast."""
+
+        sent_ranks = []
+        for original_rank in dict.fromkeys(obj.target_original_ranks):
+            if original_rank < 0 or original_rank >= len(self.workers):
+                logger.warning(
+                    "Ignore fault-tolerance command for invalid original rank %s",
+                    original_rank,
+                )
+                continue
+            worker = self.workers[original_rank]
+            if worker is not None and self.status[original_rank]:
+                sock_send(worker, obj)
+                sent_ranks.append(original_rank)
+        logger.info(
+            "[FaultTolerance][DPC] command=%s command_id=%s sent_ranks=%s",
+            obj.command,
+            obj.command_id,
+            sent_ranks,
+        )
+
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         if self.server_args.elastic_ep_backend is not None:
             if len(ranks.status) != self.max_dp_size:
@@ -349,6 +372,10 @@ class DataParallelController:
                 (BlockReqInput, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (
+                    FaultToleranceCommandReqInput,
+                    self.send_fault_tolerance_command,
+                ),
                 (
                     ElasticScaleUpdateReq,
                     lambda msg: self.add_elastic_workers(

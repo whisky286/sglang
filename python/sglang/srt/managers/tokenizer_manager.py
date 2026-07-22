@@ -53,6 +53,7 @@ from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.fault_tolerance import FaultToleranceManager
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -67,6 +68,7 @@ from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
     ElasticScaleUpdateReq,
     EmbeddingReqInput,
+    FaultToleranceCommandReqOutput,
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
@@ -307,6 +309,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init running status
         self.init_running_status()
+
+        self.fault_tolerance_manager = (
+            FaultToleranceManager(
+                original_world_size=server_args.dp_size,
+                command_timeout=server_args.fault_tolerance_timeout,
+                dispatch_command=self._dispatch_to_scheduler,
+            )
+            if server_args.enable_fault_tolerance
+            else None
+        )
 
         # Init logging and dumping
         self.init_request_logging_and_dumping()
@@ -614,6 +626,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (ConfigureLoggingReq, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
+                (
+                    FaultToleranceCommandReqOutput,
+                    self.handle_fault_tolerance_command_output,
+                ),
             ]
         )
         self.init_communicators(self.server_args)
@@ -1741,6 +1757,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if not is_locked:
                         break
                     await asyncio.sleep(1.0)
+
+    async def fault_tolerance_status(self) -> Tuple[int, dict]:
+        if self.fault_tolerance_manager is None:
+            return 503, {
+                "success": False,
+                "service_state": "DISABLED",
+                "last_error": "Start the server with --enable-fault-tolerance",
+            }
+
+        self.auto_create_handle_loop()
+        return await self.fault_tolerance_manager.status()
+
+    def handle_fault_tolerance_command_output(
+        self, output: FaultToleranceCommandReqOutput
+    ) -> None:
+        if self.fault_tolerance_manager is not None:
+            self.fault_tolerance_manager.handle_command_output(output)
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:

@@ -103,6 +103,8 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
+    FaultToleranceCommandReqInput,
+    FaultToleranceCommandReqOutput,
     FlushCacheReqInput,
     FreezeGCReq,
     GetInternalStateReq,
@@ -1411,6 +1413,10 @@ class Scheduler(
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (
+                    FaultToleranceCommandReqInput,
+                    self.handle_fault_tolerance_command,
+                ),
                 (ConfigureLoggingReq, self.configure_logging),
                 (ScaleElasticEPReqInput, self.handle_scale_elastic_ep),
                 (DumperControlReqInput, self.handle_dumper_control),
@@ -4272,6 +4278,40 @@ class Scheduler(
         ):
             self.disagg_decode_prealloc_queue.enqueue_held_rebootstrap()
         self._engine_paused = False
+
+    def handle_fault_tolerance_command(
+        self, recv_req: FaultToleranceCommandReqInput
+    ) -> Optional[FaultToleranceCommandReqOutput]:
+        """Return the local Scheduler state for a targeted A1 status query."""
+
+        original_rank = self.ps.dp_rank if self.ps.dp_rank is not None else 0
+        if original_rank not in recv_req.target_original_ranks:
+            return None
+
+        if recv_req.command != "status":
+            return FaultToleranceCommandReqOutput(
+                command_id=recv_req.command_id,
+                command=recv_req.command,
+                original_rank=original_rank,
+                success=False,
+                engine_paused=self._engine_paused,
+                message=f"Unsupported fault-tolerance command: {recv_req.command}",
+            )
+
+        logger.info(
+            "[FaultTolerance][Scheduler] status ack command_id=%s "
+            "original_rank=%s engine_paused=%s",
+            recv_req.command_id,
+            original_rank,
+            self._engine_paused,
+        )
+        return FaultToleranceCommandReqOutput(
+            command_id=recv_req.command_id,
+            command=recv_req.command,
+            original_rank=original_rank,
+            success=True,
+            engine_paused=self._engine_paused,
+        )
 
     def handle_scale_elastic_ep(
         self, recv_req: ScaleElasticEPReqInput
