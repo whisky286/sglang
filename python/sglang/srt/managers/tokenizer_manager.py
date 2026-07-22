@@ -68,6 +68,7 @@ from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
     ElasticScaleUpdateReq,
     EmbeddingReqInput,
+    FaultToleranceApplyReqInput,
     FaultToleranceCommandReqOutput,
     FaultToleranceInjectReqInput,
     FaultToleranceRecoverableErrorOutput,
@@ -1800,10 +1801,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not self.server_args.enable_fault_tolerance_test_injection:
             return 403, {
                 "success": False,
-                "last_error": (
-                    "Start the server with "
-                    "--enable-fault-tolerance-test-injection"
-                ),
+                "last_error": "Enable fault-tolerance test injection at startup",
             }
         if self.rid_to_state:
             return 409, {
@@ -1819,6 +1817,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             original_rank=obj.original_rank,
             request_id=obj.request_id,
         )
+
+    async def fault_tolerance_apply(
+        self, obj: FaultToleranceApplyReqInput
+    ) -> Tuple[int, dict]:
+        if self.fault_tolerance_manager is None:
+            return 503, {
+                "success": False,
+                "action": obj.action,
+                "last_error": "Start the server with --enable-fault-tolerance",
+            }
+        if obj.action != "retry":
+            return 400, {
+                "success": False,
+                "action": obj.action,
+                "last_error": f"Unsupported fault-tolerance action: {obj.action}",
+            }
+
+        self.auto_create_handle_loop()
+        return await self.fault_tolerance_manager.apply_retry()
 
     def handle_fault_tolerance_command_output(
         self, output: FaultToleranceCommandReqOutput

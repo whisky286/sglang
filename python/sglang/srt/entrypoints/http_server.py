@@ -120,6 +120,7 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DumperControlReqInput,
     EmbeddingReqInput,
+    FaultToleranceApplyReqInput,
     FaultToleranceInjectReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
@@ -1645,6 +1646,19 @@ async def fault_tolerance_inject_recoverable_error(
         await _global_state.tokenizer_manager.fault_tolerance_inject_recoverable_error(
             obj
         )
+    )
+    return ORJSONResponse(content=content, status_code=status_code)
+
+
+@app.post("/fault_tolerance/apply")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def fault_tolerance_apply(
+    obj: Annotated[FaultToleranceApplyReqInput, Body()], request: Request
+):
+    """Apply a coordinated fault-tolerance action."""
+
+    status_code, content = await _global_state.tokenizer_manager.fault_tolerance_apply(
+        obj
     )
     return ORJSONResponse(content=content, status_code=status_code)
 

@@ -4386,6 +4386,50 @@ class Scheduler(
                 engine_paused=self._engine_paused,
             )
 
+        if recv_req.command == "retry":
+            if not self._engine_paused:
+                return FaultToleranceCommandReqOutput(
+                    command_id=recv_req.command_id,
+                    command=recv_req.command,
+                    original_rank=original_rank,
+                    success=False,
+                    engine_paused=False,
+                    message="Scheduler must be paused before retry",
+                )
+            try:
+                self.continue_generation(
+                    ContinueGenerationReqInput(torch_empty_cache=False)
+                )
+            except Exception as exc:
+                logger.exception(
+                    "[FaultTolerance][Scheduler] retry failed command_id=%s "
+                    "original_rank=%s",
+                    recv_req.command_id,
+                    original_rank,
+                )
+                return FaultToleranceCommandReqOutput(
+                    command_id=recv_req.command_id,
+                    command=recv_req.command,
+                    original_rank=original_rank,
+                    success=False,
+                    engine_paused=self._engine_paused,
+                    message=str(exc),
+                )
+
+            logger.info(
+                "[FaultTolerance][Scheduler] retry ack command_id=%s "
+                "original_rank=%s",
+                recv_req.command_id,
+                original_rank,
+            )
+            return FaultToleranceCommandReqOutput(
+                command_id=recv_req.command_id,
+                command=recv_req.command,
+                original_rank=original_rank,
+                success=True,
+                engine_paused=self._engine_paused,
+            )
+
         return FaultToleranceCommandReqOutput(
             command_id=recv_req.command_id,
             command=recv_req.command,

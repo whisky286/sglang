@@ -180,6 +180,93 @@ class FaultToleranceManager:
             "last_error": "; ".join(errors) if errors else None,
         }
 
+    async def apply_retry(self) -> Tuple[int, dict]:
+        """Resume every original rank without changing topology or resources."""
+
+        transition = self.last_transition or {}
+        if not self.admission_closed:
+            return 409, {
+                "success": False,
+                "action": "retry",
+                "last_error": "Inference admission is not closed",
+            }
+        if self.armed_injection is not None:
+            return 409, {
+                "success": False,
+                "action": "retry",
+                "last_error": "A recoverable error injection is still armed",
+            }
+        if (
+            transition.get("command") != "pause"
+            or transition.get("state") != "SUCCEEDED"
+        ):
+            return 409, {
+                "success": False,
+                "action": "retry",
+                "last_error": "All original ranks must confirm pause before retry",
+            }
+
+        self.last_transition = {
+            "command": "retry",
+            "state": "PENDING",
+        }
+        command_id, pending, timed_out, dispatch_error = await self._execute_command(
+            command="retry",
+            target_original_ranks=self.original_ranks,
+        )
+        missing_ranks = sorted(
+            pending.target_original_ranks.difference(pending.outputs)
+        )
+        failed_ranks = sorted(
+            rank for rank, output in pending.outputs.items() if not output.success
+        )
+        success = (
+            not missing_ranks
+            and not failed_ranks
+            and dispatch_error is None
+            and not timed_out
+        )
+        errors = []
+        if dispatch_error is not None:
+            errors.append(dispatch_error)
+        if timed_out:
+            errors.append(
+                f"Timed out waiting for retry ack from original ranks {missing_ranks}"
+            )
+        if failed_ranks:
+            errors.append(f"Retry command failed on original ranks {failed_ranks}")
+
+        self.last_transition = {
+            "command": "retry",
+            "command_id": command_id,
+            "state": "SUCCEEDED" if success else "FAILED",
+            "acknowledged_ranks": sorted(pending.outputs),
+            "missing_ranks": missing_ranks,
+            "failed_ranks": failed_ranks,
+            "last_error": "; ".join(errors) if errors else None,
+        }
+        if success:
+            # Keep admission closed until every original rank has acknowledged
+            # that its existing runtime is ready to run again.
+            self.admission_closed = False
+
+        logger.info(
+            "[FaultTolerance] finish retry command_id=%s state=%s "
+            "acknowledged_ranks=%s",
+            command_id,
+            self.last_transition["state"],
+            self.last_transition["acknowledged_ranks"],
+        )
+        return (200 if success else 503), {
+            "success": success,
+            "action": "retry",
+            "command_id": command_id,
+            "acknowledged_ranks": sorted(pending.outputs),
+            "missing_ranks": missing_ranks,
+            "failed_ranks": failed_ranks,
+            "last_error": "; ".join(errors) if errors else None,
+        }
+
     def handle_recoverable_error(
         self, output: FaultToleranceRecoverableErrorOutput
     ) -> None:
@@ -256,7 +343,9 @@ class FaultToleranceManager:
             and routed_dp_rank == self.armed_injection["original_rank"]
         ):
             return None
-        return "A fault-injection experiment is armed; only its target request is allowed."
+        return (
+            "A fault-injection experiment is armed; only its target request is allowed."
+        )
 
     async def _pause_after_recoverable_error(self, event_id: str) -> None:
         command_id, pending, timed_out, dispatch_error = await self._execute_command(
@@ -432,10 +521,13 @@ class FaultToleranceManager:
         transition_state = (
             self.last_transition.get("state") if self.last_transition else None
         )
+        transition_command = (
+            self.last_transition.get("command") if self.last_transition else None
+        )
         if self.admission_closed and transition_state == "FAILED":
             service_state = "FAIL_STOP"
         elif self.admission_closed and transition_state == "PENDING":
-            service_state = "PAUSING"
+            service_state = "RESUMING" if transition_command == "retry" else "PAUSING"
         elif self.admission_closed and complete and paused_values != {True}:
             service_state = "INCONSISTENT"
         elif complete and paused_values == {False}:

@@ -1545,6 +1545,12 @@ class FaultToleranceInjectReqInput(BaseReq, kw_only=True):
     request_id: str
 
 
+class FaultToleranceApplyReqInput(BaseReq, kw_only=True):
+    """Apply one coordinated fault-tolerance control action."""
+
+    action: str
+
+
 class FaultToleranceRecoverableErrorOutput(BaseReq, kw_only=True):
     """A caught, recoverable Scheduler error reported to the control plane."""
 

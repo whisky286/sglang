@@ -12,6 +12,7 @@ from sglang.srt.managers.data_parallel_controller import DataParallelController
 from sglang.srt.managers.fault_tolerance import FaultToleranceManager
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    FaultToleranceApplyReqInput,
     FaultToleranceCommandReqInput,
     FaultToleranceCommandReqOutput,
     FaultToleranceRecoverableErrorOutput,
@@ -150,6 +151,8 @@ class TestFaultToleranceControlRouting(CustomTestCase):
         self.assertEqual(msgpack_decode(msgpack_encode(request)), request)
         self.assertEqual(msgpack_decode(msgpack_encode(output)), output)
         self.assertEqual(msgpack_decode(msgpack_encode(event)), event)
+        apply_request = FaultToleranceApplyReqInput(action="retry")
+        self.assertEqual(msgpack_decode(msgpack_encode(apply_request)), apply_request)
 
     def test_dpc_routes_only_to_available_target_original_ranks(self):
         controller = DataParallelController.__new__(DataParallelController)
@@ -302,9 +305,7 @@ class TestFaultToleranceCoordinatedPause(CustomTestCase):
         self.assertEqual(body["last_fault"]["request_id"], "a2-request")
         self.assertEqual(body["last_transition"]["command"], "pause")
         self.assertEqual(body["last_transition"]["state"], "SUCCEEDED")
-        self.assertEqual(
-            body["last_transition"]["acknowledged_ranks"], [0, 1, 2, 3]
-        )
+        self.assertEqual(body["last_transition"]["acknowledged_ranks"], [0, 1, 2, 3])
 
     def test_armed_injection_admits_only_the_exact_target_request(self):
         manager = self._new_manager(lambda _request: None)
@@ -366,9 +367,7 @@ class TestFaultToleranceCoordinatedPause(CustomTestCase):
         self.assertEqual(event.original_rank, 1)
         self.assertEqual(event.request_id, "a2-request")
         self.assertIsNone(
-            scheduler._maybe_inject_recoverable_error(
-                SimpleNamespace(rid="a2-request")
-            )
+            scheduler._maybe_inject_recoverable_error(SimpleNamespace(rid="a2-request"))
         )
 
     def test_scheduler_pause_ack_happens_after_pause_and_abort(self):
@@ -394,6 +393,135 @@ class TestFaultToleranceCoordinatedPause(CustomTestCase):
         scheduler.pause_generation.assert_called_once()
         scheduler.abort_request.assert_called_once()
         self.assertTrue(scheduler.abort_request.call_args.args[0].abort_all)
+
+
+class TestFaultToleranceRetry(CustomTestCase):
+    def _new_manager(self, dispatch, timeout: float = 0.02):
+        manager = FaultToleranceManager(
+            original_world_size=4,
+            command_timeout=timeout,
+            dispatch_command=dispatch,
+        )
+        manager.admission_closed = True
+        manager.last_transition = {
+            "command": "pause",
+            "state": "SUCCEEDED",
+            "acknowledged_ranks": [0, 1, 2, 3],
+        }
+        return manager
+
+    def test_retry_opens_admission_only_after_every_rank_acknowledges(self):
+        async def scenario():
+            manager = None
+            requests = []
+
+            def dispatch(request):
+                requests.append(request)
+                if request.command == "retry":
+                    self.assertTrue(manager.admission_closed)
+                    for rank in request.target_original_ranks:
+                        manager.handle_command_output(
+                            _ack(request, rank, engine_paused=False)
+                        )
+                elif request.command == "status":
+                    for rank in request.target_original_ranks:
+                        manager.handle_command_output(
+                            _ack(request, rank, engine_paused=False)
+                        )
+
+            manager = self._new_manager(dispatch)
+            retry_result = await manager.apply_retry()
+            status_result = await manager.status()
+            return manager, requests, retry_result, status_result
+
+        manager, requests, (retry_code, retry), (status_code, status) = asyncio.run(
+            scenario()
+        )
+
+        self.assertEqual(retry_code, 200)
+        self.assertTrue(retry["success"])
+        self.assertEqual(retry["acknowledged_ranks"], [0, 1, 2, 3])
+        self.assertEqual(requests[0].command, "retry")
+        self.assertEqual(requests[0].target_original_ranks, [0, 1, 2, 3])
+        self.assertFalse(manager.admission_closed)
+        self.assertEqual(manager.last_transition["command"], "retry")
+        self.assertEqual(manager.last_transition["state"], "SUCCEEDED")
+        self.assertEqual(status_code, 200)
+        self.assertEqual(status["service_state"], "HEALTHY")
+
+    def test_failed_retry_keeps_admission_closed(self):
+        manager = None
+
+        def dispatch(request):
+            for rank in request.target_original_ranks:
+                manager.handle_command_output(
+                    _ack(
+                        request,
+                        rank,
+                        success=(rank != 2),
+                        engine_paused=(rank == 2),
+                    )
+                )
+
+        manager = self._new_manager(dispatch, timeout=1.0)
+        status_code, body = asyncio.run(manager.apply_retry())
+
+        self.assertEqual(status_code, 503)
+        self.assertFalse(body["success"])
+        self.assertEqual(body["failed_ranks"], [2])
+        self.assertTrue(manager.admission_closed)
+        self.assertEqual(manager.last_transition["state"], "FAILED")
+
+    def test_retry_requires_a_successful_coordinated_pause(self):
+        manager = FaultToleranceManager(
+            original_world_size=4,
+            command_timeout=0.02,
+            dispatch_command=MagicMock(),
+        )
+
+        status_code, body = asyncio.run(manager.apply_retry())
+
+        self.assertEqual(status_code, 409)
+        self.assertFalse(body["success"])
+        self.assertIn("not closed", body["last_error"])
+        manager._dispatch_command.assert_not_called()
+
+    def test_scheduler_retry_reuses_existing_runtime_objects(self):
+        tp_group = object()
+        moe_ep_group = object()
+        deep_ep_buffer = object()
+        expert_metadata = object()
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.ps = SimpleNamespace(
+            dp_rank=3,
+            tp_group=tp_group,
+            moe_ep_group=moe_ep_group,
+        )
+        scheduler.deep_ep_buffer = deep_ep_buffer
+        scheduler.expert_metadata = expert_metadata
+        scheduler._engine_paused = True
+
+        def continue_generation(request):
+            self.assertFalse(request.torch_empty_cache)
+            scheduler._engine_paused = False
+
+        scheduler.continue_generation = MagicMock(side_effect=continue_generation)
+        request = FaultToleranceCommandReqInput(
+            command_id="retry-command",
+            command="retry",
+            target_original_ranks=[0, 1, 2, 3],
+        )
+
+        output = scheduler.handle_fault_tolerance_command(request)
+
+        self.assertTrue(output.success)
+        self.assertFalse(output.engine_paused)
+        scheduler.continue_generation.assert_called_once()
+        self.assertIs(scheduler.ps.tp_group, tp_group)
+        self.assertIs(scheduler.ps.moe_ep_group, moe_ep_group)
+        self.assertIs(scheduler.deep_ep_buffer, deep_ep_buffer)
+        self.assertIs(scheduler.expert_metadata, expert_metadata)
+
 
 if __name__ == "__main__":
     unittest.main()
