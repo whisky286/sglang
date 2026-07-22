@@ -69,6 +69,8 @@ from sglang.srt.managers.io_struct import (
     ElasticScaleUpdateReq,
     EmbeddingReqInput,
     FaultToleranceCommandReqOutput,
+    FaultToleranceInjectReqInput,
+    FaultToleranceRecoverableErrorOutput,
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
@@ -630,6 +632,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     FaultToleranceCommandReqOutput,
                     self.handle_fault_tolerance_command_output,
                 ),
+                (
+                    FaultToleranceRecoverableErrorOutput,
+                    self.handle_fault_tolerance_recoverable_error,
+                ),
             ]
         )
         self.init_communicators(self.server_args)
@@ -643,6 +649,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
+
+        admission_error = (
+            self.fault_tolerance_manager.get_admission_error(
+                request_id=obj.rid,
+                routed_dp_rank=getattr(obj, "routed_dp_rank", None),
+            )
+            if self.fault_tolerance_manager is not None
+            else None
+        )
+        if admission_error is not None:
+            raise fastapi.HTTPException(
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                detail=admission_error,
+            )
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
@@ -1769,11 +1789,48 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.auto_create_handle_loop()
         return await self.fault_tolerance_manager.status()
 
+    async def fault_tolerance_inject_recoverable_error(
+        self, obj: FaultToleranceInjectReqInput
+    ) -> Tuple[int, dict]:
+        if self.fault_tolerance_manager is None:
+            return 503, {
+                "success": False,
+                "last_error": "Start the server with --enable-fault-tolerance",
+            }
+        if not self.server_args.enable_fault_tolerance_test_injection:
+            return 403, {
+                "success": False,
+                "last_error": (
+                    "Start the server with "
+                    "--enable-fault-tolerance-test-injection"
+                ),
+            }
+        if self.rid_to_state:
+            return 409, {
+                "success": False,
+                "last_error": (
+                    "Recoverable fault injection requires an idle server; "
+                    f"found {len(self.rid_to_state)} active request(s)"
+                ),
+            }
+
+        self.auto_create_handle_loop()
+        return await self.fault_tolerance_manager.arm_recoverable_error(
+            original_rank=obj.original_rank,
+            request_id=obj.request_id,
+        )
+
     def handle_fault_tolerance_command_output(
         self, output: FaultToleranceCommandReqOutput
     ) -> None:
         if self.fault_tolerance_manager is not None:
             self.fault_tolerance_manager.handle_command_output(output)
+
+    def handle_fault_tolerance_recoverable_error(
+        self, output: FaultToleranceRecoverableErrorOutput
+    ) -> None:
+        if self.fault_tolerance_manager is not None:
+            self.fault_tolerance_manager.handle_recoverable_error(output)
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:

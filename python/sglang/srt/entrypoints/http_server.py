@@ -120,6 +120,7 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DumperControlReqInput,
     EmbeddingReqInput,
+    FaultToleranceInjectReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -1629,6 +1630,21 @@ async def fault_tolerance_status(request: Request):
 
     status_code, content = (
         await _global_state.tokenizer_manager.fault_tolerance_status()
+    )
+    return ORJSONResponse(content=content, status_code=status_code)
+
+
+@app.post("/fault_tolerance/inject_recoverable_error")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def fault_tolerance_inject_recoverable_error(
+    obj: Annotated[FaultToleranceInjectReqInput, Body()], request: Request
+):
+    """Arm one test-only recoverable error on an original Scheduler rank."""
+
+    status_code, content = (
+        await _global_state.tokenizer_manager.fault_tolerance_inject_recoverable_error(
+            obj
+        )
     )
     return ORJSONResponse(content=content, status_code=status_code)
 

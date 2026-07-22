@@ -20,6 +20,7 @@ import os
 import signal
 import sys
 import time
+import uuid
 from array import array
 from collections import deque
 from contextlib import contextmanager, nullcontext
@@ -105,6 +106,7 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FaultToleranceCommandReqInput,
     FaultToleranceCommandReqOutput,
+    FaultToleranceRecoverableErrorOutput,
     FlushCacheReqInput,
     FreezeGCReq,
     GetInternalStateReq,
@@ -982,6 +984,7 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+        self._fault_tolerance_injection_request_id: Optional[str] = None
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -2079,6 +2082,10 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        injected_abort = self._maybe_inject_recoverable_error(recv_req)
+        if injected_abort is not None:
+            return injected_abort
+
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
@@ -4282,36 +4289,155 @@ class Scheduler(
     def handle_fault_tolerance_command(
         self, recv_req: FaultToleranceCommandReqInput
     ) -> Optional[FaultToleranceCommandReqOutput]:
-        """Return the local Scheduler state for a targeted A1 status query."""
+        """Execute a targeted fault-tolerance command at a Scheduler safe point."""
 
         original_rank = self.ps.dp_rank if self.ps.dp_rank is not None else 0
         if original_rank not in recv_req.target_original_ranks:
             return None
 
-        if recv_req.command != "status":
+        if recv_req.command == "status":
+            logger.info(
+                "[FaultTolerance][Scheduler] status ack command_id=%s "
+                "original_rank=%s engine_paused=%s",
+                recv_req.command_id,
+                original_rank,
+                self._engine_paused,
+            )
             return FaultToleranceCommandReqOutput(
                 command_id=recv_req.command_id,
                 command=recv_req.command,
                 original_rank=original_rank,
-                success=False,
+                success=True,
                 engine_paused=self._engine_paused,
-                message=f"Unsupported fault-tolerance command: {recv_req.command}",
             )
 
-        logger.info(
-            "[FaultTolerance][Scheduler] status ack command_id=%s "
-            "original_rank=%s engine_paused=%s",
-            recv_req.command_id,
-            original_rank,
-            self._engine_paused,
-        )
+        if recv_req.command == "arm_recoverable_error":
+            if not recv_req.request_id:
+                return FaultToleranceCommandReqOutput(
+                    command_id=recv_req.command_id,
+                    command=recv_req.command,
+                    original_rank=original_rank,
+                    success=False,
+                    engine_paused=self._engine_paused,
+                    message="request_id must not be empty",
+                )
+            armed_request_id = getattr(
+                self, "_fault_tolerance_injection_request_id", None
+            )
+            if armed_request_id not in (None, recv_req.request_id):
+                return FaultToleranceCommandReqOutput(
+                    command_id=recv_req.command_id,
+                    command=recv_req.command,
+                    original_rank=original_rank,
+                    success=False,
+                    engine_paused=self._engine_paused,
+                    message=(
+                        "A different recoverable error injection is already armed: "
+                        f"{armed_request_id}"
+                    ),
+                )
+            self._fault_tolerance_injection_request_id = recv_req.request_id
+            logger.info(
+                "[FaultTolerance][Scheduler] armed recoverable error "
+                "command_id=%s original_rank=%s request_id=%s",
+                recv_req.command_id,
+                original_rank,
+                recv_req.request_id,
+            )
+            return FaultToleranceCommandReqOutput(
+                command_id=recv_req.command_id,
+                command=recv_req.command,
+                original_rank=original_rank,
+                success=True,
+                engine_paused=self._engine_paused,
+            )
+
+        if recv_req.command == "pause":
+            try:
+                self.pause_generation(PauseGenerationReqInput(mode="retract"))
+                self.abort_request(AbortReq(abort_all=True))
+            except Exception as exc:
+                logger.exception(
+                    "[FaultTolerance][Scheduler] pause failed command_id=%s "
+                    "original_rank=%s",
+                    recv_req.command_id,
+                    original_rank,
+                )
+                return FaultToleranceCommandReqOutput(
+                    command_id=recv_req.command_id,
+                    command=recv_req.command,
+                    original_rank=original_rank,
+                    success=False,
+                    engine_paused=self._engine_paused,
+                    message=str(exc),
+                )
+
+            logger.info(
+                "[FaultTolerance][Scheduler] pause ack command_id=%s "
+                "original_rank=%s",
+                recv_req.command_id,
+                original_rank,
+            )
+            return FaultToleranceCommandReqOutput(
+                command_id=recv_req.command_id,
+                command=recv_req.command,
+                original_rank=original_rank,
+                success=True,
+                engine_paused=self._engine_paused,
+            )
+
         return FaultToleranceCommandReqOutput(
             command_id=recv_req.command_id,
             command=recv_req.command,
             original_rank=original_rank,
-            success=True,
+            success=False,
             engine_paused=self._engine_paused,
+            message=f"Unsupported fault-tolerance command: {recv_req.command}",
         )
+
+    def _maybe_inject_recoverable_error(
+        self, recv_req: TokenizedGenerateReqInput
+    ) -> Optional[AbortReq]:
+        """Catch one armed test exception before the request reaches model code."""
+
+        request_id = getattr(self, "_fault_tolerance_injection_request_id", None)
+        if request_id is None or recv_req.rid != request_id:
+            return None
+
+        # Clear before reporting so the injection remains one-shot even if the
+        # control-plane notification itself fails.
+        self._fault_tolerance_injection_request_id = None
+        original_rank = self.ps.dp_rank if self.ps.dp_rank is not None else 0
+        try:
+            raise RuntimeError(
+                "Injected recoverable fault at the Scheduler request safe point"
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+            event = FaultToleranceRecoverableErrorOutput(
+                event_id=uuid.uuid4().hex,
+                original_rank=original_rank,
+                request_id=recv_req.rid,
+                message=message,
+            )
+            self.ipc_channels.send_to_tokenizer.send_output(event, recv_req)
+            logger.error(
+                "[FaultTolerance][Scheduler] caught injected recoverable error "
+                "event_id=%s original_rank=%s request_id=%s",
+                event.event_id,
+                original_rank,
+                recv_req.rid,
+            )
+            return AbortReq(
+                rid=recv_req.rid,
+                finished_reason={
+                    "type": "abort",
+                    "status_code": int(HTTPStatus.SERVICE_UNAVAILABLE),
+                    "message": message,
+                    "err_type": "RecoverableFaultError",
+                },
+                abort_message=message,
+            )
 
     def handle_scale_elastic_ep(
         self, recv_req: ScaleElasticEPReqInput

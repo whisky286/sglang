@@ -1044,6 +1044,10 @@ class ServerArgs:
         float,
         "Timeout in seconds for a fault-tolerance control command.",
     ] = 10.0
+    enable_fault_tolerance_test_injection: A[
+        bool,
+        "Enable the test-only recoverable fault injection endpoint.",
+    ] = False
     sleep_on_idle: A[bool, "Reduce CPU usage when sglang is idle."] = False
     use_ray: A[bool, "Use Ray actors for scheduler process management."] = False
     custom_sigquit_handler: Optional[Callable] = None
@@ -5493,6 +5497,13 @@ class ServerArgs:
         run_post_process_pass(self, _dp_lm_head_validation)
 
     def _handle_fault_tolerance(self):
+        assert (
+            not self.enable_fault_tolerance_test_injection
+            or self.enable_fault_tolerance
+        ), (
+            "--enable-fault-tolerance-test-injection requires "
+            "--enable-fault-tolerance."
+        )
         if not self.enable_fault_tolerance:
             return
 

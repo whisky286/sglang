@@ -1524,6 +1524,7 @@ class FaultToleranceCommandReqInput(BaseReq, kw_only=True):
     command_id: str
     command: str
     target_original_ranks: List[int]
+    request_id: Optional[str] = None
 
 
 class FaultToleranceCommandReqOutput(BaseReq, kw_only=True):
@@ -1535,6 +1536,22 @@ class FaultToleranceCommandReqOutput(BaseReq, kw_only=True):
     success: bool
     engine_paused: bool
     message: str = ""
+
+
+class FaultToleranceInjectReqInput(BaseReq, kw_only=True):
+    """Arm one recoverable error at a Scheduler request safe point."""
+
+    original_rank: int
+    request_id: str
+
+
+class FaultToleranceRecoverableErrorOutput(BaseReq, kw_only=True):
+    """A caught, recoverable Scheduler error reported to the control plane."""
+
+    event_id: str
+    original_rank: int
+    request_id: str
+    message: str
 
 
 class TokenizerWorkerRegistrationReq(BaseReq, kw_only=True):

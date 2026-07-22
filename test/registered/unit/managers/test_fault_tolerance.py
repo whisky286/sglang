@@ -11,8 +11,10 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.data_parallel_controller import DataParallelController
 from sglang.srt.managers.fault_tolerance import FaultToleranceManager
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     FaultToleranceCommandReqInput,
     FaultToleranceCommandReqOutput,
+    FaultToleranceRecoverableErrorOutput,
     msgpack_decode,
     msgpack_encode,
 )
@@ -135,11 +137,19 @@ class TestFaultToleranceControlRouting(CustomTestCase):
             command_id="command-msgpack",
             command="status",
             target_original_ranks=[0, 1, 2, 3],
+            request_id="request-msgpack",
         )
         output = _ack(request, 2)
+        event = FaultToleranceRecoverableErrorOutput(
+            event_id="event-msgpack",
+            original_rank=2,
+            request_id="request-msgpack",
+            message="recoverable",
+        )
 
         self.assertEqual(msgpack_decode(msgpack_encode(request)), request)
         self.assertEqual(msgpack_decode(msgpack_encode(output)), output)
+        self.assertEqual(msgpack_decode(msgpack_encode(event)), event)
 
     def test_dpc_routes_only_to_available_target_original_ranks(self):
         controller = DataParallelController.__new__(DataParallelController)
@@ -193,6 +203,197 @@ class TestFaultToleranceControlRouting(CustomTestCase):
         )
         self.assertIsNone(scheduler.handle_fault_tolerance_command(untargeted_request))
 
+
+class TestFaultToleranceCoordinatedPause(CustomTestCase):
+    def _new_manager(self, dispatch, timeout: float = 0.02):
+        return FaultToleranceManager(
+            original_world_size=4,
+            command_timeout=timeout,
+            dispatch_command=dispatch,
+        )
+
+    def test_arm_recoverable_error_targets_one_original_rank(self):
+        requests = []
+        manager = None
+
+        def dispatch(request):
+            requests.append(request)
+            manager.handle_command_output(_ack(request, 1))
+
+        manager = self._new_manager(dispatch)
+        status_code, body = asyncio.run(
+            manager.arm_recoverable_error(
+                original_rank=1,
+                request_id="a2-request",
+            )
+        )
+
+        self.assertEqual(status_code, 200)
+        self.assertTrue(body["success"])
+        self.assertEqual(body["acknowledged_ranks"], [1])
+        self.assertEqual(requests[0].command, "arm_recoverable_error")
+        self.assertEqual(requests[0].target_original_ranks, [1])
+        self.assertEqual(requests[0].request_id, "a2-request")
+        self.assertEqual(
+            manager.armed_injection,
+            {"original_rank": 1, "request_id": "a2-request"},
+        )
+
+    def test_ambiguous_arm_failure_closes_admission(self):
+        manager = self._new_manager(lambda _request: None, timeout=0.001)
+
+        status_code, body = asyncio.run(
+            manager.arm_recoverable_error(
+                original_rank=1,
+                request_id="a2-request",
+            )
+        )
+
+        self.assertEqual(status_code, 503)
+        self.assertFalse(body["success"])
+        self.assertTrue(manager.admission_closed)
+        self.assertIsNone(manager.armed_injection)
+        self.assertEqual(manager.last_transition["state"], "FAILED")
+        _, status = asyncio.run(manager.status())
+        self.assertEqual(status["service_state"], "FAIL_STOP")
+
+    def test_recoverable_error_closes_admission_and_pauses_every_rank(self):
+        async def scenario():
+            manager = None
+            paused = {rank: False for rank in range(4)}
+
+            def dispatch(request):
+                if request.command == "arm_recoverable_error":
+                    manager.handle_command_output(_ack(request, 1))
+                elif request.command == "pause":
+                    for rank in request.target_original_ranks:
+                        paused[rank] = True
+                        manager.handle_command_output(
+                            _ack(request, rank, engine_paused=True)
+                        )
+                elif request.command == "status":
+                    for rank in request.target_original_ranks:
+                        manager.handle_command_output(
+                            _ack(request, rank, engine_paused=paused[rank])
+                        )
+
+            manager = self._new_manager(dispatch)
+            await manager.arm_recoverable_error(
+                original_rank=1,
+                request_id="a2-request",
+            )
+            manager.handle_recoverable_error(
+                FaultToleranceRecoverableErrorOutput(
+                    event_id="event-a2",
+                    original_rank=1,
+                    request_id="a2-request",
+                    message="injected recoverable error",
+                )
+            )
+            await manager._pause_task
+            return manager, await manager.status()
+
+        manager, (status_code, body) = asyncio.run(scenario())
+
+        self.assertTrue(manager.admission_closed)
+        self.assertEqual(status_code, 200)
+        self.assertEqual(body["service_state"], "PAUSED")
+        self.assertEqual(body["last_fault"]["original_rank"], 1)
+        self.assertEqual(body["last_fault"]["request_id"], "a2-request")
+        self.assertEqual(body["last_transition"]["command"], "pause")
+        self.assertEqual(body["last_transition"]["state"], "SUCCEEDED")
+        self.assertEqual(
+            body["last_transition"]["acknowledged_ranks"], [0, 1, 2, 3]
+        )
+
+    def test_armed_injection_admits_only_the_exact_target_request(self):
+        manager = self._new_manager(lambda _request: None)
+        manager.armed_injection = {
+            "original_rank": 1,
+            "request_id": "a2-request",
+        }
+
+        self.assertIsNone(
+            manager.get_admission_error(
+                request_id="a2-request",
+                routed_dp_rank=1,
+            )
+        )
+        self.assertIsNotNone(
+            manager.get_admission_error(
+                request_id="different-request",
+                routed_dp_rank=1,
+            )
+        )
+        self.assertIsNotNone(
+            manager.get_admission_error(
+                request_id="a2-request",
+                routed_dp_rank=0,
+            )
+        )
+
+    def test_scheduler_injection_is_request_specific_and_one_shot(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.ps = SimpleNamespace(dp_rank=1)
+        scheduler._engine_paused = False
+        scheduler._fault_tolerance_injection_request_id = None
+        send_output = MagicMock()
+        scheduler.ipc_channels = SimpleNamespace(
+            send_to_tokenizer=SimpleNamespace(send_output=send_output)
+        )
+
+        arm = FaultToleranceCommandReqInput(
+            command_id="arm-command",
+            command="arm_recoverable_error",
+            target_original_ranks=[1],
+            request_id="a2-request",
+        )
+        arm_output = scheduler.handle_fault_tolerance_command(arm)
+        self.assertTrue(arm_output.success)
+
+        self.assertIsNone(
+            scheduler._maybe_inject_recoverable_error(
+                SimpleNamespace(rid="different-request")
+            )
+        )
+        abort = scheduler._maybe_inject_recoverable_error(
+            SimpleNamespace(rid="a2-request")
+        )
+        self.assertIsInstance(abort, AbortReq)
+        self.assertEqual(abort.finished_reason["status_code"], 503)
+        event = send_output.call_args.args[0]
+        self.assertIsInstance(event, FaultToleranceRecoverableErrorOutput)
+        self.assertEqual(event.original_rank, 1)
+        self.assertEqual(event.request_id, "a2-request")
+        self.assertIsNone(
+            scheduler._maybe_inject_recoverable_error(
+                SimpleNamespace(rid="a2-request")
+            )
+        )
+
+    def test_scheduler_pause_ack_happens_after_pause_and_abort(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.ps = SimpleNamespace(dp_rank=2)
+        scheduler._engine_paused = False
+
+        def pause_generation(_request):
+            scheduler._engine_paused = True
+
+        scheduler.pause_generation = MagicMock(side_effect=pause_generation)
+        scheduler.abort_request = MagicMock()
+        request = FaultToleranceCommandReqInput(
+            command_id="pause-command",
+            command="pause",
+            target_original_ranks=[0, 1, 2, 3],
+        )
+
+        output = scheduler.handle_fault_tolerance_command(request)
+
+        self.assertTrue(output.success)
+        self.assertTrue(output.engine_paused)
+        scheduler.pause_generation.assert_called_once()
+        scheduler.abort_request.assert_called_once()
+        self.assertTrue(scheduler.abort_request.call_args.args[0].abort_all)
 
 if __name__ == "__main__":
     unittest.main()
