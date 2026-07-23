@@ -523,5 +523,128 @@ class TestFaultToleranceRetry(CustomTestCase):
         self.assertIs(scheduler.expert_metadata, expert_metadata)
 
 
+class TestFaultToleranceFailureSemantics(CustomTestCase):
+    def test_pause_ack_loss_wrong_command_id_and_failure_are_fail_stop(self):
+        async def scenario(failure_mode):
+            manager = None
+
+            def dispatch(request):
+                if request.command == "arm_recoverable_error":
+                    manager.handle_command_output(_ack(request, 1))
+                elif request.command == "pause":
+                    for rank in request.target_original_ranks:
+                        if failure_mode == "missing" and rank == 3:
+                            continue
+                        if failure_mode == "wrong_command_id" and rank == 3:
+                            manager.handle_command_output(
+                                FaultToleranceCommandReqOutput(
+                                    command_id="wrong-command-id",
+                                    command=request.command,
+                                    original_rank=rank,
+                                    success=True,
+                                    engine_paused=True,
+                                )
+                            )
+                            continue
+                        manager.handle_command_output(
+                            _ack(
+                                request,
+                                rank,
+                                success=not (failure_mode == "failed" and rank == 2),
+                                engine_paused=True,
+                            )
+                        )
+                elif request.command == "status":
+                    for rank in request.target_original_ranks:
+                        manager.handle_command_output(
+                            _ack(request, rank, engine_paused=True)
+                        )
+
+            manager = FaultToleranceManager(
+                original_world_size=4,
+                command_timeout=0.001,
+                dispatch_command=dispatch,
+            )
+            await manager.arm_recoverable_error(
+                original_rank=1,
+                request_id=f"a4-pause-{failure_mode}",
+            )
+            manager.handle_recoverable_error(
+                FaultToleranceRecoverableErrorOutput(
+                    event_id=f"a4-event-{failure_mode}",
+                    original_rank=1,
+                    request_id=f"a4-pause-{failure_mode}",
+                    message="A4 pause failure injection",
+                )
+            )
+            await manager._pause_task
+            return manager, await manager.status()
+
+        for failure_mode in ("missing", "wrong_command_id", "failed"):
+            with self.subTest(failure_mode=failure_mode):
+                manager, (status_code, status) = asyncio.run(scenario(failure_mode))
+
+                self.assertTrue(manager.admission_closed)
+                self.assertEqual(manager.last_transition["command"], "pause")
+                self.assertEqual(manager.last_transition["state"], "FAILED")
+                if failure_mode == "failed":
+                    self.assertEqual(manager.last_transition["failed_ranks"], [2])
+                    self.assertEqual(manager.last_transition["missing_ranks"], [])
+                else:
+                    self.assertEqual(manager.last_transition["failed_ranks"], [])
+                    self.assertEqual(manager.last_transition["missing_ranks"], [3])
+                    self.assertIn("Timed out", manager.last_transition["last_error"])
+                self.assertEqual(status_code, 200)
+                self.assertEqual(status["service_state"], "FAIL_STOP")
+                self.assertTrue(status["admission_closed"])
+
+    def test_retry_ack_loss_and_wrong_command_id_never_reopen_admission(self):
+        async def scenario(failure_mode):
+            manager = None
+
+            def dispatch(request):
+                for rank in request.target_original_ranks:
+                    if rank != 3:
+                        manager.handle_command_output(
+                            _ack(request, rank, engine_paused=False)
+                        )
+                    elif failure_mode == "wrong_command_id":
+                        manager.handle_command_output(
+                            FaultToleranceCommandReqOutput(
+                                command_id="wrong-command-id",
+                                command=request.command,
+                                original_rank=rank,
+                                success=True,
+                                engine_paused=False,
+                            )
+                        )
+
+            manager = FaultToleranceManager(
+                original_world_size=4,
+                command_timeout=0.001,
+                dispatch_command=dispatch,
+            )
+            manager.admission_closed = True
+            manager.last_transition = {
+                "command": "pause",
+                "state": "SUCCEEDED",
+                "acknowledged_ranks": [0, 1, 2, 3],
+            }
+            return manager, await manager.apply_retry()
+
+        for failure_mode in ("missing", "wrong_command_id"):
+            with self.subTest(failure_mode=failure_mode):
+                manager, (status_code, body) = asyncio.run(scenario(failure_mode))
+
+                self.assertEqual(status_code, 503)
+                self.assertFalse(body["success"])
+                self.assertEqual(body["acknowledged_ranks"], [0, 1, 2])
+                self.assertEqual(body["missing_ranks"], [3])
+                self.assertIn("Timed out", body["last_error"])
+                self.assertTrue(manager.admission_closed)
+                self.assertEqual(manager.last_transition["command"], "retry")
+                self.assertEqual(manager.last_transition["state"], "FAILED")
+
+
 if __name__ == "__main__":
     unittest.main()
