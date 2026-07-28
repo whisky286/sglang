@@ -51,6 +51,7 @@ python -m sglang.launch_server \
   --dp-size 4 \
   --ep-size 4 \
   --enable-dp-attention \
+  --enable-dp-lm-head \
   --moe-dense-tp-size 1 \
   --moe-a2a-backend deepep \
   --deepep-mode auto \

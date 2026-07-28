@@ -316,6 +316,11 @@
       color: #40526f;
     }
 
+    .callout.warn {
+      border-left-color: var(--amber);
+      background: var(--amber-soft);
+    }
+
     .table-wrap {
       overflow-x: auto;
       border: 1px solid var(--line);
@@ -1105,7 +1110,7 @@
             <tr>
               <td>3 · Scheduler skip 健康态 A/B</td>
               <td>NPU 服务器；所有 rank 健康</td>
-              <td>对照 Scheduler CPU metadata all-gather 开/关，并构造不同长度的并发请求，使各 DP rank 出现 prefill、decode、idle 等不同状态。</td>
+              <td>在两轮都启用 DP LM head 的同一配置下，对照 Scheduler CPU metadata all-gather 开/关，并构造不同长度的并发请求，使各 DP rank 出现 prefill、decode、idle 等不同状态。</td>
               <td>输出正确、连续请求稳定、forward mode 与 batch 组织正确；不能只看“没有 hang”。该实验只帮助理解 skip 的影响，不改变容错主方案。</td>
             </tr>
             <tr>
@@ -1136,7 +1141,16 @@
       <div class="callout">
         <p>
           两轮都在四个 rank 全部健康、未启用容错的情况下运行。baseline 和 skip 使用相同模型与参数，
-          仅切换 <code>SGLANG_SCHEDULER_SKIP_ALL_GATHER</code>。两轮顺序运行，不能同时占用同一组 NPU。
+          都启用 <code>--enable-dp-lm-head</code>，仅切换
+          <code>SGLANG_SCHEDULER_SKIP_ALL_GATHER</code>。两轮顺序运行，不能同时占用同一组 NPU。
+        </p>
+      </div>
+      <div class="callout warn">
+        <p>
+          已确认的负例：若未启用 DP LM head，当前 Qwen3-MoE 配置需要全局 MLP token 元数据。
+          skip 会使 <code>global_num_tokens_for_logprob_gpu</code> 保持为空，随后在 logits processor
+          中对空值执行 <code>torch.cumsum</code> 并导致 Scheduler 退出。该负例说明 skip
+          具有严格的配置前提，不能作为通用容错方案。
         </p>
       </div>
       <h3>第一轮：baseline</h3>
