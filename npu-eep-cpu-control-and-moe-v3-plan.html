@@ -1,0 +1,1261 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>昇腾 NPU EEP：CPU 控制面与 MoE V3 动态缩容</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f3f5f9;
+      --paper: #ffffff;
+      --ink: #172033;
+      --muted: #667085;
+      --line: #d9deea;
+      --soft: #eef2f8;
+      --blue: #3568d4;
+      --blue-soft: #eaf0ff;
+      --green: #287a5c;
+      --green-soft: #e9f7f1;
+      --amber: #9b6512;
+      --amber-soft: #fff5df;
+      --red: #a13d45;
+      --red-soft: #fff0f1;
+      --violet: #6750a4;
+      --violet-soft: #f1edff;
+      --shadow: 0 18px 45px rgba(28, 39, 65, .08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 10% -10%, rgba(53, 104, 212, .12), transparent 33rem),
+        radial-gradient(circle at 95% 10%, rgba(103, 80, 164, .10), transparent 30rem),
+        var(--bg);
+      color: var(--ink);
+      font-family:
+        Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      line-height: 1.72;
+    }
+
+    a {
+      color: var(--blue);
+      text-decoration-thickness: 1px;
+      text-underline-offset: 3px;
+    }
+
+    code {
+      padding: .12rem .35rem;
+      border-radius: .35rem;
+      background: var(--soft);
+      color: #324465;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: .9em;
+    }
+
+    .page {
+      width: min(1180px, calc(100% - 32px));
+      margin: 34px auto 72px;
+    }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: 48px 52px 42px;
+      border: 1px solid rgba(217, 222, 234, .9);
+      border-radius: 28px;
+      background: rgba(255, 255, 255, .92);
+      box-shadow: var(--shadow);
+    }
+
+    .hero::after {
+      position: absolute;
+      right: -70px;
+      bottom: -95px;
+      width: 290px;
+      height: 290px;
+      border: 44px solid rgba(53, 104, 212, .07);
+      border-radius: 50%;
+      content: "";
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 16px;
+      color: var(--blue);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow::before {
+      width: 26px;
+      height: 2px;
+      background: currentColor;
+      content: "";
+    }
+
+    h1, h2, h3 {
+      margin-top: 0;
+      line-height: 1.28;
+    }
+
+    h1 {
+      position: relative;
+      z-index: 1;
+      max-width: 900px;
+      margin-bottom: 18px;
+      font-size: clamp(32px, 5vw, 54px);
+      letter-spacing: -.035em;
+    }
+
+    h2 {
+      margin-bottom: 20px;
+      font-size: clamp(24px, 3vw, 32px);
+      letter-spacing: -.02em;
+    }
+
+    h3 {
+      margin-bottom: 10px;
+      font-size: 18px;
+    }
+
+    .lede {
+      position: relative;
+      z-index: 1;
+      max-width: 880px;
+      margin: 0;
+      color: var(--muted);
+      font-size: 18px;
+    }
+
+    .hero-meta {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 26px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 30px;
+      padding: 4px 11px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .confirmed {
+      background: var(--green-soft);
+      color: var(--green);
+    }
+
+    .verify {
+      background: var(--amber-soft);
+      color: var(--amber);
+    }
+
+    .excluded {
+      background: var(--red-soft);
+      color: var(--red);
+    }
+
+    .section {
+      margin-top: 28px;
+      padding: 34px 38px 38px;
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: var(--paper);
+      box-shadow: 0 10px 30px rgba(28, 39, 65, .045);
+    }
+
+    .section-intro {
+      max-width: 900px;
+      margin: -8px 0 24px;
+      color: var(--muted);
+    }
+
+    .decision-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .decision {
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 17px;
+      background: linear-gradient(145deg, #fff, #fafbfe);
+    }
+
+    .decision strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 16px;
+    }
+
+    .decision p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .architecture {
+      display: grid;
+      gap: 12px;
+    }
+
+    .lane {
+      display: grid;
+      grid-template-columns: 150px repeat(4, minmax(0, 1fr));
+      align-items: stretch;
+      gap: 10px;
+    }
+
+    .lane-label {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding: 12px 14px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+
+    .lane-label span {
+      margin-top: 2px;
+      color: var(--ink);
+      font-size: 16px;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+
+    .node {
+      position: relative;
+      min-height: 92px;
+      padding: 16px 16px 15px;
+      border: 1px solid var(--line);
+      border-radius: 15px;
+      background: #fbfcff;
+    }
+
+    .node::after {
+      position: absolute;
+      top: 50%;
+      right: -11px;
+      width: 10px;
+      border-top: 1px solid #aeb8cc;
+      content: "";
+    }
+
+    .node:last-child::after {
+      display: none;
+    }
+
+    .node b {
+      display: block;
+      margin-bottom: 5px;
+      font-size: 15px;
+    }
+
+    .node small {
+      display: block;
+      color: var(--muted);
+      font-size: 12.5px;
+      line-height: 1.55;
+    }
+
+    .node.control {
+      border-color: #c8d7ff;
+      background: var(--blue-soft);
+    }
+
+    .node.moe {
+      border-color: #c9e7da;
+      background: var(--green-soft);
+    }
+
+    .node.risk {
+      border-color: #f0d6a7;
+      background: var(--amber-soft);
+    }
+
+    .node.stop {
+      border-color: #ecc4c8;
+      background: var(--red-soft);
+    }
+
+    .callout {
+      margin-top: 20px;
+      padding: 17px 19px;
+      border-left: 4px solid var(--blue);
+      border-radius: 0 13px 13px 0;
+      background: var(--blue-soft);
+    }
+
+    .callout strong {
+      display: block;
+      margin-bottom: 4px;
+    }
+
+    .callout p {
+      margin: 0;
+      color: #40526f;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 760px;
+      background: #fff;
+    }
+
+    th, td {
+      padding: 15px 17px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+      text-align: left;
+    }
+
+    th {
+      background: #f7f9fc;
+      color: #47536a;
+      font-size: 13px;
+      letter-spacing: .035em;
+      text-transform: uppercase;
+    }
+
+    td {
+      font-size: 14px;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .compact-list {
+      margin: 0;
+      padding-left: 1.2rem;
+    }
+
+    .compact-list li + li {
+      margin-top: 7px;
+    }
+
+    .split {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    .panel {
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: #fbfcfe;
+    }
+
+    .panel h3 {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .panel h3::before {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--blue);
+      content: "";
+    }
+
+    .timeline {
+      display: grid;
+      grid-template-columns: repeat(8, minmax(120px, 1fr));
+      overflow-x: auto;
+      padding: 4px 2px 14px;
+    }
+
+    .step {
+      position: relative;
+      min-height: 176px;
+      padding: 47px 16px 14px;
+      border-top: 2px solid #c7d0e0;
+    }
+
+    .step::before {
+      position: absolute;
+      top: -11px;
+      left: 16px;
+      display: grid;
+      width: 22px;
+      height: 22px;
+      place-items: center;
+      border: 3px solid var(--paper);
+      border-radius: 50%;
+      background: var(--blue);
+      color: white;
+      content: attr(data-step);
+      font-size: 11px;
+      font-weight: 750;
+      box-shadow: 0 0 0 1px var(--blue);
+    }
+
+    .step b {
+      display: block;
+      margin-bottom: 7px;
+      font-size: 14px;
+    }
+
+    .step span {
+      color: var(--muted);
+      font-size: 12.5px;
+      line-height: 1.55;
+    }
+
+    .comparison-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+      margin: 0 0 14px;
+    }
+
+    .comparison-legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 6px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .comparison-legend i {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+    }
+
+    .comparison-legend .existing-dot {
+      background: var(--green);
+    }
+
+    .comparison-legend .gap-dot {
+      background: var(--amber);
+    }
+
+    .comparison-legend .new-dot {
+      background: var(--blue);
+    }
+
+    .delta-table {
+      min-width: 1040px;
+      table-layout: fixed;
+    }
+
+    .delta-table th:first-child,
+    .delta-table td:first-child {
+      width: 14%;
+    }
+
+    .delta-table th:nth-child(2),
+    .delta-table td:nth-child(2),
+    .delta-table th:nth-child(3),
+    .delta-table td:nth-child(3),
+    .delta-table th:nth-child(4),
+    .delta-table td:nth-child(4) {
+      width: 28.66%;
+    }
+
+    .delta-table th {
+      text-transform: none;
+    }
+
+    .delta-table th.existing,
+    .delta-table td.existing {
+      background: var(--green-soft);
+    }
+
+    .delta-table th.gap,
+    .delta-table td.gap {
+      background: var(--amber-soft);
+    }
+
+    .delta-table th.new,
+    .delta-table td.new {
+      background: var(--blue-soft);
+    }
+
+    .delta-table td.system {
+      color: var(--ink);
+      font-size: 14px;
+      font-weight: 760;
+    }
+
+    .delta-table td {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .delta-table ul {
+      margin: 0;
+      padding-left: 1.05rem;
+    }
+
+    .delta-table li + li {
+      margin-top: 7px;
+    }
+
+    .formula {
+      margin: 14px 0 0;
+      padding: 17px 19px;
+      border: 1px dashed #b9c5dc;
+      border-radius: 14px;
+      background: #f8faff;
+      color: #354563;
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: 13px;
+      white-space: pre-wrap;
+    }
+
+    .acceptance {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .check {
+      display: flex;
+      gap: 12px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fbfcfe;
+    }
+
+    .check::before {
+      display: grid;
+      flex: 0 0 auto;
+      width: 24px;
+      height: 24px;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--green-soft);
+      color: var(--green);
+      content: "✓";
+      font-size: 14px;
+      font-weight: 800;
+    }
+
+    .check b {
+      display: block;
+      margin-bottom: 3px;
+      font-size: 14px;
+    }
+
+    .check span {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .footer {
+      margin-top: 28px;
+      padding: 26px 8px 0;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .footer p {
+      margin: 6px 0;
+    }
+
+    @media (max-width: 900px) {
+      .hero {
+        padding: 36px 30px;
+      }
+
+      .section {
+        padding: 28px 24px 30px;
+      }
+
+      .decision-grid,
+      .split {
+        grid-template-columns: 1fr;
+      }
+
+      .lane {
+        grid-template-columns: 118px repeat(4, minmax(180px, 1fr));
+        overflow-x: auto;
+        padding-bottom: 8px;
+      }
+
+    }
+
+    @media (max-width: 620px) {
+      .page {
+        width: min(100% - 18px, 1180px);
+        margin-top: 12px;
+      }
+
+      .hero,
+      .section {
+        border-radius: 18px;
+      }
+
+      .hero {
+        padding: 30px 22px;
+      }
+
+      .section {
+        padding: 25px 18px 27px;
+      }
+
+      .acceptance {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --bg: #101522;
+        --paper: #171e2c;
+        --ink: #edf1f8;
+        --muted: #a5afc1;
+        --line: #303a4c;
+        --soft: #242d3d;
+        --blue: #8fb1ff;
+        --blue-soft: #202d4b;
+        --green: #7bd0ae;
+        --green-soft: #17372e;
+        --amber: #efc269;
+        --amber-soft: #3b2e18;
+        --red: #f39aa1;
+        --red-soft: #402126;
+        --shadow: 0 18px 45px rgba(0, 0, 0, .22);
+      }
+
+      .hero,
+      .section {
+        background: rgba(23, 30, 44, .96);
+      }
+
+      .decision,
+      .panel,
+      .node,
+      .check,
+      table,
+      .formula {
+        background: #1b2332;
+      }
+
+      th {
+        background: #202939;
+        color: #c2cad8;
+      }
+
+      code {
+        color: #cad9f6;
+      }
+
+      .callout p {
+        color: #c4d1e8;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <div class="eyebrow">NPU EEP · Current Architecture</div>
+      <h1>CPU 控制面 + MoE V3 动态缩容</h1>
+      <p class="lede">
+        当前路线不再重建 compacted topology。而是要让启动期拓扑、rank 编号、图和主要设备地址保持不变；
+        控制面负责发现进程退出并协调存活 rank，MoE 数据面通过 CANN V3
+        <code>elasticInfoOptional</code> 表达故障 rank，DP-attention 与其他 HCCL 通信单独排除。
+      </p>
+      <div class="hero-meta">
+        <span class="pill confirmed">固定：masked original topology</span>
+        <span class="pill confirmed">固定：DeepEP</span>
+        <span class="pill confirmed">固定：进程退出故障</span>
+        <span class="pill confirmed">主线：存活 rank CPU 元数据聚合</span>
+        <span class="pill verify">待证：CANN 9.0.0 V3 支持</span>
+        <span class="pill verify">理解实验：健康态 all-gather skip A/B</span>
+      </div>
+    </header>
+
+    <section class="section">
+      <h2>1. 当前决策</h2>
+      <div class="decision-grid">
+        <article class="decision">
+          <strong>拓扑不缩短</strong>
+          <p>
+            original rank namespace、ServerArgs 和图中通信规模保持启动值；故障状态用固定长度 mask 表达。
+          </p>
+        </article>
+        <article class="decision">
+          <strong>控制与数据分开</strong>
+          <p>
+            CPU/服务控制面传递状态和恢复指令；NPU 只承担必须留在设备侧的模型数据通信。
+          </p>
+        </article>
+        <article class="decision">
+          <strong>不把 MC2 当故障检测器</strong>
+          <p>
+            进程状态、控制连接和硬件健康信息负责发现故障；算子/HCCL 报错只作为补充信号。
+          </p>
+        </article>
+      </div>
+
+      <div class="callout">
+        <strong>DeepEP 与 MC2 不是二选一</strong>
+        <p>
+          SGLang 选择 DeepEP 作为 MoE A2A backend；NPU DeepEP 的底层可以调用 CANN
+          MoE/MC² 通算融合算子。当前要修改的是这条接口链，而不是改回 FuseEP。
+        </p>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>2. 一张图看懂新架构</h2>
+      <p class="section-intro">
+        同一次恢复分成四条并行关注线。控制面先形成唯一 active mask；随后每条数据路径只能在自身能力范围内处理 dead rank。
+      </p>
+
+      <div class="architecture" aria-label="NPU EEP 分层架构">
+        <div class="lane">
+          <div class="lane-label">Shared Service<span>统一服务控制</span></div>
+          <div class="node control">
+            <b>发现进程退出</b>
+            <small>进程状态、socket、NPU/GPU 硬件状态</small>
+          </div>
+          <div class="node control">
+            <b>关闭 admission</b>
+            <small>暂停新请求；在途请求允许失败或重试</small>
+          </div>
+          <div class="node control">
+            <b>确认 active mask</b>
+            <small>只等待存活 Scheduler，不等待 dead rank</small>
+          </div>
+          <div class="node control">
+            <b>统一恢复/保持暂停</b>
+            <small>所有验证成功才恢复，否则 fail-stop</small>
+          </div>
+        </div>
+
+        <div class="lane">
+          <div class="lane-label">Scheduler<span>小型元数据</span></div>
+          <div class="node risk">
+            <b>原 Gloo group 失效</b>
+            <small>它仍包含已退出进程，不能继续 collective</small>
+          </div>
+          <div class="node">
+            <b>主方案：CPU 控制面聚合</b>
+            <small>存活进程通过现有控制通道 P2P 上报元数据</small>
+          </div>
+          <div class="node">
+            <b>补齐故障槽位</b>
+            <small>dead original-rank 槽位统一填为 IDLE/fallback</small>
+          </div>
+          <div class="node">
+            <b>固定宽度视图</b>
+            <small>结果仍按 original rank 排列</small>
+          </div>
+        </div>
+
+        <div class="lane">
+          <div class="lane-label">MoE Data Plane<span>DeepEP / CANN</span></div>
+          <div class="node moe">
+            <b>构造 elasticInfo</b>
+            <small>有效 rank 数 + original/local 双向映射</small>
+          </div>
+          <div class="node moe">
+            <b>DispatchV3</b>
+            <small>在 EP AllToAllV 中剔除故障卡</small>
+          </div>
+          <div class="node moe">
+            <b>专家计算</b>
+            <small>每个存活 rank 的本地专家槽位数保持不变</small>
+          </div>
+          <div class="node moe">
+            <b>CombineV3</b>
+            <small>与 dispatch 使用同一 elasticInfo 和路由结果</small>
+          </div>
+        </div>
+
+        <div class="lane">
+          <div class="lane-label">Other HCCL<span>必须逐项排除</span></div>
+          <div class="node stop">
+            <b>DP-attention</b>
+            <small>普通 all-gather/all-reduce 不认识 MoE elasticInfo</small>
+          </div>
+          <div class="node risk">
+            <b>LM head / dense MLP</b>
+            <small>确认目标参数下是否仍有大 TP collective</small>
+          </div>
+          <div class="node risk">
+            <b>EPLB / 专家刷新</b>
+            <small>检查 metadata、权重传输和 barrier</small>
+          </div>
+          <div class="node">
+            <b>排除故障 rank 依赖</b>
+            <small>允许存活 rank 之间继续通信，但不能再有等待 dead rank 的 collective</small>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>3. 两种 mask 不能混用</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>参数</th>
+              <th>表示什么</th>
+              <th>不能表示什么</th>
+              <th>当前接入状态</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>xActiveMaskOptional</code></td>
+              <td>哪些 token 或 token-expert 路由项参与通信</td>
+              <td>不能表示哪些 EP rank 已故障</td>
+              <td>V2 路径已有相关参数；它不是 EEP rank mask</td>
+            </tr>
+            <tr>
+              <td><code>elasticInfoOptional</code></td>
+              <td>EP 动态缩容信息：有效 rank 数与双向 rank 映射表</td>
+              <td>不能替代 DP-attention 的普通 HCCL collective</td>
+              <td>CANN MoE V3 提供；当前公开 sgl-kernel-npu 未接入</td>
+            </tr>
+            <tr>
+              <td>SGLang active mask</td>
+              <td>控制面使用的 original-rank 固定长度存活视图</td>
+              <td>不能直接作为任意底层算子的参数</td>
+              <td>需要转换为 Scheduler 视图、elasticInfo 和专家布局</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <pre class="formula">elasticInfoOptional: int32[4 + 2 * initial_ep_size]
+
+[ is_shrunk,
+  effective_ep_size,
+  effective_shared_expert_rank_count,
+  effective_moe_expert_count,
+  original_ep_rank -> effective_ep_rank or -1,
+  effective_ep_rank -> original_ep_rank ]</pre>
+
+      <div class="callout">
+        <strong>当前公开契约的限制</strong>
+        <p>
+          CANN 文档把动态缩容绑定在 DispatchV3/CombineV3 配套调用上，并规定
+          <code>tpWorldSize=1</code>；受支持的 Atlas A3 场景可在通信域创建后剔除故障卡且无需重新编译。
+          目标服务器的硬件型号、CANN 9.0.0 符号与真实行为仍需现场确认。
+        </p>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>4. 恢复过程</h2>
+      <p class="section-intro">
+        “一致确认”发生在任何新设备通信之前。恢复过程不要求 dead rank 参与，也不假装设备操作可以完全回滚。
+      </p>
+      <div class="timeline">
+        <div class="step" data-step="1">
+          <b>发现</b>
+          <span>服务控制面确认某个 original rank 的进程已经退出。</span>
+        </div>
+        <div class="step" data-step="2">
+          <b>暂停</b>
+          <span>关闭请求入口，通知所有存活 Scheduler 停止进入新 batch。</span>
+        </div>
+        <div class="step" data-step="3">
+          <b>形成 mask</b>
+          <span>控制面生成固定长度 active mask，并使用现有 command_id 标识本次恢复操作。</span>
+        </div>
+        <div class="step" data-step="4">
+          <b>存活者确认</b>
+          <span>所有存活 rank 确认相同 command_id、成员顺序与 mask。</span>
+        </div>
+        <div class="step" data-step="5">
+          <b>刷新元数据</b>
+          <span>通过存活 rank 的 CPU 控制面聚合，生成 original-rank 固定宽度 Scheduler 视图。</span>
+        </div>
+        <div class="step" data-step="6">
+          <b>刷新 MoE</b>
+          <span>构造 elasticInfo，更新专家布局，调用配套的 DispatchV3/CombineV3。</span>
+        </div>
+        <div class="step" data-step="7">
+          <b>设备通信审计</b>
+          <span>确认 DP-attention、LM head、dense MLP、EPLB 不再等待 dead rank。</span>
+        </div>
+        <div class="step" data-step="8">
+          <b>恢复或停住</b>
+          <span>全部存活 rank 成功才恢复；任何不一致或设备失败都保持暂停。</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>5. main 已有能力与新增工作</h2>
+      <p>
+        下表只回答三个问题：哪些能力可以直接复用、它为什么还不足以处理进程退出、以及本方案究竟新增什么。
+        “已有 demo”表示已经完成的前置验证，不等同于 SGLang main 原生能力。
+      </p>
+      <div class="comparison-legend" aria-label="对照表图例">
+        <span><i class="existing-dot"></i>绿色：已有，可复用</span>
+        <span><i class="gap-dot"></i>黄色：当前缺口</span>
+        <span><i class="new-dot"></i>蓝色：需要新增</span>
+      </div>
+      <div class="table-wrap">
+        <table class="delta-table">
+          <thead>
+            <tr>
+              <th>子系统</th>
+              <th class="existing">main 已有 / 已完成验证</th>
+              <th class="gap">当前缺口</th>
+              <th class="new">本方案新增</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="system">服务控制</td>
+              <td class="existing">
+                <ul>
+                  <li>main 已有 TokenizerManager、DPC、Scheduler 之间的控制通道。</li>
+                  <li>前置 demo 已跑通 A1 status、A2 全 rank pause、A3 原拓扑 retry。</li>
+                </ul>
+              </td>
+              <td class="gap">
+                <ul>
+                  <li>demo 的 retry 假设所有进程仍存活。</li>
+                  <li>尚不能根据真实进程退出或硬件状态下发缩容。</li>
+                </ul>
+              </td>
+              <td class="new">
+                <ul>
+                  <li>在现有控制面增加进程/硬件状态、dead-rank 事件和 masked scale-down 指令。</li>
+                  <li>只联系存活 Scheduler；任何失败都保持暂停。</li>
+                </ul>
+              </td>
+            </tr>
+            <tr>
+              <td class="system">Scheduler 元数据</td>
+              <td class="existing">
+                <ul>
+                  <li><code>prepare_dp_attn_batch</code> 会通过 <code>MLPSyncBatchInfo.all_gather</code> 同步元数据。</li>
+                  <li>overlap schedule 默认可使用 <code>tp_group.cpu_group</code>（Gloo）。</li>
+                </ul>
+              </td>
+              <td class="gap">
+                <ul>
+                  <li>启动期 Gloo group 仍包含全部 original ranks；进程退出后 collective 会失败或等待。</li>
+                  <li>inactive rank 的 fallback 是在 all-gather 返回后才填写，无法保护这次 collective。</li>
+                </ul>
+              </td>
+              <td class="new">
+                <ul>
+                  <li>主方案复用服务控制 socket，在存活进程间 P2P 聚合，再把 dead-rank 槽位填为 IDLE/fallback。</li>
+                  <li>另做一次无故障 skip A/B，仅用于理解 all-gather 的调度作用，不作为容错方案分支。</li>
+                </ul>
+              </td>
+            </tr>
+            <tr>
+              <td class="system">MoE / DeepEP</td>
+              <td class="existing">
+                <ul>
+                  <li>SGLang 已通过 DeepEP 调用 dispatch/combine 与 low-latency 接口。</li>
+                  <li>公开的 sgl-kernel-npu 路径已有 V2/LowLatencyV2 包装。</li>
+                </ul>
+              </td>
+              <td class="gap">
+                <ul>
+                  <li>现有包装未暴露 rank 级 <code>elasticInfoOptional</code>。</li>
+                  <li><code>xActiveMaskOptional</code> 是 token mask，不能代替故障 rank mask。</li>
+                </ul>
+              </td>
+              <td class="new">
+                <ul>
+                  <li>先确认目标 CANN/硬件确实提供 DispatchV3/CombineV3。</li>
+                  <li>打通 sgl-kernel-npu → DeepEP Buffer → SGLang dispatcher 的 V3 参数链路。</li>
+                </ul>
+              </td>
+            </tr>
+            <tr>
+              <td class="system">DP-attention 与其他 HCCL</td>
+              <td class="existing">
+                <ul>
+                  <li>模型前向可通过 <code>_TP.device_group</code> 执行 all-gather、all-reduce 或 reduce-scatter。</li>
+                  <li>EPLB 与专家刷新路径也可能包含设备 collective。</li>
+                </ul>
+              </td>
+              <td class="gap">
+                <ul>
+                  <li>MoE V3 的 rank mask 只作用于配套 MoE 算子，不会自动保护这些通信。</li>
+                  <li>任何仍等待 dead rank 的 collective 都会阻止恢复。</li>
+                </ul>
+              </td>
+              <td class="new">
+                <ul>
+                  <li>对目标配置做通信 trace，逐项排除 dead-rank-dependent collective。</li>
+                  <li>第一版收紧 attention TP、MoE TP、dense TP 等参数；无法排除的通信另行设计，不冒充已解决。</li>
+                </ul>
+              </td>
+            </tr>
+            <tr>
+              <td class="system">专家状态</td>
+              <td class="existing">
+                <ul>
+                  <li>main 已有 EPLB 专家位置元数据和专家分布/刷新路径。</li>
+                </ul>
+              </td>
+              <td class="gap">
+                <ul>
+                  <li>更新位置 metadata 不等于恢复 dead rank 上的专家权重。</li>
+                  <li>存活卡的固定专家槽位未必覆盖全部 logical experts。</li>
+                </ul>
+              </td>
+              <td class="new">
+                <ul>
+                  <li>恢复前验证存活槽位是否覆盖全部 logical experts。</li>
+                  <li>需要时从副本、DRAM 或磁盘恢复权重，并保持每 rank 本地槽位数不变。</li>
+                </ul>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>6. GPU 与 NPU：统一控制，分别适配数据面</h2>
+      <div class="split">
+        <article class="panel">
+          <h3>统一的服务化能力</h3>
+          <ul class="compact-list">
+            <li>查询服务、进程和硬件状态；</li>
+            <li>关闭/开放 admission；</li>
+            <li>下发 retry、pause、scale-down 指令；</li>
+            <li>使用 original rank namespace 表达故障；</li>
+            <li>超时、失败上报和 fail-stop 语义保持一致。</li>
+          </ul>
+        </article>
+        <article class="panel">
+          <h3>设备侧分别适配</h3>
+          <ul class="compact-list">
+            <li>GPU：验证 Mooncake active mask 对 collective 与 MoE 数据面的真实覆盖；</li>
+            <li>NPU：接入 CANN MoE V3 <code>elasticInfoOptional</code>；</li>
+            <li>两侧都要分别审计 DP-attention、图捕捉和专家刷新；</li>
+            <li>不能因为共享控制面，就假设底层算子具有相同容错能力。</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>7. 实验顺序</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>阶段</th>
+              <th>环境</th>
+              <th>验证内容</th>
+              <th>通过标准</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>1 · 接口探测</td>
+              <td>NPU 服务器</td>
+              <td>确认硬件型号、CANN 9.0.0 是否导出 DispatchV3/CombineV3，核对参数与产品约束。</td>
+              <td>获得可调用符号、精确签名和最小正常样例；不根据文档版本猜实现。</td>
+            </tr>
+            <tr>
+              <td>2 · 健康态通信清单</td>
+              <td>NPU 服务器</td>
+              <td>记录 Scheduler Gloo、DP hidden-state HCCL、DeepEP/MC2、EPLB 通信。</td>
+              <td>一次 decode 中每个 collective 的 group、backend、调用点和张量规模可定位。</td>
+            </tr>
+            <tr>
+              <td>3 · Scheduler skip 健康态 A/B</td>
+              <td>NPU 服务器；所有 rank 健康</td>
+              <td>对照 Scheduler CPU metadata all-gather 开/关，并构造不同长度的并发请求，使各 DP rank 出现 prefill、decode、idle 等不同状态。</td>
+              <td>输出正确、连续请求稳定、forward mode 与 batch 组织正确；不能只看“没有 hang”。该实验只帮助理解 skip 的影响，不改变容错主方案。</td>
+            </tr>
+            <tr>
+              <td>4 · MoE V3 微实验</td>
+              <td>NPU 服务器</td>
+              <td>先脱离 SGLang，验证同一通信域创建后通过 elasticInfo 剔除一个故障 rank。</td>
+              <td>存活 rank 的 DispatchV3/CombineV3 有限时间返回，结果正确，无重新编译。</td>
+            </tr>
+            <tr>
+              <td>5 · sgl-kernel-npu 接入</td>
+              <td>NPU 服务器</td>
+              <td>把 V3 和 elasticInfo 暴露到 DeepEP Python API，并验证正常态回归。</td>
+              <td>全 active 与 V2 结果一致；scale-down 输入在 dispatch/combine 间保持一致。</td>
+            </tr>
+            <tr>
+              <td>6 · 进程退出集成</td>
+              <td>NPU 服务器</td>
+              <td>推理中 kill 一个 rank，控制面暂停、形成 mask、刷新元数据与 MoE 数据面。</td>
+              <td>不等待 dead rank；所有存活 rank 一致恢复，或在限定时间内明确保持暂停。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>7.1 Scheduler all-gather 理解性实验启动方式</h2>
+      <div class="callout">
+        <p>
+          两轮都在四个 rank 全部健康、未启用容错的情况下运行。baseline 和 skip 使用相同模型与参数，
+          仅切换 <code>SGLANG_SCHEDULER_SKIP_ALL_GATHER</code>。两轮顺序运行，不能同时占用同一组 NPU。
+        </p>
+      </div>
+      <h3>第一轮：baseline</h3>
+      <p>终端 A 启动服务：</p>
+      <pre class="formula">cd /home/hww/projects/sglang
+conda activate sglang-eep-npu
+PORT=31210 bash test/manual/ascend/run_scheduler_skip_understanding_server.sh baseline</pre>
+      <p>终端 B 确认服务就绪并发送混合请求：</p>
+      <pre class="formula">cd /home/hww/projects/sglang
+conda activate sglang-eep-npu
+curl --noproxy '*' -sS http://127.0.0.1:31210/model_info
+python test/manual/ascend/run_scheduler_skip_understanding_requests.py \
+  --base-url http://127.0.0.1:31210 \
+  --label baseline \
+  --output-dir artifacts/npu_eep/scheduler_skip_understanding/baseline</pre>
+      <p>请求完成后，在终端 A 按 <code>Ctrl+C</code> 停止 baseline 服务。</p>
+
+      <h3>第二轮：skip</h3>
+      <p>终端 A 启动只改变 skip 开关的服务：</p>
+      <pre class="formula">cd /home/hww/projects/sglang
+conda activate sglang-eep-npu
+PORT=31211 bash test/manual/ascend/run_scheduler_skip_understanding_server.sh skip</pre>
+      <p>终端 B 发送同一组请求，并与 baseline 的确定性输出对比：</p>
+      <pre class="formula">cd /home/hww/projects/sglang
+conda activate sglang-eep-npu
+curl --noproxy '*' -sS http://127.0.0.1:31211/model_info
+python test/manual/ascend/run_scheduler_skip_understanding_requests.py \
+  --base-url http://127.0.0.1:31211 \
+  --label skip \
+  --output-dir artifacts/npu_eep/scheduler_skip_understanding/skip \
+  --compare-with artifacts/npu_eep/scheduler_skip_understanding/baseline/result.json</pre>
+      <p>
+        需要复制给我的是两个 <code>result.json</code> 的内容，以及对应 <code>server.log</code>
+        中包含 error、exception、traceback 或 timeout 的行；不需要传输文件。
+      </p>
+    </section>
+
+    <section class="section">
+      <h2>8. 第一版验收</h2>
+      <div class="acceptance">
+        <div class="check">
+          <div>
+            <b>真实进程退出</b>
+            <span>不是只注入 Python 异常，也不要求故障 rank 继续参加 CPU 通信。</span>
+          </div>
+        </div>
+        <div class="check">
+          <div>
+            <b>固定拓扑与图地址</b>
+            <span>original rank、ServerArgs、图与预分配容量不因缩容改变。</span>
+          </div>
+        </div>
+        <div class="check">
+          <div>
+            <b>MoE 数据面避开故障卡</b>
+            <span>DispatchV3/CombineV3 使用一致 elasticInfo，存活 rank 不无限等待。</span>
+          </div>
+        </div>
+        <div class="check">
+          <div>
+            <b>不存在漏网 collective</b>
+            <span>DP-attention、LM head、dense MLP 与 EPLB 不再依赖 dead rank。</span>
+          </div>
+        </div>
+        <div class="check">
+          <div>
+            <b>专家权重可用</b>
+            <span>metadata 更新不等于权重恢复；丢失专家必须有存活副本、DRAM 或磁盘来源。</span>
+          </div>
+        </div>
+        <div class="check">
+          <div>
+            <b>失败时 fail-stop</b>
+            <span>恢复中任何不一致、超时或设备错误都不得重新开放推理。</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>9. 当前未决问题</h2>
+      <div class="split">
+        <article class="panel">
+          <h3>接口与硬件</h3>
+          <ul class="compact-list">
+            <li>实际 NPU 是 Atlas A2 还是 A3 产品系列；</li>
+            <li>CANN 9.0.0 安装包是否包含可用的 MoE V3 动态缩容实现；</li>
+            <li>DeepEP normal、low-latency、fused 三条路径分别对应哪组 V3 接口；</li>
+            <li>故障进程退出后，存活 rank 上正在执行的旧算子如何有限时间结束。</li>
+          </ul>
+        </article>
+        <article class="panel">
+          <h3>SGLang 热路径</h3>
+          <ul class="compact-list">
+            <li>存活 rank 的控制面聚合需要同步哪些 Scheduler 字段；</li>
+            <li>控制面聚合的一致性与每步延迟是否可接受；</li>
+            <li>DP-attention gather/reduce 是否能通过参数组合完全消除；</li>
+            <li>MoE 专家刷新是否包含 WORLD/TP collective，权重恢复来源是什么。</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <p>
+        代码定位：
+        <code>managers/scheduler_components/dp_attn.py</code>、
+        <code>layers/dp_attention.py</code>、
+        <code>layers/moe/token_dispatcher/deepep.py</code>、
+        <code>distributed/parallel_state.py</code>。
+      </p>
+      <p>
+        官方依据：
+        <a href="https://www.hiascend.com/document/detail/zh/canncommercial/850/API/aolapi/context/ops-transformer/aclnnMoeDistributeDispatchV3.md">CANN MoeDistributeDispatchV3</a>、
+        <a href="https://www.hiascend.com/document/detail/zh/canncommercial/850/API/aolapi/context/ops-transformer/aclnnMoeDistributeCombineV3.md">CANN MoeDistributeCombineV3</a>、
+        <a href="https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1alpha003/API/aolapi/context/aclnnMoeDistributeDispatchV2.md">CANN MoeDistributeDispatchV2</a>。
+      </p>
+      <p>更新时间：2026-07-28。本文描述当前可验证路线，不把尚未现场确认的 CANN 能力写成已完成适配。</p>
+    </footer>
+  </main>
+</body>
+</html>
