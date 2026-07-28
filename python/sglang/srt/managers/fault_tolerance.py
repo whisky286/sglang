@@ -92,6 +92,135 @@ class FaultToleranceManager:
         )
         return response
 
+    async def probe_survivor_metadata(
+        self, *, active_mask: Iterable[int]
+    ) -> Tuple[int, dict]:
+        """Collect Scheduler snapshots only from active original ranks.
+
+        This is an A4 feasibility probe for the existing CPU control path. It
+        deliberately does not update topology or replace the per-step
+        MLPSyncBatchInfo collective.
+        """
+
+        try:
+            normalized_mask = self._validate_active_mask(active_mask)
+        except ValueError as exc:
+            return 400, {
+                "success": False,
+                "experiment": "A4-survivor-only-cpu-metadata",
+                "last_error": str(exc),
+            }
+
+        active_ranks = tuple(
+            rank for rank, is_active in enumerate(normalized_mask) if is_active
+        )
+        command_id, pending, timed_out, dispatch_error = await self._execute_command(
+            command="probe_scheduler_metadata",
+            target_original_ranks=active_ranks,
+        )
+        missing_ranks = sorted(
+            pending.target_original_ranks.difference(pending.outputs)
+        )
+        failed_ranks = sorted(
+            rank for rank, output in pending.outputs.items() if not output.success
+        )
+        invalid_metadata_ranks = sorted(
+            rank
+            for rank, output in pending.outputs.items()
+            if output.success and output.scheduler_metadata is None
+        )
+        complete = (
+            not missing_ranks
+            and not failed_ranks
+            and not invalid_metadata_ranks
+            and dispatch_error is None
+            and not timed_out
+        )
+
+        slots = []
+        for original_rank, is_active in enumerate(normalized_mask):
+            if not is_active:
+                slots.append(
+                    {
+                        "original_rank": original_rank,
+                        "active": False,
+                        "source": "IDLE/fallback",
+                        "metadata": {
+                            "num_running_requests": 0,
+                            "num_waiting_requests": 0,
+                            "last_batch_forward_mode": "IDLE",
+                        },
+                    }
+                )
+                continue
+
+            output = pending.outputs.get(original_rank)
+            metadata = (
+                {
+                    "num_running_requests": (
+                        output.scheduler_metadata.num_running_requests
+                    ),
+                    "num_waiting_requests": (
+                        output.scheduler_metadata.num_waiting_requests
+                    ),
+                    "last_batch_forward_mode": (
+                        output.scheduler_metadata.last_batch_forward_mode
+                    ),
+                }
+                if output is not None and output.scheduler_metadata is not None
+                else None
+            )
+            slots.append(
+                {
+                    "original_rank": original_rank,
+                    "active": True,
+                    "source": "Scheduler" if metadata is not None else "MISSING",
+                    "metadata": metadata,
+                }
+            )
+
+        errors = []
+        if dispatch_error is not None:
+            errors.append(dispatch_error)
+        if timed_out:
+            errors.append(
+                "Timed out waiting for Scheduler metadata from active original "
+                f"ranks {missing_ranks}"
+            )
+        if failed_ranks:
+            errors.append(
+                "Scheduler metadata probe failed on active original ranks "
+                f"{failed_ranks}"
+            )
+        if invalid_metadata_ranks:
+            errors.append(
+                "Scheduler metadata was absent on active original ranks "
+                f"{invalid_metadata_ranks}"
+            )
+
+        body = {
+            "success": complete,
+            "experiment": "A4-survivor-only-cpu-metadata",
+            "command_id": command_id,
+            "active_mask": [int(value) for value in normalized_mask],
+            "target_original_ranks": list(active_ranks),
+            "acknowledged_ranks": sorted(pending.outputs),
+            "missing_ranks": missing_ranks,
+            "failed_ranks": failed_ranks,
+            "invalid_metadata_ranks": invalid_metadata_ranks,
+            "slots": slots,
+            "last_error": "; ".join(errors) if errors else None,
+        }
+        logger.info(
+            "[FaultTolerance] finish metadata probe command_id=%s success=%s "
+            "target_ranks=%s acknowledged_ranks=%s",
+            command_id,
+            complete,
+            list(active_ranks),
+            sorted(pending.outputs),
+        )
+        return (200 if complete else 503), body
+
     async def arm_recoverable_error(
         self, *, original_rank: int, request_id: str
     ) -> Tuple[int, dict]:
@@ -438,6 +567,19 @@ class FaultToleranceManager:
             self._pending_commands.pop(command_id, None)
 
         return command_id, pending, timed_out, dispatch_error
+
+    def _validate_active_mask(self, active_mask: Iterable[int]) -> Tuple[bool, ...]:
+        values = tuple(active_mask)
+        if len(values) != len(self.original_ranks):
+            raise ValueError(
+                "active_mask length must match original_world_size "
+                f"({len(self.original_ranks)}), got {len(values)}"
+            )
+        if any(type(value) is not int or value not in (0, 1) for value in values):
+            raise ValueError("active_mask must contain only integer 0 or 1")
+        if not any(values):
+            raise ValueError("active_mask must keep at least one original rank active")
+        return tuple(bool(value) for value in values)
 
     def handle_command_output(self, output: FaultToleranceCommandReqOutput) -> None:
         """Record a valid acknowledgement; ignore stale or duplicate output."""

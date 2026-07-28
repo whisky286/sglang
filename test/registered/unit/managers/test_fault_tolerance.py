@@ -15,7 +15,9 @@ from sglang.srt.managers.io_struct import (
     FaultToleranceApplyReqInput,
     FaultToleranceCommandReqInput,
     FaultToleranceCommandReqOutput,
+    FaultToleranceMetadataProbeReqInput,
     FaultToleranceRecoverableErrorOutput,
+    FaultToleranceSchedulerMetadata,
     msgpack_decode,
     msgpack_encode,
 )
@@ -30,6 +32,7 @@ def _ack(
     *,
     success: bool = True,
     engine_paused: bool = False,
+    scheduler_metadata: FaultToleranceSchedulerMetadata | None = None,
 ) -> FaultToleranceCommandReqOutput:
     return FaultToleranceCommandReqOutput(
         command_id=request.command_id,
@@ -37,6 +40,7 @@ def _ack(
         original_rank=original_rank,
         success=success,
         engine_paused=engine_paused,
+        scheduler_metadata=scheduler_metadata,
     )
 
 
@@ -153,6 +157,8 @@ class TestFaultToleranceControlRouting(CustomTestCase):
         self.assertEqual(msgpack_decode(msgpack_encode(event)), event)
         apply_request = FaultToleranceApplyReqInput(action="retry")
         self.assertEqual(msgpack_decode(msgpack_encode(apply_request)), apply_request)
+        probe_request = FaultToleranceMetadataProbeReqInput(active_mask=[1, 0, 1, 1])
+        self.assertEqual(msgpack_decode(msgpack_encode(probe_request)), probe_request)
 
     def test_dpc_routes_only_to_available_target_original_ranks(self):
         controller = DataParallelController.__new__(DataParallelController)
@@ -205,6 +211,125 @@ class TestFaultToleranceControlRouting(CustomTestCase):
             target_original_ranks=[0, 3],
         )
         self.assertIsNone(scheduler.handle_fault_tolerance_command(untargeted_request))
+
+
+class TestFaultToleranceSurvivorMetadataProbe(CustomTestCase):
+    def _new_manager(self, dispatch, timeout: float = 0.02):
+        return FaultToleranceManager(
+            original_world_size=4,
+            command_timeout=timeout,
+            dispatch_command=dispatch,
+        )
+
+    def test_contacts_only_survivors_and_fills_dead_original_rank_slot(self):
+        requests = []
+        manager = None
+
+        def dispatch(request):
+            requests.append(request)
+            for rank in request.target_original_ranks:
+                manager.handle_command_output(
+                    _ack(
+                        request,
+                        rank,
+                        scheduler_metadata=FaultToleranceSchedulerMetadata(
+                            num_running_requests=rank + 1,
+                            num_waiting_requests=rank,
+                            last_batch_forward_mode="DECODE",
+                        ),
+                    )
+                )
+
+        manager = self._new_manager(dispatch)
+        status_code, body = asyncio.run(
+            manager.probe_survivor_metadata(active_mask=[1, 0, 1, 1])
+        )
+
+        self.assertEqual(status_code, 200)
+        self.assertTrue(body["success"])
+        self.assertEqual(requests[0].target_original_ranks, [0, 2, 3])
+        self.assertEqual(body["target_original_ranks"], [0, 2, 3])
+        self.assertEqual(body["acknowledged_ranks"], [0, 2, 3])
+        self.assertEqual(
+            [slot["original_rank"] for slot in body["slots"]], [0, 1, 2, 3]
+        )
+        self.assertEqual(body["slots"][1]["source"], "IDLE/fallback")
+        self.assertEqual(
+            body["slots"][1]["metadata"],
+            {
+                "num_running_requests": 0,
+                "num_waiting_requests": 0,
+                "last_batch_forward_mode": "IDLE",
+            },
+        )
+        self.assertEqual(body["slots"][2]["source"], "Scheduler")
+        self.assertEqual(body["slots"][2]["metadata"]["num_running_requests"], 3)
+
+    def test_rejects_invalid_active_masks_before_dispatch(self):
+        dispatch = MagicMock()
+        manager = self._new_manager(dispatch)
+
+        for mask in ([1, 0, 1], [1, 2, 1, 1], [0, 0, 0, 0]):
+            with self.subTest(mask=mask):
+                status_code, body = asyncio.run(
+                    manager.probe_survivor_metadata(active_mask=mask)
+                )
+                self.assertEqual(status_code, 400)
+                self.assertFalse(body["success"])
+
+        dispatch.assert_not_called()
+
+    def test_missing_active_rank_fails_without_filling_it_as_idle(self):
+        manager = None
+
+        def dispatch(request):
+            for rank in (0, 2):
+                manager.handle_command_output(
+                    _ack(
+                        request,
+                        rank,
+                        scheduler_metadata=FaultToleranceSchedulerMetadata(
+                            num_running_requests=0,
+                            num_waiting_requests=0,
+                            last_batch_forward_mode="IDLE",
+                        ),
+                    )
+                )
+
+        manager = self._new_manager(dispatch, timeout=0.001)
+        status_code, body = asyncio.run(
+            manager.probe_survivor_metadata(active_mask=[1, 0, 1, 1])
+        )
+
+        self.assertEqual(status_code, 503)
+        self.assertFalse(body["success"])
+        self.assertEqual(body["missing_ranks"], [3])
+        self.assertEqual(body["slots"][3]["source"], "MISSING")
+        self.assertIsNone(body["slots"][3]["metadata"])
+
+    def test_scheduler_reports_its_current_local_state(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.ps = SimpleNamespace(dp_rank=2)
+        scheduler._engine_paused = True
+        scheduler.running_batch = SimpleNamespace(reqs=[object(), object()])
+        scheduler.waiting_queue = [object()]
+        scheduler.last_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(name="DECODE")
+        )
+        request = FaultToleranceCommandReqInput(
+            command_id="metadata-command",
+            command="probe_scheduler_metadata",
+            target_original_ranks=[0, 2, 3],
+        )
+
+        output = scheduler.handle_fault_tolerance_command(request)
+
+        self.assertTrue(output.success)
+        self.assertEqual(output.original_rank, 2)
+        self.assertTrue(output.engine_paused)
+        self.assertEqual(output.scheduler_metadata.num_running_requests, 2)
+        self.assertEqual(output.scheduler_metadata.num_waiting_requests, 1)
+        self.assertEqual(output.scheduler_metadata.last_batch_forward_mode, "DECODE")
 
 
 class TestFaultToleranceCoordinatedPause(CustomTestCase):

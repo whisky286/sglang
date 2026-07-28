@@ -107,6 +107,7 @@ from sglang.srt.managers.io_struct import (
     FaultToleranceCommandReqInput,
     FaultToleranceCommandReqOutput,
     FaultToleranceRecoverableErrorOutput,
+    FaultToleranceSchedulerMetadata,
     FlushCacheReqInput,
     FreezeGCReq,
     GetInternalStateReq,
@@ -4309,6 +4310,41 @@ class Scheduler(
                 original_rank=original_rank,
                 success=True,
                 engine_paused=self._engine_paused,
+            )
+
+        if recv_req.command == "probe_scheduler_metadata":
+            running_batch = getattr(self, "running_batch", None)
+            waiting_queue = getattr(self, "waiting_queue", ())
+            last_batch = getattr(self, "last_batch", None)
+            last_forward_mode = (
+                last_batch.forward_mode.name
+                if last_batch is not None
+                and getattr(last_batch, "forward_mode", None) is not None
+                else "IDLE"
+            )
+            metadata = FaultToleranceSchedulerMetadata(
+                num_running_requests=(
+                    len(getattr(running_batch, "reqs", ()))
+                    if running_batch is not None
+                    else 0
+                ),
+                num_waiting_requests=len(waiting_queue),
+                last_batch_forward_mode=last_forward_mode,
+            )
+            logger.info(
+                "[FaultTolerance][Scheduler] metadata probe ack command_id=%s "
+                "original_rank=%s metadata=%s",
+                recv_req.command_id,
+                original_rank,
+                metadata,
+            )
+            return FaultToleranceCommandReqOutput(
+                command_id=recv_req.command_id,
+                command=recv_req.command,
+                original_rank=original_rank,
+                success=True,
+                engine_paused=self._engine_paused,
+                scheduler_metadata=metadata,
             )
 
         if recv_req.command == "arm_recoverable_error":

@@ -122,6 +122,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FaultToleranceApplyReqInput,
     FaultToleranceInjectReqInput,
+    FaultToleranceMetadataProbeReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -1631,6 +1632,22 @@ async def fault_tolerance_status(request: Request):
 
     status_code, content = (
         await _global_state.tokenizer_manager.fault_tolerance_status()
+    )
+    return ORJSONResponse(content=content, status_code=status_code)
+
+
+@app.post("/fault_tolerance/probe_survivor_metadata")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def fault_tolerance_probe_survivor_metadata(
+    obj: Annotated[FaultToleranceMetadataProbeReqInput, Body()], request: Request
+):
+    """Run the read-only A4 survivor-only CPU metadata aggregation probe."""
+
+    (
+        status_code,
+        content,
+    ) = await _global_state.tokenizer_manager.fault_tolerance_probe_survivor_metadata(
+        obj
     )
     return ORJSONResponse(content=content, status_code=status_code)
 

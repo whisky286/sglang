@@ -1527,6 +1527,14 @@ class FaultToleranceCommandReqInput(BaseReq, kw_only=True):
     request_id: Optional[str] = None
 
 
+class FaultToleranceSchedulerMetadata(msgspec.Struct, kw_only=True, array_like=True):
+    """Small CPU-side Scheduler snapshot returned by the A4 control probe."""
+
+    num_running_requests: int
+    num_waiting_requests: int
+    last_batch_forward_mode: str
+
+
 class FaultToleranceCommandReqOutput(BaseReq, kw_only=True):
     """Per-rank acknowledgement for a fault-tolerance control command."""
 
@@ -1536,6 +1544,13 @@ class FaultToleranceCommandReqOutput(BaseReq, kw_only=True):
     success: bool
     engine_paused: bool
     message: str = ""
+    scheduler_metadata: Optional[FaultToleranceSchedulerMetadata] = None
+
+
+class FaultToleranceMetadataProbeReqInput(BaseReq, kw_only=True):
+    """Probe survivor-only CPU metadata aggregation without changing topology."""
+
+    active_mask: List[int]
 
 
 class FaultToleranceInjectReqInput(BaseReq, kw_only=True):
