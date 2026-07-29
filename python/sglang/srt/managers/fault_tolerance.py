@@ -24,10 +24,25 @@ from typing import Callable, Dict, FrozenSet, Iterable, Optional, Tuple
 from sglang.srt.managers.io_struct import (
     FaultToleranceCommandReqInput,
     FaultToleranceCommandReqOutput,
+    FaultToleranceMLPSyncMetadata,
     FaultToleranceRecoverableErrorOutput,
 )
 
 logger = logging.getLogger(__name__)
+
+_MLP_SYNC_METADATA_FIELDS = (
+    "num_tokens",
+    "num_tokens_for_logprob",
+    "can_cuda_graph",
+    "is_extend_in_batch",
+    "local_can_run_tbo",
+    "local_forward_mode",
+    "can_run_breakable_cuda_graph",
+)
+
+
+def _mlp_sync_metadata_to_dict(metadata: FaultToleranceMLPSyncMetadata) -> dict:
+    return {field: getattr(metadata, field) for field in _MLP_SYNC_METADATA_FIELDS}
 
 
 @dataclasses.dataclass(slots=True)
@@ -220,6 +235,200 @@ class FaultToleranceManager:
             sorted(pending.outputs),
         )
         return (200 if complete else 503), body
+
+    async def probe_metadata_parity(self) -> Tuple[int, dict]:
+        """Compare one real healthy-rank MLP-sync collective with CPU aggregation.
+
+        The collective is intentionally run only after every original Scheduler
+        acknowledges that inference is paused. This keeps normal scheduling
+        collectives from interleaving with the A5 probe.
+        """
+
+        (
+            precheck_command_id,
+            precheck,
+            precheck_timed_out,
+            precheck_dispatch_error,
+        ) = await self._execute_command(
+            command="status",
+            target_original_ranks=self.original_ranks,
+        )
+        precheck_missing = sorted(
+            precheck.target_original_ranks.difference(precheck.outputs)
+        )
+        precheck_failed = sorted(
+            rank for rank, output in precheck.outputs.items() if not output.success
+        )
+        unpaused_ranks = sorted(
+            rank
+            for rank, output in precheck.outputs.items()
+            if output.success and not output.engine_paused
+        )
+        precheck_errors = []
+        if precheck_dispatch_error is not None:
+            precheck_errors.append(precheck_dispatch_error)
+        if precheck_timed_out:
+            precheck_errors.append(
+                "Timed out checking whether all original Schedulers are paused"
+            )
+        if precheck_missing:
+            precheck_errors.append(
+                f"Pause precheck did not receive ranks {precheck_missing}"
+            )
+        if precheck_failed:
+            precheck_errors.append(f"Pause precheck failed on ranks {precheck_failed}")
+        if unpaused_ranks:
+            precheck_errors.append(
+                "A5 requires every original Scheduler to be paused; "
+                f"unpaused ranks are {unpaused_ranks}"
+            )
+        if precheck_errors:
+            body = {
+                "success": False,
+                "experiment": "A5-mlp-sync-metadata-parity",
+                "phase": "pause-precheck",
+                "pause_precheck_command_id": precheck_command_id,
+                "original_ranks": list(self.original_ranks),
+                "missing_ranks": precheck_missing,
+                "failed_ranks": precheck_failed,
+                "unpaused_ranks": unpaused_ranks,
+                "last_error": "; ".join(precheck_errors),
+            }
+            return (409 if unpaused_ranks and not precheck_missing else 503), body
+
+        command_id, pending, timed_out, dispatch_error = await self._execute_command(
+            command="probe_mlp_sync_metadata_parity",
+            target_original_ranks=self.original_ranks,
+        )
+        missing_ranks = sorted(
+            pending.target_original_ranks.difference(pending.outputs)
+        )
+        failed_ranks = sorted(
+            rank for rank, output in pending.outputs.items() if not output.success
+        )
+        invalid_ranks = sorted(
+            rank
+            for rank, output in pending.outputs.items()
+            if output.success
+            and (
+                output.mlp_sync_local_metadata is None
+                or output.mlp_sync_collective_metadata is None
+                or output.mlp_sync_group is None
+            )
+        )
+
+        cpu_control_slots = []
+        if not missing_ranks and not failed_ranks and not invalid_ranks:
+            cpu_control_slots = [
+                {
+                    "original_rank": rank,
+                    "metadata": _mlp_sync_metadata_to_dict(
+                        pending.outputs[rank].mlp_sync_local_metadata
+                    ),
+                }
+                for rank in self.original_ranks
+            ]
+
+        comparisons = []
+        if cpu_control_slots:
+            expected_slots = [slot["metadata"] for slot in cpu_control_slots]
+            for reporting_rank in self.original_ranks:
+                output = pending.outputs[reporting_rank]
+                collective = output.mlp_sync_collective_metadata
+                mismatches = []
+                if len(collective) != len(expected_slots):
+                    mismatches.append(
+                        {
+                            "field": "slot_count",
+                            "cpu_control": len(expected_slots),
+                            "collective": len(collective),
+                        }
+                    )
+                else:
+                    for slot_rank, (expected, actual_metadata) in enumerate(
+                        zip(expected_slots, collective)
+                    ):
+                        actual = _mlp_sync_metadata_to_dict(actual_metadata)
+                        for field in _MLP_SYNC_METADATA_FIELDS:
+                            if actual[field] != expected[field]:
+                                mismatches.append(
+                                    {
+                                        "original_rank": slot_rank,
+                                        "field": field,
+                                        "cpu_control": expected[field],
+                                        "collective": actual[field],
+                                    }
+                                )
+                comparisons.append(
+                    {
+                        "reporting_rank": reporting_rank,
+                        "matched": not mismatches,
+                        "mismatches": mismatches,
+                    }
+                )
+
+        group_kinds = sorted(
+            {
+                output.mlp_sync_group
+                for output in pending.outputs.values()
+                if output.mlp_sync_group is not None
+            }
+        )
+        errors = []
+        if dispatch_error is not None:
+            errors.append(dispatch_error)
+        if timed_out:
+            errors.append(
+                "Timed out waiting for the healthy-rank MLP-sync parity probe"
+            )
+        if missing_ranks:
+            errors.append(f"Parity probe did not receive ranks {missing_ranks}")
+        if failed_ranks:
+            errors.append(f"Parity probe failed on ranks {failed_ranks}")
+        if invalid_ranks:
+            errors.append(
+                f"Parity probe returned incomplete data on ranks {invalid_ranks}"
+            )
+        mismatched_ranks = [
+            item["reporting_rank"] for item in comparisons if not item["matched"]
+        ]
+        if mismatched_ranks:
+            errors.append(
+                "CPU control aggregation differs from collective views reported "
+                f"by ranks {mismatched_ranks}"
+            )
+        if len(group_kinds) != 1:
+            errors.append(
+                "Schedulers selected different MLP-sync communication paths: "
+                f"{group_kinds}"
+            )
+
+        success = not errors and len(comparisons) == len(self.original_ranks)
+        body = {
+            "success": success,
+            "experiment": "A5-mlp-sync-metadata-parity",
+            "phase": "compare",
+            "pause_precheck_command_id": precheck_command_id,
+            "command_id": command_id,
+            "original_ranks": list(self.original_ranks),
+            "metadata_fields": list(_MLP_SYNC_METADATA_FIELDS),
+            "mlp_sync_group": group_kinds[0] if len(group_kinds) == 1 else None,
+            "cpu_control_slots": cpu_control_slots,
+            "comparisons": comparisons,
+            "missing_ranks": missing_ranks,
+            "failed_ranks": failed_ranks,
+            "invalid_ranks": invalid_ranks,
+            "last_error": "; ".join(errors) if errors else None,
+        }
+        logger.info(
+            "[FaultTolerance] finish A5 metadata parity command_id=%s "
+            "success=%s group=%s mismatched_ranks=%s",
+            command_id,
+            success,
+            body["mlp_sync_group"],
+            mismatched_ranks,
+        )
+        return (200 if success else 503), body
 
     async def arm_recoverable_error(
         self, *, original_rank: int, request_id: str

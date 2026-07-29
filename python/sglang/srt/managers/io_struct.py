@@ -1535,6 +1535,18 @@ class FaultToleranceSchedulerMetadata(msgspec.Struct, kw_only=True, array_like=T
     last_batch_forward_mode: str
 
 
+class FaultToleranceMLPSyncMetadata(msgspec.Struct, kw_only=True, array_like=True):
+    """One original-rank slot in the A5 MLP-sync metadata parity probe."""
+
+    num_tokens: int
+    num_tokens_for_logprob: int
+    can_cuda_graph: bool
+    is_extend_in_batch: bool
+    local_can_run_tbo: bool
+    local_forward_mode: int
+    can_run_breakable_cuda_graph: bool
+
+
 class FaultToleranceCommandReqOutput(BaseReq, kw_only=True):
     """Per-rank acknowledgement for a fault-tolerance control command."""
 
@@ -1545,12 +1557,21 @@ class FaultToleranceCommandReqOutput(BaseReq, kw_only=True):
     engine_paused: bool
     message: str = ""
     scheduler_metadata: Optional[FaultToleranceSchedulerMetadata] = None
+    mlp_sync_local_metadata: Optional[FaultToleranceMLPSyncMetadata] = None
+    mlp_sync_collective_metadata: Optional[List[FaultToleranceMLPSyncMetadata]] = None
+    mlp_sync_group: Optional[str] = None
 
 
 class FaultToleranceMetadataProbeReqInput(BaseReq, kw_only=True):
     """Probe survivor-only CPU metadata aggregation without changing topology."""
 
     active_mask: List[int]
+
+
+class FaultToleranceMetadataParityProbeReqInput(BaseReq, kw_only=True):
+    """Compare healthy-rank MLP-sync all-gather with CPU control aggregation."""
+
+    pass
 
 
 class FaultToleranceInjectReqInput(BaseReq, kw_only=True):

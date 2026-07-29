@@ -106,6 +106,7 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FaultToleranceCommandReqInput,
     FaultToleranceCommandReqOutput,
+    FaultToleranceMLPSyncMetadata,
     FaultToleranceRecoverableErrorOutput,
     FaultToleranceSchedulerMetadata,
     FlushCacheReqInput,
@@ -183,7 +184,10 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
+from sglang.srt.managers.scheduler_components.dp_attn import (
+    MLPSyncBatchInfo,
+    SchedulerDPAttnAdapter,
+)
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
 from sglang.srt.managers.scheduler_components.invariant_checker import (
@@ -4347,6 +4351,37 @@ class Scheduler(
                 scheduler_metadata=metadata,
             )
 
+        if recv_req.command == "probe_mlp_sync_metadata_parity":
+            try:
+                local_metadata, collective_metadata, group_kind = (
+                    self._probe_mlp_sync_metadata_parity(original_rank)
+                )
+                return FaultToleranceCommandReqOutput(
+                    command_id=recv_req.command_id,
+                    command=recv_req.command,
+                    original_rank=original_rank,
+                    success=True,
+                    engine_paused=self._engine_paused,
+                    mlp_sync_local_metadata=local_metadata,
+                    mlp_sync_collective_metadata=collective_metadata,
+                    mlp_sync_group=group_kind,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "[FaultTolerance][Scheduler] A5 metadata parity failed "
+                    "command_id=%s original_rank=%s",
+                    recv_req.command_id,
+                    original_rank,
+                )
+                return FaultToleranceCommandReqOutput(
+                    command_id=recv_req.command_id,
+                    command=recv_req.command,
+                    original_rank=original_rank,
+                    success=False,
+                    engine_paused=self._engine_paused,
+                    message=str(exc),
+                )
+
         if recv_req.command == "arm_recoverable_error":
             if not recv_req.request_id:
                 return FaultToleranceCommandReqOutput(
@@ -4474,6 +4509,106 @@ class Scheduler(
             engine_paused=self._engine_paused,
             message=f"Unsupported fault-tolerance command: {recv_req.command}",
         )
+
+    def _probe_mlp_sync_metadata_parity(self, original_rank: int) -> Tuple[
+        FaultToleranceMLPSyncMetadata,
+        List[FaultToleranceMLPSyncMetadata],
+        str,
+    ]:
+        """Run one test-only MLP-sync collective with rank-distinct metadata."""
+
+        if not self.server_args.enable_dp_attention:
+            raise RuntimeError("A5 requires --enable-dp-attention")
+        if self.ps.attn_tp_size != 1 or self.ps.attn_cp_size != 1:
+            raise RuntimeError(
+                "A5 v1 requires attention TP=1 and attention CP=1, got "
+                f"attn_tp_size={self.ps.attn_tp_size} "
+                f"attn_cp_size={self.ps.attn_cp_size}"
+            )
+
+        # The values are deliberately distinct per original rank so that a
+        # swapped slot or dropped field cannot accidentally compare equal.
+        local_metadata = FaultToleranceMLPSyncMetadata(
+            num_tokens=11 * (original_rank + 1),
+            num_tokens_for_logprob=7 * (original_rank + 1),
+            can_cuda_graph=original_rank % 2 == 0,
+            is_extend_in_batch=original_rank % 3 == 1,
+            local_can_run_tbo=original_rank % 3 != 2,
+            local_forward_mode=(original_rank % 4) + 1,
+            can_run_breakable_cuda_graph=original_rank % 2 == 1,
+        )
+        sync_info = MLPSyncBatchInfo(
+            dp_size=self.server_args.dp_size,
+            tp_size=self.ps.attn_tp_size,
+            cp_size=self.ps.attn_cp_size,
+            num_tokens=local_metadata.num_tokens,
+            num_tokens_for_logprob=local_metadata.num_tokens_for_logprob,
+            can_cuda_graph=local_metadata.can_cuda_graph,
+            is_extend_in_batch=local_metadata.is_extend_in_batch,
+            local_can_run_tbo=local_metadata.local_can_run_tbo,
+            local_forward_mode=local_metadata.local_forward_mode,
+            can_run_breakable_cuda_graph=(local_metadata.can_run_breakable_cuda_graph),
+        )
+
+        from sglang.srt.layers.dp_attention import world_dp_gather_enabled
+
+        use_world_group = world_dp_gather_enabled()
+        if use_world_group:
+            group = torch.distributed.group.WORLD
+            device = self.world_group.device
+            use_all_reduce = True
+            group_kind = "world-device-all-reduce"
+        elif len(self.dp_attn_adapter.offload_tags) == 0 and (
+            self.server_args.disable_overlap_schedule
+            or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
+        ):
+            group = self.tp_group.device_group
+            device = self.tp_group.device
+            use_all_reduce = False
+            group_kind = "tp-device-all-gather"
+        else:
+            group = self.tp_group.cpu_group
+            device = "cpu"
+            use_all_reduce = False
+            group_kind = "tp-cpu-all-gather"
+
+        expected_group_size = (
+            self.server_args.dp_size * self.ps.attn_tp_size * self.ps.attn_cp_size
+        )
+        actual_group_size = torch.distributed.get_world_size(group)
+        if actual_group_size != expected_group_size:
+            raise RuntimeError(
+                "A5 MLP-sync group size does not match its fixed metadata view: "
+                f"group={group_kind} actual={actual_group_size} "
+                f"expected={expected_group_size}"
+            )
+
+        sync_info.all_gather(
+            device=device,
+            group=group,
+            use_all_reduce=use_all_reduce,
+        )
+        collective_metadata = [
+            FaultToleranceMLPSyncMetadata(
+                num_tokens=int(row[0].item()),
+                num_tokens_for_logprob=int(row[1].item()),
+                can_cuda_graph=bool(row[2].item()),
+                is_extend_in_batch=bool(row[3].item()),
+                local_can_run_tbo=bool(row[4].item()),
+                local_forward_mode=int(row[5].item()),
+                can_run_breakable_cuda_graph=bool(row[6].item()),
+            )
+            for row in sync_info.tp0_info
+        ]
+        logger.info(
+            "[FaultTolerance][Scheduler] A5 metadata parity ack "
+            "original_rank=%s group=%s local=%s collective=%s",
+            original_rank,
+            group_kind,
+            local_metadata,
+            collective_metadata,
+        )
+        return local_metadata, collective_metadata, group_kind
 
     def _maybe_inject_recoverable_error(
         self, recv_req: TokenizedGenerateReqInput

@@ -71,6 +71,7 @@ from sglang.srt.managers.io_struct import (
     FaultToleranceApplyReqInput,
     FaultToleranceCommandReqOutput,
     FaultToleranceInjectReqInput,
+    FaultToleranceMetadataParityProbeReqInput,
     FaultToleranceMetadataProbeReqInput,
     FaultToleranceRecoverableErrorOutput,
     FreezeGCReq,
@@ -1811,6 +1812,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return await self.fault_tolerance_manager.probe_survivor_metadata(
             active_mask=obj.active_mask
         )
+
+    async def fault_tolerance_probe_metadata_parity(
+        self, obj: FaultToleranceMetadataParityProbeReqInput
+    ) -> Tuple[int, dict]:
+        del obj
+        if self.fault_tolerance_manager is None:
+            return 503, {
+                "success": False,
+                "experiment": "A5-mlp-sync-metadata-parity",
+                "last_error": "Start the server with --enable-fault-tolerance",
+            }
+        if not self.server_args.enable_fault_tolerance_test_injection:
+            return 403, {
+                "success": False,
+                "experiment": "A5-mlp-sync-metadata-parity",
+                "last_error": "Enable fault-tolerance test injection at startup",
+            }
+
+        self.auto_create_handle_loop()
+        return await self.fault_tolerance_manager.probe_metadata_parity()
 
     async def fault_tolerance_inject_recoverable_error(
         self, obj: FaultToleranceInjectReqInput

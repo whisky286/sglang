@@ -122,6 +122,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FaultToleranceApplyReqInput,
     FaultToleranceInjectReqInput,
+    FaultToleranceMetadataParityProbeReqInput,
     FaultToleranceMetadataProbeReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
@@ -1649,6 +1650,21 @@ async def fault_tolerance_probe_survivor_metadata(
     ) = await _global_state.tokenizer_manager.fault_tolerance_probe_survivor_metadata(
         obj
     )
+    return ORJSONResponse(content=content, status_code=status_code)
+
+
+@app.post("/fault_tolerance/probe_metadata_parity")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def fault_tolerance_probe_metadata_parity(
+    obj: Annotated[FaultToleranceMetadataParityProbeReqInput, Body()],
+    request: Request,
+):
+    """Run the read-only A5 MLP-sync metadata parity probe."""
+
+    (
+        status_code,
+        content,
+    ) = await _global_state.tokenizer_manager.fault_tolerance_probe_metadata_parity(obj)
     return ORJSONResponse(content=content, status_code=status_code)
 
 

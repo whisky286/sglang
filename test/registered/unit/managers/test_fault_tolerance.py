@@ -15,6 +15,8 @@ from sglang.srt.managers.io_struct import (
     FaultToleranceApplyReqInput,
     FaultToleranceCommandReqInput,
     FaultToleranceCommandReqOutput,
+    FaultToleranceMLPSyncMetadata,
+    FaultToleranceMetadataParityProbeReqInput,
     FaultToleranceMetadataProbeReqInput,
     FaultToleranceRecoverableErrorOutput,
     FaultToleranceSchedulerMetadata,
@@ -33,6 +35,9 @@ def _ack(
     success: bool = True,
     engine_paused: bool = False,
     scheduler_metadata: FaultToleranceSchedulerMetadata | None = None,
+    mlp_sync_local_metadata: FaultToleranceMLPSyncMetadata | None = None,
+    mlp_sync_collective_metadata: list[FaultToleranceMLPSyncMetadata] | None = None,
+    mlp_sync_group: str | None = None,
 ) -> FaultToleranceCommandReqOutput:
     return FaultToleranceCommandReqOutput(
         command_id=request.command_id,
@@ -41,6 +46,21 @@ def _ack(
         success=success,
         engine_paused=engine_paused,
         scheduler_metadata=scheduler_metadata,
+        mlp_sync_local_metadata=mlp_sync_local_metadata,
+        mlp_sync_collective_metadata=mlp_sync_collective_metadata,
+        mlp_sync_group=mlp_sync_group,
+    )
+
+
+def _mlp_sync_metadata(original_rank: int) -> FaultToleranceMLPSyncMetadata:
+    return FaultToleranceMLPSyncMetadata(
+        num_tokens=11 * (original_rank + 1),
+        num_tokens_for_logprob=7 * (original_rank + 1),
+        can_cuda_graph=original_rank % 2 == 0,
+        is_extend_in_batch=original_rank % 3 == 1,
+        local_can_run_tbo=original_rank % 3 != 2,
+        local_forward_mode=(original_rank % 4) + 1,
+        can_run_breakable_cuda_graph=original_rank % 2 == 1,
     )
 
 
@@ -330,6 +350,178 @@ class TestFaultToleranceSurvivorMetadataProbe(CustomTestCase):
         self.assertEqual(output.scheduler_metadata.num_running_requests, 2)
         self.assertEqual(output.scheduler_metadata.num_waiting_requests, 1)
         self.assertEqual(output.scheduler_metadata.last_batch_forward_mode, "DECODE")
+
+
+class TestFaultToleranceMetadataParityProbe(CustomTestCase):
+    def _new_manager(self, dispatch, timeout: float = 0.02):
+        return FaultToleranceManager(
+            original_world_size=4,
+            command_timeout=timeout,
+            dispatch_command=dispatch,
+        )
+
+    def test_cpu_control_slots_match_every_collective_view_field_by_field(self):
+        requests = []
+        manager = None
+        collective = [_mlp_sync_metadata(rank) for rank in range(4)]
+
+        def dispatch(request):
+            requests.append(request)
+            for rank in request.target_original_ranks:
+                if request.command == "status":
+                    output = _ack(request, rank, engine_paused=True)
+                else:
+                    output = _ack(
+                        request,
+                        rank,
+                        engine_paused=True,
+                        mlp_sync_local_metadata=_mlp_sync_metadata(rank),
+                        mlp_sync_collective_metadata=collective,
+                        mlp_sync_group="tp-cpu-all-gather",
+                    )
+                manager.handle_command_output(output)
+
+        manager = self._new_manager(dispatch)
+        status_code, body = asyncio.run(manager.probe_metadata_parity())
+
+        self.assertEqual(status_code, 200)
+        self.assertTrue(body["success"])
+        self.assertEqual(
+            [request.command for request in requests],
+            ["status", "probe_mlp_sync_metadata_parity"],
+        )
+        self.assertEqual(body["mlp_sync_group"], "tp-cpu-all-gather")
+        self.assertEqual(
+            [slot["original_rank"] for slot in body["cpu_control_slots"]],
+            [0, 1, 2, 3],
+        )
+        self.assertEqual(body["cpu_control_slots"][2]["metadata"]["num_tokens"], 33)
+        self.assertTrue(all(item["matched"] for item in body["comparisons"]))
+        self.assertTrue(all(not item["mismatches"] for item in body["comparisons"]))
+
+    def test_field_mismatch_is_reported_with_rank_and_values(self):
+        manager = None
+
+        def dispatch(request):
+            for rank in request.target_original_ranks:
+                if request.command == "status":
+                    output = _ack(request, rank, engine_paused=True)
+                else:
+                    collective = [_mlp_sync_metadata(i) for i in range(4)]
+                    if rank == 2:
+                        collective[1] = FaultToleranceMLPSyncMetadata(
+                            num_tokens=999,
+                            num_tokens_for_logprob=14,
+                            can_cuda_graph=False,
+                            is_extend_in_batch=True,
+                            local_can_run_tbo=True,
+                            local_forward_mode=2,
+                            can_run_breakable_cuda_graph=True,
+                        )
+                    output = _ack(
+                        request,
+                        rank,
+                        engine_paused=True,
+                        mlp_sync_local_metadata=_mlp_sync_metadata(rank),
+                        mlp_sync_collective_metadata=collective,
+                        mlp_sync_group="tp-cpu-all-gather",
+                    )
+                manager.handle_command_output(output)
+
+        manager = self._new_manager(dispatch)
+        status_code, body = asyncio.run(manager.probe_metadata_parity())
+
+        self.assertEqual(status_code, 503)
+        self.assertFalse(body["success"])
+        rank_two = next(
+            item for item in body["comparisons"] if item["reporting_rank"] == 2
+        )
+        self.assertFalse(rank_two["matched"])
+        self.assertEqual(
+            rank_two["mismatches"],
+            [
+                {
+                    "original_rank": 1,
+                    "field": "num_tokens",
+                    "cpu_control": 22,
+                    "collective": 999,
+                }
+            ],
+        )
+
+    def test_unpaused_rank_blocks_probe_before_any_collective_command(self):
+        requests = []
+        manager = None
+
+        def dispatch(request):
+            requests.append(request)
+            for rank in request.target_original_ranks:
+                manager.handle_command_output(
+                    _ack(request, rank, engine_paused=(rank != 1))
+                )
+
+        manager = self._new_manager(dispatch)
+        status_code, body = asyncio.run(manager.probe_metadata_parity())
+
+        self.assertEqual(status_code, 409)
+        self.assertFalse(body["success"])
+        self.assertEqual(body["phase"], "pause-precheck")
+        self.assertEqual(body["unpaused_ranks"], [1])
+        self.assertEqual([request.command for request in requests], ["status"])
+
+    def test_scheduler_returns_the_collective_probe_payload(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.ps = SimpleNamespace(dp_rank=3)
+        scheduler._engine_paused = True
+        collective = [_mlp_sync_metadata(rank) for rank in range(4)]
+        scheduler._probe_mlp_sync_metadata_parity = MagicMock(
+            return_value=(
+                _mlp_sync_metadata(3),
+                collective,
+                "tp-cpu-all-gather",
+            )
+        )
+        request = FaultToleranceCommandReqInput(
+            command_id="a5-command",
+            command="probe_mlp_sync_metadata_parity",
+            target_original_ranks=[0, 1, 2, 3],
+        )
+
+        output = scheduler.handle_fault_tolerance_command(request)
+
+        self.assertTrue(output.success)
+        self.assertEqual(output.original_rank, 3)
+        self.assertEqual(output.mlp_sync_local_metadata.num_tokens, 44)
+        self.assertEqual(len(output.mlp_sync_collective_metadata), 4)
+        self.assertEqual(output.mlp_sync_group, "tp-cpu-all-gather")
+
+    def test_new_probe_structs_round_trip_through_msgpack(self):
+        request = FaultToleranceMetadataParityProbeReqInput()
+        output = FaultToleranceCommandReqOutput(
+            command_id="a5-command",
+            command="probe_mlp_sync_metadata_parity",
+            original_rank=0,
+            success=True,
+            engine_paused=True,
+            mlp_sync_local_metadata=_mlp_sync_metadata(0),
+            mlp_sync_collective_metadata=[
+                _mlp_sync_metadata(rank) for rank in range(4)
+            ],
+            mlp_sync_group="tp-cpu-all-gather",
+        )
+
+        decoded_request = msgpack_decode(
+            msgpack_encode(request), FaultToleranceMetadataParityProbeReqInput
+        )
+        decoded_output = msgpack_decode(
+            msgpack_encode(output), FaultToleranceCommandReqOutput
+        )
+
+        self.assertIsInstance(
+            decoded_request, FaultToleranceMetadataParityProbeReqInput
+        )
+        self.assertEqual(decoded_output.mlp_sync_local_metadata.num_tokens, 11)
+        self.assertEqual(decoded_output.mlp_sync_collective_metadata[3].num_tokens, 44)
 
 
 class TestFaultToleranceCoordinatedPause(CustomTestCase):
