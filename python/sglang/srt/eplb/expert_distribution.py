@@ -28,7 +28,9 @@ import einops
 import torch
 import torch.distributed
 
+from sglang.srt.distributed.collective_trace import trace_collective
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
@@ -323,6 +325,18 @@ class _SinglePassGatherer(ABC):
                 server_args.deepep_mode == "normal"
             ):
                 return _DeepepNormalSinglePassGatherer(expert_location_metadata, rank)
+            elif (
+                server_args.moe_a2a_backend == "deepep"
+                and server_args.deepep_mode == "auto"
+            ):
+                return _DeeEPAutoSinglePassGatherer(
+                    expert_location_metadata,
+                    rank,
+                    normal_gatherer=_DeepepNormalSinglePassGatherer(
+                        expert_location_metadata, rank
+                    ),
+                    elastic_ep_enabled=server_args.elastic_ep_backend is not None,
+                )
             else:
                 raise NotImplementedError
 
@@ -333,6 +347,15 @@ class _SinglePassGatherer(ABC):
                 return _DeepepLowLatencySinglePassGatherer(
                     expert_location_metadata,
                     rank,
+                    elastic_ep_enabled=server_args.elastic_ep_backend is not None,
+                )
+            elif server_args.deepep_mode == "auto":
+                return _DeeEPAutoSinglePassGatherer(
+                    expert_location_metadata,
+                    rank,
+                    normal_gatherer=_SelectExpertsSinglePassGatherer(
+                        expert_location_metadata, rank
+                    ),
                     elastic_ep_enabled=server_args.elastic_ep_backend is not None,
                 )
             else:
@@ -597,6 +620,92 @@ class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
                     (0, n - local_physical_count_of_layer.shape[0]),
                 )
         self._data[layer_idx, :] += local_physical_count_of_layer
+
+
+class _DeeEPAutoSinglePassGatherer(_SinglePassGatherer):
+    """Route DeepEP statistics to the gatherer used by the resolved mode.
+
+    DeepEP auto uses normal dispatch for batches containing extend work and
+    low-latency dispatch for decode-only batches. The active mode is restored
+    from ForwardBatch at the start of every pass because CUDA/NPU graph replay
+    does not re-run the Python dispatch hooks that execute during capture.
+    """
+
+    def __init__(
+        self,
+        expert_location_metadata: ExpertLocationMetadata,
+        rank: int,
+        *,
+        normal_gatherer: _SinglePassGatherer,
+        elastic_ep_enabled: bool = False,
+    ):
+        super().__init__(expert_location_metadata, rank)
+        self._normal_gatherer = normal_gatherer
+        self._low_latency_gatherer = _DeepepLowLatencySinglePassGatherer(
+            expert_location_metadata,
+            rank,
+            elastic_ep_enabled=elastic_ep_enabled,
+        )
+        self._active_gatherer: Optional[_SinglePassGatherer] = None
+
+    def _set_active_mode(self, *, is_extend_in_batch: bool):
+        self._active_gatherer = (
+            self._normal_gatherer if is_extend_in_batch else self._low_latency_gatherer
+        )
+
+    def on_forward_pass_start(self, forward_batch: ForwardBatch):
+        self._set_active_mode(
+            is_extend_in_batch=forward_batch.is_extend_in_batch,
+        )
+        self._active_gatherer.on_forward_pass_start(forward_batch)
+
+    def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        # This hook also runs during graph capture, before graph replay has a
+        # ForwardBatch-driven Python path. Resolve from the same runtime flag
+        # used by DeepEPDispatcher so decode graphs do not capture the normal
+        # gatherer's scatter_add.
+        self._set_active_mode(
+            is_extend_in_batch=get_is_extend_in_batch(),
+        )
+        self._active_gatherer.on_select_experts(layer_idx, topk_ids)
+
+    def on_deepep_dispatch_normal(
+        self,
+        layer_idx: int,
+        local_physical_count_of_layer: List[int],
+        num_tokens_per_rank,
+        num_tokens_per_rdma_rank,
+        num_tokens_per_expert,
+    ):
+        self._set_active_mode(is_extend_in_batch=True)
+        self._normal_gatherer.on_deepep_dispatch_normal(
+            layer_idx,
+            local_physical_count_of_layer,
+            num_tokens_per_rank,
+            num_tokens_per_rdma_rank,
+            num_tokens_per_expert,
+        )
+
+    def on_deepep_dispatch_low_latency(
+        self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
+    ):
+        self._set_active_mode(is_extend_in_batch=False)
+        self._low_latency_gatherer.on_deepep_dispatch_low_latency(
+            layer_idx, local_physical_count_of_layer
+        )
+
+    def reset(self):
+        self._normal_gatherer.reset()
+        self._low_latency_gatherer.reset()
+        self._active_gatherer = None
+
+    def collect(self) -> Dict:
+        if self._active_gatherer is None:
+            raise RuntimeError(
+                "DeepEP auto expert distribution mode was not resolved for this "
+                "forward pass."
+            )
+        return self._active_gatherer.collect()
 
 
 def _convert_per_token_to_global_physical_count(
@@ -916,9 +1025,20 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             self._first_dump = False
             torch.get_device_module().empty_cache()
 
-        torch.distributed.all_reduce(
-            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
-        )
+        from sglang.srt.distributed.parallel_state import get_tp_group
+
+        with trace_collective(
+            "all_reduce",
+            coordinator=get_tp_group(),
+            process_group=torch.distributed.group.WORLD,
+            scope="eplb_world",
+            source="_ExpertDistributionRecorderReal.dump",
+            tensors=logical_count_of_buffered_step,
+            extra={"reason": "aggregate_expert_load"},
+        ):
+            torch.distributed.all_reduce(
+                logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
+            )
 
         output = dict(
             rank=self._rank,
@@ -956,7 +1076,18 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             )
         else:
             avg_rate_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
-        torch.distributed.broadcast(avg_rate_tensor, src=0)
+        from sglang.srt.distributed.parallel_state import get_tp_group
+
+        with trace_collective(
+            "broadcast",
+            coordinator=get_tp_group(),
+            process_group=torch.distributed.group.WORLD,
+            scope="eplb_world",
+            source="_ExpertDistributionRecorderReal._get_global_average_utilization_rate",
+            tensors=avg_rate_tensor,
+            extra={"reason": "broadcast_expert_utilization", "src": 0},
+        ):
+            torch.distributed.broadcast(avg_rate_tensor, src=0)
         return avg_rate_tensor.item()
 
 
