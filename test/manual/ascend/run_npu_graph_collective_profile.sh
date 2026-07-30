@@ -34,7 +34,7 @@ if [[ ! -e "${MODEL_PATH}" ]]; then
   echo "MODEL_PATH does not exist: ${MODEL_PATH}" >&2
   exit 2
 fi
-for command_name in git python curl rg; do
+for command_name in git python curl grep; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "Required command is missing: ${command_name}" >&2
     exit 2
@@ -56,7 +56,7 @@ if [[ "${#GRAPH_BUCKETS[@]}" -eq 0 ]]; then
   exit 2
 fi
 for marker in GRAPH_WARMUP GRAPH_CAPTURE GRAPH_REPLAY; do
-  if ! rg -q "${marker}" \
+  if ! grep -q -- "${marker}" \
     python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py \
     python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py; then
     echo "Required profiler marker is missing from the source: ${marker}" >&2
@@ -141,7 +141,7 @@ for rank in 0 1 2 3; do
   echo "original_rank_${rank}=visible_device_${VISIBLE_DEVICE_LIST[${rank}]}"
 done >"${MANIFEST_DIR}/rank-device-map.txt"
 env |
-  rg '^(ASCEND|CANN|HCCL|SGLANG|PYTHON|LD_LIBRARY_PATH|PATH)=' |
+  grep -E '^(ASCEND|CANN|HCCL|SGLANG|PYTHON|LD_LIBRARY_PATH|PATH)=' |
   sort >"${MANIFEST_DIR}/runtime-environment.txt"
 npu-smi info >"${MANIFEST_DIR}/npu-smi-info.txt" 2>&1 || true
 for device_id in "${VISIBLE_DEVICE_LIST[@]}"; do
