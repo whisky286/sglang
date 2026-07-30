@@ -86,11 +86,12 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         # Two warmups so kernels are loaded and one-time setup is paid before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
         for _ in range(2):
-            self._device_module.synchronize()
-            self._tp_group.barrier()
-            forward_fn()
-            if post_warmup_hook is not None:
-                post_warmup_hook()
+            with torch.profiler.record_function("GRAPH_WARMUP"):
+                self._device_module.synchronize()
+                self._tp_group.barrier()
+                forward_fn()
+                if post_warmup_hook is not None:
+                    post_warmup_hook()
 
         graph = torch.npu.NPUGraph()
 
@@ -111,13 +112,14 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         else:
             graph_ctx = torch.npu.graph
 
-        with skip_guard_context, graph_ctx(
-            graph,
-            pool=self._pool,
-            stream=self._capture_stream,
-            auto_dispatch_capture=True,
-        ):
-            out = forward_fn()
+        with torch.profiler.record_function("GRAPH_CAPTURE"):
+            with skip_guard_context, graph_ctx(
+                graph,
+                pool=self._pool,
+                stream=self._capture_stream,
+                auto_dispatch_capture=True,
+            ):
+                out = forward_fn()
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
@@ -135,7 +137,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
-        self._graphs[shape_key].replay()
+        with torch.profiler.record_function("GRAPH_REPLAY"):
+            self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 
     def replay_with_input_update(
@@ -167,7 +170,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
         thread = threading.Thread(target=_update)
         thread.start()
-        graph.replay()
+        with torch.profiler.record_function("GRAPH_REPLAY"):
+            graph.replay()
         thread.join()
         return self._outputs[shape_key]
 

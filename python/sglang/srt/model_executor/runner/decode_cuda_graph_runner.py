@@ -823,48 +823,54 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture(self) -> None:
-        # Warm up + autotune kernels once before capture (run-once across the
-        # decode + prefill runners; see BaseRunner.warmup).
-        self.warmup()
-        # warmup() may disable torch.compile for a model whose _can_torch_compile
-        # is False; recompute the compile bucket so capture matches.
-        if self.enable_torch_compile and not (get_flags().capture.enable_torch_compile):
-            self.enable_torch_compile = False
-            _, self.compile_bs = get_batch_sizes_to_capture(
-                self.model_runner, self.captured_req_width
-            )
         profile_context = empty_context()
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
 
-        # share_buffers() coalesces seq_lens / seq_lens_cpu through the process-
-        # wide pool, so they may alias a buffer seeded by an earlier runner (the
-        # eager registry fills them with 0). The capture-time attention-metadata
-        # plan reads these as the per-request KV length, and the prefill wrapper
-        # (DLLM_EXTEND) asserts kv_len >= qo_len, so restore the fill value the
-        # captured graph needs before capturing.
-        self.buffers.seq_lens.fill_(self.seq_len_fill_value)
-        self.buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
+        # Keep the capture profiler active across both the run-once warmup and
+        # graph recording. This makes startup traces distinguish initialization
+        # work from operations actually recorded into the graph.
+        with profile_context as prof:
+            # Warm up + autotune kernels once before capture (run-once across the
+            # decode + prefill runners; see BaseRunner.warmup).
+            with torch.profiler.record_function("GRAPH_WARMUP"):
+                self.warmup()
+            # warmup() may disable torch.compile for a model whose
+            # _can_torch_compile is False; recompute the compile bucket so capture
+            # matches.
+            if self.enable_torch_compile and not (
+                get_flags().capture.enable_torch_compile
+            ):
+                self.enable_torch_compile = False
+                _, self.compile_bs = get_batch_sizes_to_capture(
+                    self.model_runner, self.captured_req_width
+                )
 
-        # Trigger CUDA graph capture for specific shapes.
-        # Capture the large shapes first so that the smaller shapes
-        # can reuse the memory pool allocated for the large shapes.
-        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
-            if not self.enable_pdmux:
-                with graph_capture() as graph_capture_context, profile_context as prof:
-                    self.stream = graph_capture_context.stream
-                    with self.backend.capture_session(self.stream):
-                        self._capture_one_stream()
-            else:
-                set_pdmux_status(False)
-                for i, sg in enumerate(self.stream_groups):
-                    with (
-                        graph_capture(stream=sg[1]) as graph_capture_context,
-                        profile_context as prof,
-                    ):
+            # share_buffers() coalesces seq_lens / seq_lens_cpu through the
+            # process-wide pool, so they may alias a buffer seeded by an earlier
+            # runner (the eager registry fills them with 0). The capture-time
+            # attention-metadata plan reads these as the per-request KV length,
+            # and the prefill wrapper (DLLM_EXTEND) asserts kv_len >= qo_len, so
+            # restore the fill value the captured graph needs before capturing.
+            self.buffers.seq_lens.fill_(self.seq_len_fill_value)
+            self.buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
+
+            # Trigger CUDA graph capture for specific shapes.
+            # Capture the large shapes first so that the smaller shapes
+            # can reuse the memory pool allocated for the large shapes.
+            with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
+                if not self.enable_pdmux:
+                    with graph_capture() as graph_capture_context:
                         self.stream = graph_capture_context.stream
                         with self.backend.capture_session(self.stream):
-                            self._capture_one_stream(i)
+                            self._capture_one_stream()
+                else:
+                    set_pdmux_status(False)
+                    for i, sg in enumerate(self.stream_groups):
+                        with graph_capture(stream=sg[1]) as graph_capture_context:
+                            self.stream = graph_capture_context.stream
+                            with self.backend.capture_session(self.stream):
+                                self._capture_one_stream(i)
 
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
