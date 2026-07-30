@@ -329,7 +329,7 @@ class _SinglePassGatherer(ABC):
                 server_args.moe_a2a_backend == "deepep"
                 and server_args.deepep_mode == "auto"
             ):
-                return _DeeEPAutoSinglePassGatherer(
+                return _DeepEPAutoSinglePassGatherer(
                     expert_location_metadata,
                     rank,
                     normal_gatherer=_DeepepNormalSinglePassGatherer(
@@ -350,7 +350,7 @@ class _SinglePassGatherer(ABC):
                     elastic_ep_enabled=server_args.elastic_ep_backend is not None,
                 )
             elif server_args.deepep_mode == "auto":
-                return _DeeEPAutoSinglePassGatherer(
+                return _DeepEPAutoSinglePassGatherer(
                     expert_location_metadata,
                     rank,
                     normal_gatherer=_SelectExpertsSinglePassGatherer(
@@ -622,7 +622,7 @@ class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
         self._data[layer_idx, :] += local_physical_count_of_layer
 
 
-class _DeeEPAutoSinglePassGatherer(_SinglePassGatherer):
+class _DeepEPAutoSinglePassGatherer(_SinglePassGatherer):
     """Route DeepEP statistics to the gatherer used by the resolved mode.
 
     DeepEP auto uses normal dispatch for batches containing extend work and

@@ -25,7 +25,7 @@ class TestDeepEPAutoSinglePassGatherer(CustomTestCase):
             "_DeepepLowLatencySinglePassGatherer",
             return_value=low_latency_gatherer,
         ):
-            gatherer = expert_distribution._DeeEPAutoSinglePassGatherer(
+            gatherer = expert_distribution._DeepEPAutoSinglePassGatherer(
                 metadata,
                 rank=0,
                 normal_gatherer=normal_gatherer,
@@ -61,7 +61,7 @@ class TestDeepEPAutoSinglePassGatherer(CustomTestCase):
             )
 
         self.assertIsInstance(
-            gatherer, expert_distribution._DeeEPAutoSinglePassGatherer
+            gatherer, expert_distribution._DeepEPAutoSinglePassGatherer
         )
 
     def test_forward_batch_restores_mode_for_graph_replay(self):
