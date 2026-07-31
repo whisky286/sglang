@@ -52,6 +52,27 @@ class TestExpertLocationUpdaterNPUP2P(CustomTestCase):
         expert_location_updater._copy_staged_p2p_recvs(recv_copy_infos)
         self.assertTrue(torch.equal(recv_tensor, torch.full_like(recv_tensor, 7)))
 
+    def test_multicast_reuses_one_staged_send_tensor(self):
+        send_tensor = torch.arange(12).reshape(3, 4)[1]
+        ops = [
+            P2POp(torch.distributed.isend, send_tensor, peer=1),
+            P2POp(torch.distributed.isend, send_tensor, peer=2),
+        ]
+
+        with patch.object(
+            expert_location_updater,
+            "_needs_npu_p2p_staging",
+            return_value=True,
+        ):
+            staged_ops, recv_copy_infos = expert_location_updater._stage_npu_p2p_ops(
+                ops
+            )
+
+        self.assertIs(staged_ops[0].tensor, staged_ops[1].tensor)
+        self.assertEqual(staged_ops[0].tensor.storage_offset(), 0)
+        self.assertNotEqual(staged_ops[0].tensor.data_ptr(), send_tensor.data_ptr())
+        self.assertEqual(recv_copy_infos, [])
+
     def test_weight_update_uses_staged_buffers_and_preserves_recv_result(self):
         routed_expert_weights = [
             torch.tensor(

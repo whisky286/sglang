@@ -24,6 +24,9 @@ PROFILE_STEPS="${PROFILE_STEPS:-5}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
 RANDOM_INPUT_LEN="${RANDOM_INPUT_LEN:-128}"
 RUN_GSM8K_EVAL="${RUN_GSM8K_EVAL:-1}"
+SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE="${SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE:-1}"
+SGLANG_PROFILE_WITH_STACK="${SGLANG_PROFILE_WITH_STACK:-true}"
+SGLANG_PROFILE_RECORD_SHAPES="${SGLANG_PROFILE_RECORD_SHAPES:-true}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
@@ -34,7 +37,7 @@ if [[ ! -e "${MODEL_PATH}" ]]; then
   echo "MODEL_PATH does not exist: ${MODEL_PATH}" >&2
   exit 2
 fi
-for command_name in git python curl grep; do
+for command_name in git python curl grep setsid; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "Required command is missing: ${command_name}" >&2
     exit 2
@@ -77,8 +80,9 @@ export ASCEND_RT_VISIBLE_DEVICES
 export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
 export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost"
 export SGLANG_TORCH_PROFILER_DIR="${CAPTURE_DIR}"
-export SGLANG_PROFILE_WITH_STACK=true
-export SGLANG_PROFILE_RECORD_SHAPES=true
+export SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE
+export SGLANG_PROFILE_WITH_STACK
+export SGLANG_PROFILE_RECORD_SHAPES
 
 SERVER_ARGS=(
   --model-path "${MODEL_PATH}"
@@ -123,6 +127,7 @@ done
   echo "graph_buckets_decode=${CUDA_GRAPH_BS_DECODE}"
   echo "profile_steps=${PROFILE_STEPS}"
   echo "eplb=enabled"
+  echo "eplb_p2p_batch_chunk_size=${SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE}"
   echo "moe_backend=deepep"
   echo "deepep_mode=auto"
   echo "moe_tp=1"
@@ -185,16 +190,34 @@ PY
 
 SERVER_PID=""
 cleanup() {
-  if [[ -n "${SERVER_PID}" ]] && kill -0 "${SERVER_PID}" 2>/dev/null; then
-    kill -TERM "${SERVER_PID}" 2>/dev/null || true
-    wait "${SERVER_PID}" 2>/dev/null || true
+  if [[ -z "${SERVER_PID}" ]]; then
+    return
   fi
+
+  # The launcher and all scheduler workers run in an isolated process group.
+  # Clean the group even if its leader was already OOM-killed, otherwise orphan
+  # workers can retain NPU memory and make the next run fail immediately.
+  if kill -0 -- "-${SERVER_PID}" 2>/dev/null; then
+    kill -TERM -- "-${SERVER_PID}" 2>/dev/null || true
+    for _ in $(seq 1 60); do
+      if ! kill -0 -- "-${SERVER_PID}" 2>/dev/null; then
+        break
+      fi
+      sleep 0.5
+    done
+    if kill -0 -- "-${SERVER_PID}" 2>/dev/null; then
+      kill -KILL -- "-${SERVER_PID}" 2>/dev/null || true
+    fi
+  fi
+  wait "${SERVER_PID}" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
-python -m sglang.launch_server "${SERVER_ARGS[@]}" >"${SERVER_LOG}" 2>&1 &
+setsid python -m sglang.launch_server "${SERVER_ARGS[@]}" \
+  >"${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
 echo "${SERVER_PID}" >"${OUTPUT_DIR}/server.pid"
+echo "${SERVER_PID}" >"${OUTPUT_DIR}/server.pgid"
 
 READY=0
 for _ in $(seq 1 240); do

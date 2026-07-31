@@ -199,6 +199,7 @@ def _stage_npu_p2p_ops(
 
     staged_ops = []
     recv_copy_infos = []
+    staged_send_tensors = {}
     for op in p2p_ops:
         tensor = op.tensor
         if not _needs_npu_p2p_staging(tensor):
@@ -209,7 +210,21 @@ def _stage_npu_p2p_ops(
             staged_tensor = torch.empty_like(tensor)
             recv_copy_infos.append((staged_tensor, tensor))
         elif op.op == torch.distributed.isend:
-            staged_tensor = tensor.clone()
+            # A single expert tensor can be sent to multiple peers. Reuse one
+            # offset-zero clone for those sends instead of multiplying the
+            # rebalance memory peak by the destination fanout.
+            send_key = (
+                tensor.device,
+                tensor.data_ptr(),
+                tensor.storage_offset(),
+                tuple(tensor.shape),
+                tuple(tensor.stride()),
+                tensor.dtype,
+            )
+            staged_tensor = staged_send_tensors.get(send_key)
+            if staged_tensor is None:
+                staged_tensor = tensor.clone()
+                staged_send_tensors[send_key] = staged_tensor
         else:
             raise ValueError(f"Unsupported P2P operation: {op.op}")
 
@@ -587,7 +602,13 @@ def update_expert_weights_single_layer(
                     reqs = torch.distributed.batch_isend_irecv(batch_ops)
                     for req in reqs:
                         req.wait()
+                    if reqs:
+                        del req
                 _copy_staged_p2p_recvs(recv_copy_infos)
+                # Drop references before constructing the next staging batch.
+                # The device allocator may cache the freed blocks, but they are
+                # reusable and no longer live EPLB tensors.
+                del reqs, recv_copy_infos, batch_ops, direction_counts, op
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
         for (
