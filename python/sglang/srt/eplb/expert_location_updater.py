@@ -20,6 +20,7 @@ import torch
 import torch.distributed
 from torch.distributed import P2POp
 
+from sglang.srt.distributed.collective_trace import trace_collective
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import (
@@ -178,6 +179,63 @@ def _update_expert_weights_raw(
 
 def create_temp_buffers(sample_tensors):
     return [torch.empty_like(tensor) for tensor in sample_tensors]
+
+
+def _needs_npu_p2p_staging(tensor: torch.Tensor) -> bool:
+    return tensor.device.type == "npu" and tensor.storage_offset() != 0
+
+
+def _stage_npu_p2p_ops(
+    p2p_ops: List[P2POp],
+) -> Tuple[List[P2POp], List[Tuple[torch.Tensor, torch.Tensor]]]:
+    """Give HCCL offset-zero buffers for internal-format tensor views.
+
+    Expert weights are stored with the local-expert dimension first, so
+    selecting any expert after index 0 usually returns a view with a non-zero
+    storage offset. HCCL rejects such views when their underlying NPU tensor
+    uses an internal format. Stage only those NPU views; CUDA/ROCm retain the
+    existing zero-copy behavior.
+    """
+
+    staged_ops = []
+    recv_copy_infos = []
+    for op in p2p_ops:
+        tensor = op.tensor
+        if not _needs_npu_p2p_staging(tensor):
+            staged_ops.append(op)
+            continue
+
+        if op.op == torch.distributed.irecv:
+            staged_tensor = torch.empty_like(tensor)
+            recv_copy_infos.append((staged_tensor, tensor))
+        elif op.op == torch.distributed.isend:
+            staged_tensor = tensor.clone()
+        else:
+            raise ValueError(f"Unsupported P2P operation: {op.op}")
+
+        if staged_tensor.storage_offset() != 0:
+            raise RuntimeError(
+                "Failed to create an offset-zero NPU staging tensor for EPLB P2P."
+            )
+
+        staged_ops.append(
+            P2POp(
+                op=op.op,
+                tensor=staged_tensor,
+                peer=op.peer,
+                group=op.group,
+                tag=op.tag,
+            )
+        )
+
+    return staged_ops, recv_copy_infos
+
+
+def _copy_staged_p2p_recvs(
+    recv_copy_infos: List[Tuple[torch.Tensor, torch.Tensor]],
+):
+    for staged_tensor, destination_tensor in recv_copy_infos:
+        destination_tensor.copy_(staged_tensor)
 
 
 def update_expert_weights_single_layer(
@@ -498,9 +556,38 @@ def update_expert_weights_single_layer(
                 if eid in ops_by_expert:
                     batch_ops.extend(ops_by_expert[eid])
             if batch_ops:
-                reqs = torch.distributed.batch_isend_irecv(batch_ops)
-                for req in reqs:
-                    req.wait()
+                batch_ops, recv_copy_infos = _stage_npu_p2p_ops(batch_ops)
+
+                from sglang.srt.distributed.parallel_state import get_tp_group
+
+                direction_counts = defaultdict(int)
+                for op in batch_ops:
+                    direction_counts[op.op.__name__] += 1
+                with trace_collective(
+                    "batch_isend_irecv",
+                    coordinator=get_tp_group(),
+                    process_group=torch.distributed.group.WORLD,
+                    scope="eplb_world_p2p",
+                    source="_update_expert_weights._execute_p2p_ops",
+                    tensors=[op.tensor for op in batch_ops],
+                    extra={
+                        "reason": "refresh_expert_weights",
+                        "expert_range": [
+                            start,
+                            min(
+                                start + batch_chunk_size,
+                                num_physical_experts,
+                            ),
+                        ],
+                        "op_count": len(batch_ops),
+                        "peers": sorted({op.peer for op in batch_ops}),
+                        "direction_counts": dict(direction_counts),
+                    },
+                ):
+                    reqs = torch.distributed.batch_isend_irecv(batch_ops)
+                    for req in reqs:
+                        req.wait()
+                _copy_staged_p2p_recvs(recv_copy_infos)
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
         for (
