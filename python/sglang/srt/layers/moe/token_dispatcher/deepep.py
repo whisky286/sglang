@@ -746,6 +746,26 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
+        num_input_tokens = hidden_states.shape[0]
+        if num_input_tokens > self.num_max_dispatch_tokens_per_rank:
+            global_rank = (
+                dist.get_rank()
+                if dist.is_available() and dist.is_initialized()
+                else None
+            )
+            raise RuntimeError(
+                "DeepEP low-latency dispatch capacity exceeded before kernel "
+                "launch: "
+                f"global_rank={global_rank}, "
+                f"input_tokens={num_input_tokens}, "
+                f"capacity={self.num_max_dispatch_tokens_per_rank}, "
+                f"hidden_size={hidden_states.shape[1]}, "
+                f"topk={topk_ids.shape[1]}, "
+                f"is_extend_in_batch={get_is_extend_in_batch()}, "
+                f"device={hidden_states.device}, dtype={hidden_states.dtype}. "
+                "Set SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK to at "
+                "least input_tokens, using the same value on every rank."
+            )
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
