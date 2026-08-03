@@ -106,7 +106,7 @@ SERVER_ARGS=(
   --moe-dense-tp-size 1
   --moe-dp-size 1
   --moe-a2a-backend deepep
-  --deepep-mode auto
+  --deepep-mode low_latency
   --enable-eplb
   --eplb-rebalance-num-iterations "${EPLB_REBALANCE_NUM_ITERATIONS}"
   --enable-profile-cuda-graph
@@ -147,7 +147,7 @@ done
   echo "eplb_p2p_batch_chunk_size=${SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE}"
   echo "mlp_sync_device_all_gather=${SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH}"
   echo "moe_backend=deepep"
-  echo "deepep_mode=auto"
+  echo "deepep_mode=low_latency"
   echo "moe_tp=1"
   echo "moe_dp=1"
   echo "artifact_dir=${OUTPUT_DIR}"
