@@ -653,6 +653,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
 
 class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
+    _logged_dispatch_metadata = set()
+
     def __init__(self, return_recv_hook: bool, **kwargs):
         super().__init__(**kwargs)
 
@@ -747,6 +749,31 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
         num_input_tokens = hidden_states.shape[0]
+        is_extend_in_batch = get_is_extend_in_batch()
+        dispatch_metadata = (
+            num_input_tokens,
+            self.num_max_dispatch_tokens_per_rank,
+            is_extend_in_batch,
+        )
+        if dispatch_metadata not in type(self)._logged_dispatch_metadata:
+            global_rank = (
+                dist.get_rank()
+                if dist.is_available() and dist.is_initialized()
+                else None
+            )
+            logger.warning(
+                "DeepEP low-latency dispatch metadata: "
+                f"global_rank={global_rank}, "
+                f"input_tokens={num_input_tokens}, "
+                f"capacity={self.num_max_dispatch_tokens_per_rank}, "
+                f"within_capacity="
+                f"{num_input_tokens <= self.num_max_dispatch_tokens_per_rank}, "
+                f"hidden_size={hidden_states.shape[1]}, "
+                f"topk={topk_ids.shape[1]}, "
+                f"is_extend_in_batch={is_extend_in_batch}, "
+                f"device={hidden_states.device}, dtype={hidden_states.dtype}"
+            )
+            type(self)._logged_dispatch_metadata.add(dispatch_metadata)
         if num_input_tokens > self.num_max_dispatch_tokens_per_rank:
             global_rank = (
                 dist.get_rank()
@@ -761,7 +788,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 f"capacity={self.num_max_dispatch_tokens_per_rank}, "
                 f"hidden_size={hidden_states.shape[1]}, "
                 f"topk={topk_ids.shape[1]}, "
-                f"is_extend_in_batch={get_is_extend_in_batch()}, "
+                f"is_extend_in_batch={is_extend_in_batch}, "
                 f"device={hidden_states.device}, dtype={hidden_states.dtype}. "
                 "Set SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK to at "
                 "least input_tokens, using the same value on every rank."
