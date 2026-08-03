@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed.collective_trace import trace_collective
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -147,19 +148,37 @@ class MLPSyncBatchInfo:
             rank = torch.distributed.get_rank(group)
             if 0 <= rank < flat_info.shape[0]:
                 flat_info[rank] = local_info_tensor
-            torch.distributed.all_reduce(
-                global_info_tensor,
-                op=torch.distributed.ReduceOp.SUM,
-                group=group,
-            )
+            with trace_collective(
+                "all_reduce",
+                coordinator=get_tp_group(),
+                process_group=group,
+                scope="scheduler_world",
+                source="MLPSyncBatchInfo.all_gather",
+                tensors=(global_info_tensor, local_info_tensor),
+                extra={"reason": "scheduler_mlp_metadata"},
+            ):
+                torch.distributed.all_reduce(
+                    global_info_tensor,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=group,
+                )
             missing = flat_info.abs().sum(dim=1) == 0
             flat_info[missing] = fallback_tensor
         else:
-            torch.distributed.all_gather_into_tensor(
-                global_info_tensor.flatten(),
-                local_info_tensor,
-                group=group,
-            )
+            with trace_collective(
+                "all_gather_into_tensor",
+                coordinator=get_tp_group(),
+                process_group=group,
+                scope="scheduler_big_tp",
+                source="MLPSyncBatchInfo.all_gather",
+                tensors=(global_info_tensor, local_info_tensor),
+                extra={"reason": "scheduler_mlp_metadata"},
+            ):
+                torch.distributed.all_gather_into_tensor(
+                    global_info_tensor.flatten(),
+                    local_info_tensor,
+                    group=group,
+                )
 
         tp_info = global_info_tensor.view(
             self.dp_size * self.tp_size * self.cp_size, info_width
