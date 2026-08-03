@@ -107,9 +107,10 @@ class EPLBManager:
             torch.get_device_module().synchronize()
             time_start = time.time()
 
-        dump_record_output = get_global_expert_distribution_recorder().dump_record(
-            output_mode="object"
-        )
+        with torch.profiler.record_function("EPLB_DISTRIBUTION_DUMP"):
+            dump_record_output = get_global_expert_distribution_recorder().dump_record(
+                output_mode="object"
+            )
         logical_count = dump_record_output["logical_count"]
         average_utilization_rate_over_window = dump_record_output[
             "average_utilization_rate_over_window"
@@ -138,20 +139,21 @@ class EPLBManager:
         for chunk_layer_ids in update_layer_ids_chunks:
             if len(update_layer_ids_chunks) > 1:
                 yield
-            update_expert_location_with_recovery(
-                expert_location_updater=self._get_expert_location_updater(),
-                model=self._get_model(),
-                new_expert_location_metadata=expert_location_metadata,
-                update_layer_ids=chunk_layer_ids,
-                nnodes=self._server_args.nnodes,
-                tp_rank=self._ps.tp_rank,
-                expert_backup_client=self._get_expert_backup_client(),
-                update_weights_from_disk_callable=self._get_weight_updater().update_weights_from_disk,
-                ep_dispatch_algorithm=self._server_args.ep_dispatch_algorithm,
-                init_lplb_solvers_callable=lambda: init_lplb_solvers(
-                    model_config=self._model_config
-                ),
-            )
+            with torch.profiler.record_function("EPLB_WEIGHT_UPDATE"):
+                update_expert_location_with_recovery(
+                    expert_location_updater=self._get_expert_location_updater(),
+                    model=self._get_model(),
+                    new_expert_location_metadata=expert_location_metadata,
+                    update_layer_ids=chunk_layer_ids,
+                    nnodes=self._server_args.nnodes,
+                    tp_rank=self._ps.tp_rank,
+                    expert_backup_client=self._get_expert_backup_client(),
+                    update_weights_from_disk_callable=self._get_weight_updater().update_weights_from_disk,
+                    ep_dispatch_algorithm=self._server_args.ep_dispatch_algorithm,
+                    init_lplb_solvers_callable=lambda: init_lplb_solvers(
+                        model_config=self._model_config
+                    ),
+                )
 
         self._log_rebalance_layout_after_update(update_layer_ids=all_update_layer_ids)
 

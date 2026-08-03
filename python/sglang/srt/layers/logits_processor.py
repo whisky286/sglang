@@ -24,6 +24,7 @@ from torch import nn
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
+from sglang.srt.distributed.collective_trace import trace_collective
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -790,6 +791,7 @@ class LogitsProcessor(nn.Module):
         return hidden_states, hidden_states
 
     def _gather_attn_tp_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        attn_tp_group = get_parallel().attn_tp_group
         if self.vocab_size % self.attn_tp_size == 0:
             global_logits = torch.empty(
                 (
@@ -800,7 +802,23 @@ class LogitsProcessor(nn.Module):
                 device=logits.device,
                 dtype=logits.dtype,
             )
-            attn_tp_all_gather_into_tensor(global_logits, logits)
+            with (
+                torch.profiler.record_function("LM_HEAD_VOCAB_GATHER"),
+                trace_collective(
+                    "all_gather_into_tensor",
+                    coordinator=attn_tp_group,
+                    process_group=attn_tp_group.device_group,
+                    scope="lm_head_vocab",
+                    source="LogitsProcessor._gather_attn_tp_logits",
+                    tensors=(global_logits, logits),
+                    extra={
+                        "reason": "gather_sharded_vocab_logits",
+                        "vocab_size": self.vocab_size,
+                        "attn_tp_size": self.attn_tp_size,
+                    },
+                ),
+            ):
+                attn_tp_all_gather_into_tensor(global_logits, logits)
             global_logits = global_logits.permute(1, 0, 2).reshape(
                 logits.shape[0], self.vocab_size
             )
@@ -811,10 +829,26 @@ class LogitsProcessor(nn.Module):
                 dtype=logits.dtype,
             )
             global_logits = global_logits.T
-            attn_tp_all_gather(
-                list(global_logits.tensor_split(self.attn_tp_size, dim=-1)),
-                logits,
+            output_tensor_list = list(
+                global_logits.tensor_split(self.attn_tp_size, dim=-1)
             )
+            with (
+                torch.profiler.record_function("LM_HEAD_VOCAB_GATHER"),
+                trace_collective(
+                    "all_gather",
+                    coordinator=attn_tp_group,
+                    process_group=attn_tp_group.device_group,
+                    scope="lm_head_vocab",
+                    source="LogitsProcessor._gather_attn_tp_logits",
+                    tensors=(output_tensor_list, logits),
+                    extra={
+                        "reason": "gather_sharded_vocab_logits",
+                        "vocab_size": self.vocab_size,
+                        "attn_tp_size": self.attn_tp_size,
+                    },
+                ),
+            ):
+                attn_tp_all_gather(output_tensor_list, logits)
         return global_logits
 
     def _scatter_dp_attn_logits(

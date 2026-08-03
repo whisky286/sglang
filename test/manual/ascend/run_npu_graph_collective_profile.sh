@@ -24,7 +24,13 @@ PROFILE_STEPS="${PROFILE_STEPS:-5}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
 RANDOM_INPUT_LEN="${RANDOM_INPUT_LEN:-128}"
 RUN_GSM8K_EVAL="${RUN_GSM8K_EVAL:-1}"
+EPLB_REBALANCE_NUM_ITERATIONS="${EPLB_REBALANCE_NUM_ITERATIONS:-1000}"
+EPLB_REBALANCE_LAYERS_PER_CHUNK="${EPLB_REBALANCE_LAYERS_PER_CHUNK:-}"
+REQUIRE_FOCUSED_VALIDATION="${REQUIRE_FOCUSED_VALIDATION:-0}"
 SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE="${SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE:-1}"
+SGLANG_BIG_TP_COLLECTIVE_TRACE="${SGLANG_BIG_TP_COLLECTIVE_TRACE:-0}"
+SGLANG_BIG_TP_COLLECTIVE_TRACE_MAX_RECORDS="${SGLANG_BIG_TP_COLLECTIVE_TRACE_MAX_RECORDS:-0}"
+SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH="${SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH:-0}"
 SGLANG_PROFILE_WITH_STACK="${SGLANG_PROFILE_WITH_STACK:-true}"
 SGLANG_PROFILE_RECORD_SHAPES="${SGLANG_PROFILE_RECORD_SHAPES:-true}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -81,6 +87,9 @@ export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
 export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost"
 export SGLANG_TORCH_PROFILER_DIR="${CAPTURE_DIR}"
 export SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE
+export SGLANG_BIG_TP_COLLECTIVE_TRACE
+export SGLANG_BIG_TP_COLLECTIVE_TRACE_MAX_RECORDS
+export SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH
 export SGLANG_PROFILE_WITH_STACK
 export SGLANG_PROFILE_RECORD_SHAPES
 
@@ -99,6 +108,7 @@ SERVER_ARGS=(
   --moe-a2a-backend deepep
   --deepep-mode auto
   --enable-eplb
+  --eplb-rebalance-num-iterations "${EPLB_REBALANCE_NUM_ITERATIONS}"
   --enable-profile-cuda-graph
   --cuda-graph-bs-decode "${GRAPH_BUCKETS[@]}"
   --disable-radix-cache
@@ -110,6 +120,11 @@ SERVER_ARGS=(
   --host "${HOST}"
   --port "${PORT}"
 )
+if [[ -n "${EPLB_REBALANCE_LAYERS_PER_CHUNK}" ]]; then
+  SERVER_ARGS+=(
+    --eplb-rebalance-layers-per-chunk "${EPLB_REBALANCE_LAYERS_PER_CHUNK}"
+  )
+fi
 for argument in "${SERVER_ARGS[@]}"; do
   if [[ "${argument}" == "--disable-cuda-graph" ]]; then
     echo "Refusing to run with NPU graph disabled." >&2
@@ -127,7 +142,10 @@ done
   echo "graph_buckets_decode=${CUDA_GRAPH_BS_DECODE}"
   echo "profile_steps=${PROFILE_STEPS}"
   echo "eplb=enabled"
+  echo "eplb_rebalance_num_iterations=${EPLB_REBALANCE_NUM_ITERATIONS}"
+  echo "eplb_rebalance_layers_per_chunk=${EPLB_REBALANCE_LAYERS_PER_CHUNK:-all}"
   echo "eplb_p2p_batch_chunk_size=${SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE}"
+  echo "mlp_sync_device_all_gather=${SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH}"
   echo "moe_backend=deepep"
   echo "deepep_mode=auto"
   echo "moe_tp=1"
@@ -335,6 +353,22 @@ if summary["capture"]["marker_counts"]["GRAPH_CAPTURE"] == 0:
 if summary["healthy_replay"]["marker_counts"]["GRAPH_REPLAY"] == 0:
     raise SystemExit("GRAPH_REPLAY marker not found in healthy replay profile")
 PY
+
+FOCUSED_VALIDATION_ARGS=()
+if [[ "${REQUIRE_FOCUSED_VALIDATION}" == "1" ]]; then
+  FOCUSED_VALIDATION_ARGS+=(--require-complete)
+fi
+set +e
+python test/manual/ascend/analyze_npu_lm_head_eplb_validation.py \
+  "${OUTPUT_DIR}" "${FOCUSED_VALIDATION_ARGS[@]}" \
+  >"${OUTPUT_DIR}/lm-head-eplb-validation-summary.json"
+FOCUSED_VALIDATION_STATUS=$?
+set -e
+cat "${OUTPUT_DIR}/lm-head-eplb-validation-summary.json"
+if [[ "${FOCUSED_VALIDATION_STATUS}" -ne 0 ]]; then
+  echo "Focused LM-head/EPLB validation did not meet all required conditions." >&2
+  exit "${FOCUSED_VALIDATION_STATUS}"
+fi
 
 printf '%s\n' \
   "ID,Phase,Source symbol,Backend/op,Group members,Shape/dtype,Stream,Buffer address,Contacts all original ranks?,Initial recovery classification" \
