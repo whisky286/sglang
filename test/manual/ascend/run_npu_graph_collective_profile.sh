@@ -30,6 +30,7 @@ REQUIRE_FOCUSED_VALIDATION="${REQUIRE_FOCUSED_VALIDATION:-0}"
 SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE="${SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE:-1}"
 SGLANG_BIG_TP_COLLECTIVE_TRACE="${SGLANG_BIG_TP_COLLECTIVE_TRACE:-0}"
 SGLANG_BIG_TP_COLLECTIVE_TRACE_MAX_RECORDS="${SGLANG_BIG_TP_COLLECTIVE_TRACE_MAX_RECORDS:-0}"
+SGLANG_BIG_TP_COLLECTIVE_TRACE_MAX_RECORDS_PER_SOURCE="${SGLANG_BIG_TP_COLLECTIVE_TRACE_MAX_RECORDS_PER_SOURCE:-0}"
 SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH="${SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH:-0}"
 SGLANG_PROFILE_WITH_STACK="${SGLANG_PROFILE_WITH_STACK:-true}"
 SGLANG_PROFILE_RECORD_SHAPES="${SGLANG_PROFILE_RECORD_SHAPES:-true}"
@@ -89,6 +90,7 @@ export SGLANG_TORCH_PROFILER_DIR="${CAPTURE_DIR}"
 export SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE
 export SGLANG_BIG_TP_COLLECTIVE_TRACE
 export SGLANG_BIG_TP_COLLECTIVE_TRACE_MAX_RECORDS
+export SGLANG_BIG_TP_COLLECTIVE_TRACE_MAX_RECORDS_PER_SOURCE
 export SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH
 export SGLANG_PROFILE_WITH_STACK
 export SGLANG_PROFILE_RECORD_SHAPES
@@ -147,6 +149,9 @@ done
   echo "eplb_rebalance_layers_per_chunk=${EPLB_REBALANCE_LAYERS_PER_CHUNK:-all}"
   echo "eplb_p2p_batch_chunk_size=${SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE}"
   echo "mlp_sync_device_all_gather=${SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH}"
+  echo "collective_trace=${SGLANG_BIG_TP_COLLECTIVE_TRACE}"
+  echo "collective_trace_max_records=${SGLANG_BIG_TP_COLLECTIVE_TRACE_MAX_RECORDS}"
+  echo "collective_trace_max_records_per_source=${SGLANG_BIG_TP_COLLECTIVE_TRACE_MAX_RECORDS_PER_SOURCE}"
   echo "moe_backend=deepep"
   echo "deepep_mode=low_latency"
   echo "moe_tp=1"
@@ -362,12 +367,12 @@ fi
 set +e
 python test/manual/ascend/analyze_npu_lm_head_eplb_validation.py \
   "${OUTPUT_DIR}" "${FOCUSED_VALIDATION_ARGS[@]}" \
-  >"${OUTPUT_DIR}/lm-head-eplb-validation-summary.json"
+  >"${OUTPUT_DIR}/graph-membership-summary.json"
 FOCUSED_VALIDATION_STATUS=$?
 set -e
-cat "${OUTPUT_DIR}/lm-head-eplb-validation-summary.json"
+cat "${OUTPUT_DIR}/graph-membership-summary.json"
 if [[ "${FOCUSED_VALIDATION_STATUS}" -ne 0 ]]; then
-  echo "Focused LM-head/EPLB validation did not meet all required conditions." >&2
+  echo "Focused MLP-sync/EPLB graph-membership validation did not meet all required conditions." >&2
   exit "${FOCUSED_VALIDATION_STATUS}"
 fi
 

@@ -2,7 +2,7 @@
 
 import io
 import json
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 from unittest.mock import patch
 
 import torch
@@ -75,6 +75,10 @@ class TestCollectiveTrace(CustomTestCase):
         self.assertEqual(records[0]["group"], "tp:0")
         self.assertEqual(records[0]["ranks"], [0, 1, 2, 3])
         self.assertEqual(records[0]["active_mask_cpu"], [1, 0, 1, 1])
+        self.assertEqual(
+            records[0]["profile_marker"],
+            "SGLANG_COLLECTIVE::big_tp::GroupCoordinator.all_reduce::all_reduce",
+        )
         self.assertEqual(records[0]["tensors"][0]["shape"], [2, 3])
         self.assertEqual(records[0]["tensors"][0]["dtype"], "torch.bfloat16")
         self.assertIn("device_completion_not_implied", records[1]["completion"])
@@ -137,6 +141,47 @@ class TestCollectiveTrace(CustomTestCase):
         self.assertEqual(begin["tensor_count"], 20)
         self.assertEqual(len(begin["tensors"]), 16)
         self.assertEqual(begin["tensor_metadata_truncated"], 4)
+
+    def test_per_source_limit_preserves_capacity_for_other_sources(self):
+        buffer = io.StringIO()
+        with (
+            patch.object(collective_trace, "_TRACE_ENABLED", True),
+            patch.object(collective_trace, "_TRACE_MAX_RECORDS", 0),
+            patch.object(collective_trace, "_TRACE_MAX_RECORDS_PER_SOURCE", 1),
+            patch.object(collective_trace, "_TRACE_RECORD_COUNT_BY_SOURCE", {}),
+            patch.object(
+                torch.profiler,
+                "record_function",
+                side_effect=lambda _: nullcontext(),
+            ) as record_function,
+            redirect_stdout(buffer),
+        ):
+            for source in ("frequent", "frequent", "later"):
+                with trace_collective(
+                    "all_gather",
+                    coordinator=_FakeGroup(),
+                    source=source,
+                    tensors=torch.empty(1),
+                ):
+                    pass
+
+        begin_records = [
+            record
+            for record in self._records(buffer.getvalue())
+            if record["event"] == "BEGIN"
+        ]
+        self.assertEqual(
+            [record["source"] for record in begin_records], ["frequent", "later"]
+        )
+        self.assertEqual(record_function.call_count, 3)
+        self.assertEqual(
+            [call.args[0] for call in record_function.call_args_list],
+            [
+                "SGLANG_COLLECTIVE::big_tp::frequent::all_gather",
+                "SGLANG_COLLECTIVE::big_tp::frequent::all_gather",
+                "SGLANG_COLLECTIVE::big_tp::later::all_gather",
+            ],
+        )
 
 
 if __name__ == "__main__":

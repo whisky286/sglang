@@ -23,7 +23,11 @@ import torch.distributed
 
 TRACE_ENV = "SGLANG_BIG_TP_COLLECTIVE_TRACE"
 TRACE_MAX_RECORDS_ENV = "SGLANG_BIG_TP_COLLECTIVE_TRACE_MAX_RECORDS"
+TRACE_MAX_RECORDS_PER_SOURCE_ENV = (
+    "SGLANG_BIG_TP_COLLECTIVE_TRACE_MAX_RECORDS_PER_SOURCE"
+)
 TRACE_PREFIX = "[SGLANG_BIG_TP_COLL] "
+PROFILE_MARKER_PREFIX = "SGLANG_COLLECTIVE::"
 _MAX_TENSOR_METADATA_PER_RECORD = 16
 
 _TRACE_ENABLED = os.getenv(TRACE_ENV, "").strip().lower() in {
@@ -33,11 +37,13 @@ _TRACE_ENABLED = os.getenv(TRACE_ENV, "").strip().lower() in {
     "on",
 }
 _TRACE_MAX_RECORDS = int(os.getenv(TRACE_MAX_RECORDS_ENV, "0"))
+_TRACE_MAX_RECORDS_PER_SOURCE = int(os.getenv(TRACE_MAX_RECORDS_PER_SOURCE_ENV, "0"))
 _TRACE_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
     "sglang_big_tp_collective_trace_depth", default=0
 )
 _TRACE_SEQUENCE = itertools.count(1)
 _TRACE_RECORD_COUNT = 0
+_TRACE_RECORD_COUNT_BY_SOURCE: dict[str, int] = {}
 
 
 def trace_enabled() -> bool:
@@ -127,6 +133,10 @@ def _emit(record: dict[str, Any]) -> None:
     )
 
 
+def _profile_marker_name(scope: str, source: str, op: str) -> str:
+    return f"{PROFILE_MARKER_PREFIX}{scope}::{source}::{op}"
+
+
 @contextmanager
 def trace_collective(
     op: str,
@@ -148,82 +158,102 @@ def trace_collective(
     """
     global _TRACE_RECORD_COUNT
 
-    should_trace = _TRACE_ENABLED
-    should_trace = should_trace and (
+    source_key = source or "<unspecified>"
+    should_instrument = _TRACE_ENABLED
+    should_instrument = should_instrument and (
         not require_big_tp_group or is_big_tp_group(coordinator)
     )
-    should_trace = should_trace and _TRACE_DEPTH.get() == 0
-    should_trace = should_trace and (
-        _TRACE_MAX_RECORDS <= 0 or _TRACE_RECORD_COUNT < _TRACE_MAX_RECORDS
-    )
-    if not should_trace:
+    should_instrument = should_instrument and _TRACE_DEPTH.get() == 0
+    if not should_instrument:
         yield
         return
 
-    _TRACE_RECORD_COUNT += 1
-    sequence = next(_TRACE_SEQUENCE)
+    should_emit = _TRACE_MAX_RECORDS <= 0 or _TRACE_RECORD_COUNT < _TRACE_MAX_RECORDS
+    should_emit = should_emit and (
+        _TRACE_MAX_RECORDS_PER_SOURCE <= 0
+        or _TRACE_RECORD_COUNT_BY_SOURCE.get(source_key, 0)
+        < _TRACE_MAX_RECORDS_PER_SOURCE
+    )
+    profile_marker = _profile_marker_name(scope, source_key, op)
+    sequence = next(_TRACE_SEQUENCE) if should_emit else None
     tensor_metadata: list[dict[str, Any]] = []
     tensor_stats = {"count": 0}
-    _collect_tensor_metadata(tensors, tensor_metadata, tensor_stats)
-
-    if process_group is None and coordinator is not None:
-        process_group = getattr(coordinator, "device_group", None)
-    ranks = getattr(coordinator, "ranks", None)
-    rank_in_group = getattr(coordinator, "rank_in_group", None)
-    group_name = getattr(coordinator, "unique_name", None)
-    world_size = getattr(coordinator, "world_size", None)
-    if world_size is None:
-        world_size = _safe_dist_world_size(process_group)
-    if ranks is None and world_size is not None:
-        ranks = list(range(world_size))
-
-    base_record = {
-        "seq": sequence,
-        "pid": os.getpid(),
-        "scope": scope,
-        "source": source,
-        "op": op,
-        "group": group_name,
-        "ranks": ranks,
-        "group_size": world_size,
-        "global_rank": _safe_dist_rank(),
-        "rank_in_group": (
-            rank_in_group
-            if rank_in_group is not None
-            else _safe_dist_rank(process_group)
-        ),
-        "backend": _safe_backend(process_group),
-        "active_mask_cpu": _safe_active_mask(coordinator),
-        "tensors": tensor_metadata,
-        "tensor_count": tensor_stats["count"],
-        "tensor_metadata_truncated": tensor_stats["count"] - len(tensor_metadata),
-        "extra": _json_safe(extra or {}),
-    }
-    token = _TRACE_DEPTH.set(_TRACE_DEPTH.get() + 1)
-    started_at = time.perf_counter_ns()
-    _emit({"event": "BEGIN", **base_record})
-    try:
-        yield
-    except BaseException as error:
-        _emit(
-            {
-                "event": "ERROR",
-                **base_record,
-                "elapsed_us": (time.perf_counter_ns() - started_at) // 1000,
-                "error_type": type(error).__name__,
-                "error": str(error),
-            }
+    if should_emit:
+        _TRACE_RECORD_COUNT += 1
+        _TRACE_RECORD_COUNT_BY_SOURCE[source_key] = (
+            _TRACE_RECORD_COUNT_BY_SOURCE.get(source_key, 0) + 1
         )
+        _collect_tensor_metadata(tensors, tensor_metadata, tensor_stats)
+
+    base_record: dict[str, Any] = {}
+    if should_emit:
+        if process_group is None and coordinator is not None:
+            process_group = getattr(coordinator, "device_group", None)
+        ranks = getattr(coordinator, "ranks", None)
+        rank_in_group = getattr(coordinator, "rank_in_group", None)
+        group_name = getattr(coordinator, "unique_name", None)
+        world_size = getattr(coordinator, "world_size", None)
+        if world_size is None:
+            world_size = _safe_dist_world_size(process_group)
+        if ranks is None and world_size is not None:
+            ranks = list(range(world_size))
+
+        base_record = {
+            "seq": sequence,
+            "pid": os.getpid(),
+            "profile_marker": profile_marker,
+            "scope": scope,
+            "source": source,
+            "op": op,
+            "group": group_name,
+            "ranks": ranks,
+            "group_size": world_size,
+            "global_rank": _safe_dist_rank(),
+            "rank_in_group": (
+                rank_in_group
+                if rank_in_group is not None
+                else _safe_dist_rank(process_group)
+            ),
+            "backend": _safe_backend(process_group),
+            "active_mask_cpu": _safe_active_mask(coordinator),
+            "tensors": tensor_metadata,
+            "tensor_count": tensor_stats["count"],
+            "tensor_metadata_truncated": tensor_stats["count"] - len(tensor_metadata),
+            "extra": _json_safe(extra or {}),
+        }
+    token = _TRACE_DEPTH.set(_TRACE_DEPTH.get() + 1)
+    started_at = time.perf_counter_ns() if should_emit else 0
+    if should_emit:
+        _emit({"event": "BEGIN", **base_record})
+    try:
+        # Keep this marker active even after the text-record quota is
+        # exhausted. The scheduler can call an MLP-sync collective thousands
+        # of times before the requested profiling window starts; the profiler
+        # itself records this scope only while it is active.
+        with torch.profiler.record_function(profile_marker):
+            yield
+    except BaseException as error:
+        if should_emit:
+            _emit(
+                {
+                    "event": "ERROR",
+                    **base_record,
+                    "elapsed_us": (time.perf_counter_ns() - started_at) // 1000,
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                }
+            )
         raise
     else:
-        _emit(
-            {
-                "event": "RETURN",
-                **base_record,
-                "elapsed_us": (time.perf_counter_ns() - started_at) // 1000,
-                "completion": "python_call_returned_device_completion_not_implied",
-            }
-        )
+        if should_emit:
+            _emit(
+                {
+                    "event": "RETURN",
+                    **base_record,
+                    "elapsed_us": (time.perf_counter_ns() - started_at) // 1000,
+                    "completion": "python_call_returned_device_completion_not_implied",
+                }
+            )
     finally:
         _TRACE_DEPTH.reset(token)
 
