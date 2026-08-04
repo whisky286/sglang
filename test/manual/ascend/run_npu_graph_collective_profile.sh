@@ -21,12 +21,14 @@ ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3}"
 ARTIFACT_ROOT="${ARTIFACT_ROOT:-/tmp/sglang-npu-graph-profile}"
 CUDA_GRAPH_BS_DECODE="${CUDA_GRAPH_BS_DECODE:-1 2 4 8}"
 PROFILE_STEPS="${PROFILE_STEPS:-5}"
+PROFILE_BATCH_SIZE="${PROFILE_BATCH_SIZE:-1}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
 RANDOM_INPUT_LEN="${RANDOM_INPUT_LEN:-128}"
 RUN_GSM8K_EVAL="${RUN_GSM8K_EVAL:-0}"
 EPLB_REBALANCE_NUM_ITERATIONS="${EPLB_REBALANCE_NUM_ITERATIONS:-1000}"
 EPLB_REBALANCE_LAYERS_PER_CHUNK="${EPLB_REBALANCE_LAYERS_PER_CHUNK:-}"
 REQUIRE_FOCUSED_VALIDATION="${REQUIRE_FOCUSED_VALIDATION:-0}"
+REQUIRE_COMPLETE_COMMUNICATION_MATRIX="${REQUIRE_COMPLETE_COMMUNICATION_MATRIX:-0}"
 SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE="${SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE:-1}"
 SGLANG_BIG_TP_COLLECTIVE_TRACE="${SGLANG_BIG_TP_COLLECTIVE_TRACE:-0}"
 SGLANG_BIG_TP_COLLECTIVE_TRACE_MAX_RECORDS="${SGLANG_BIG_TP_COLLECTIVE_TRACE_MAX_RECORDS:-0}"
@@ -143,6 +145,7 @@ done
   echo "visible_npus=${ASCEND_RT_VISIBLE_DEVICES}"
   echo "graph_buckets_decode=${CUDA_GRAPH_BS_DECODE}"
   echo "profile_steps=${PROFILE_STEPS}"
+  echo "profile_batch_size=${PROFILE_BATCH_SIZE}"
   echo "gsm8k_eval=${RUN_GSM8K_EVAL}"
   echo "eplb=enabled"
   echo "eplb_rebalance_num_iterations=${EPLB_REBALANCE_NUM_ITERATIONS}"
@@ -154,6 +157,7 @@ done
   echo "collective_trace_max_records_per_source=${SGLANG_BIG_TP_COLLECTIVE_TRACE_MAX_RECORDS_PER_SOURCE}"
   echo "moe_backend=deepep"
   echo "deepep_mode=low_latency"
+  echo "deepep_num_max_dispatch_tokens_per_rank=${SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-unset}"
   echo "moe_tp=1"
   echo "moe_dp=1"
   echo "artifact_dir=${OUTPUT_DIR}"
@@ -293,6 +297,8 @@ SGLANG_TORCH_PROFILER_DIR="${REPLAY_DIR}" \
   --profile-steps "${PROFILE_STEPS}" \
   --profile-by-stage \
   --profile-prefix healthy-replay \
+  --batch-size "${PROFILE_BATCH_SIZE}" \
+  --different-prompts \
   --random-input-len "${RANDOM_INPUT_LEN}" \
   --seed 0 \
   --temperature 0 \
@@ -360,20 +366,34 @@ if summary["healthy_replay"]["marker_counts"]["GRAPH_REPLAY"] == 0:
     raise SystemExit("GRAPH_REPLAY marker not found in healthy replay profile")
 PY
 
-FOCUSED_VALIDATION_ARGS=()
-if [[ "${REQUIRE_FOCUSED_VALIDATION}" == "1" ]]; then
-  FOCUSED_VALIDATION_ARGS+=(--require-complete)
-fi
-set +e
-python test/manual/ascend/analyze_npu_lm_head_eplb_validation.py \
-  "${OUTPUT_DIR}" "${FOCUSED_VALIDATION_ARGS[@]}" \
-  >"${OUTPUT_DIR}/graph-membership-summary.json"
-FOCUSED_VALIDATION_STATUS=$?
-set -e
-cat "${OUTPUT_DIR}/graph-membership-summary.json"
-if [[ "${FOCUSED_VALIDATION_STATUS}" -ne 0 ]]; then
-  echo "Focused MLP-sync/EPLB graph-membership validation did not meet all required conditions." >&2
-  exit "${FOCUSED_VALIDATION_STATUS}"
+if [[ "${REQUIRE_COMPLETE_COMMUNICATION_MATRIX}" == "1" ]]; then
+  set +e
+  python test/manual/ascend/analyze_npu_communication_matrix.py \
+    "${OUTPUT_DIR}" --require-complete \
+    >"${OUTPUT_DIR}/communication-matrix-summary.json"
+  COMMUNICATION_MATRIX_STATUS=$?
+  set -e
+  cat "${OUTPUT_DIR}/communication-matrix-summary.json"
+  if [[ "${COMMUNICATION_MATRIX_STATUS}" -ne 0 ]]; then
+    echo "Complete communication inventory still has missing or unclassified entries." >&2
+    exit "${COMMUNICATION_MATRIX_STATUS}"
+  fi
+else
+  FOCUSED_VALIDATION_ARGS=()
+  if [[ "${REQUIRE_FOCUSED_VALIDATION}" == "1" ]]; then
+    FOCUSED_VALIDATION_ARGS+=(--require-complete)
+  fi
+  set +e
+  python test/manual/ascend/analyze_npu_lm_head_eplb_validation.py \
+    "${OUTPUT_DIR}" "${FOCUSED_VALIDATION_ARGS[@]}" \
+    >"${OUTPUT_DIR}/graph-membership-summary.json"
+  FOCUSED_VALIDATION_STATUS=$?
+  set -e
+  cat "${OUTPUT_DIR}/graph-membership-summary.json"
+  if [[ "${FOCUSED_VALIDATION_STATUS}" -ne 0 ]]; then
+    echo "Focused MLP-sync/EPLB graph-membership validation did not meet all required conditions." >&2
+    exit "${FOCUSED_VALIDATION_STATUS}"
+  fi
 fi
 
 printf '%s\n' \

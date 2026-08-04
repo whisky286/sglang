@@ -44,6 +44,11 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.distributed.collective_trace import (
+    trace_big_tp_collective,
+    trace_collective,
+    trace_enabled,
+)
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -166,7 +171,18 @@ def inplace_all_reduce(tensor: torch.Tensor, group_name: str) -> None:
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
-    group._all_reduce_in_place(tensor)
+    if not trace_enabled():
+        group._all_reduce_in_place(tensor)
+        return
+    with trace_collective(
+        "all_reduce",
+        coordinator=group,
+        scope="big_tp_custom_op",
+        source="inplace_all_reduce",
+        tensors=tensor,
+        require_big_tp_group=True,
+    ):
+        group._all_reduce_in_place(tensor)
 
 
 @register_custom_op(out_shape="tensor")
@@ -177,7 +193,18 @@ def outplace_all_reduce(
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
-    return group._all_reduce_out_place(tensor, outplace_all_reduce_method)
+    if not trace_enabled():
+        return group._all_reduce_out_place(tensor, outplace_all_reduce_method)
+    with trace_collective(
+        "all_reduce",
+        coordinator=group,
+        scope="big_tp_custom_op",
+        source="outplace_all_reduce",
+        tensors=tensor,
+        extra={"implementation": outplace_all_reduce_method},
+        require_big_tp_group=True,
+    ):
+        return group._all_reduce_out_place(tensor, outplace_all_reduce_method)
 
 
 @register_custom_op(mutates_args=["output"])
@@ -188,7 +215,18 @@ def reg_all_gather_into_tensor(
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
-    group._all_gather_into_tensor(output, input)
+    if not trace_enabled():
+        group._all_gather_into_tensor(output, input)
+        return
+    with trace_collective(
+        "all_gather_into_tensor",
+        coordinator=group,
+        scope="big_tp_custom_op",
+        source="reg_all_gather_into_tensor",
+        tensors=(output, input),
+        require_big_tp_group=True,
+    ):
+        group._all_gather_into_tensor(output, input)
 
 
 @register_custom_op(mutates_args=["output"])
@@ -199,7 +237,18 @@ def reg_reduce_scatter_tensor(
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
-    group._reduce_scatter_tensor(output, input)
+    if not trace_enabled():
+        group._reduce_scatter_tensor(output, input)
+        return
+    with trace_collective(
+        "reduce_scatter_tensor",
+        coordinator=group,
+        scope="big_tp_custom_op",
+        source="reg_reduce_scatter_tensor",
+        tensors=(output, input),
+        require_big_tp_group=True,
+    ):
+        group._reduce_scatter_tensor(output, input)
 
 
 @register_custom_op(mutates_args=["output"])
@@ -210,7 +259,18 @@ def reg_all_to_all_single(
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
-    group._all_to_all_single(output, input)
+    if not trace_enabled():
+        group._all_to_all_single(output, input)
+        return
+    with trace_collective(
+        "all_to_all_single",
+        coordinator=group,
+        scope="big_tp_custom_op",
+        source="reg_all_to_all_single",
+        tensors=(output, input),
+        require_big_tp_group=True,
+    ):
+        group._all_to_all_single(output, input)
 
 
 class GroupCoordinator:
@@ -613,6 +673,7 @@ class GroupCoordinator:
             with maybe_pynccl_context, maybe_pymscclpp_context:
                 yield graph_capture_context
 
+    @trace_big_tp_collective("all_reduce")
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the
@@ -705,6 +766,7 @@ class GroupCoordinator:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
+    @trace_big_tp_collective("quant_all_reduce")
     def quant_all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """
         User-facing quant-all-reduce function similar to all-reduce. (NPU support only)
@@ -719,6 +781,7 @@ class GroupCoordinator:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
+    @trace_big_tp_collective("fused_allreduce_rmsnorm")
     def fused_allreduce_rmsnorm(
         self,
         input_: torch.Tensor,
@@ -821,6 +884,7 @@ class GroupCoordinator:
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
+    @trace_big_tp_collective("reduce_scatter_along_dim")
     def reduce_scatter_along_dim(
         self, input_: torch.Tensor, dim: int = -1
     ) -> torch.Tensor:
@@ -878,6 +942,7 @@ class GroupCoordinator:
             )
         return output
 
+    @trace_big_tp_collective("reduce_scatter_tensor")
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu:
             self._reduce_scatter_tensor(output, input)
@@ -936,12 +1001,14 @@ class GroupCoordinator:
     def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
         torch.distributed.all_to_all_single(output, input, group=self.device_group)
 
+    @trace_big_tp_collective("all_to_all_single")
     def all_to_all_single(self, output: torch.Tensor, input: torch.Tensor):
         if self.world_size == 1:
             output.copy_(input)
             return
         reg_all_to_all_single(output, input, group_name=self.unique_name)
 
+    @trace_big_tp_collective("reduce_scatter")
     def reduce_scatter(
         self,
         output: torch.Tensor,
@@ -951,6 +1018,7 @@ class GroupCoordinator:
         torch.distributed.reduce_scatter(output, input_list, group=self.device_group)
         return output
 
+    @trace_big_tp_collective("reduce_scatterv")
     def reduce_scatterv(
         self,
         input_: torch.Tensor,
@@ -1050,6 +1118,7 @@ class GroupCoordinator:
             return envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
         return envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
 
+    @trace_big_tp_collective("all_gather_into_tensor")
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu:
             self._all_gather_into_tensor(output, input)
@@ -1060,6 +1129,7 @@ class GroupCoordinator:
             # + wait_tensor, which invokes sycl_event.wait() and breaks XPU graph capture.
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
 
+    @trace_big_tp_collective("all_gather")
     def all_gather(
         self,
         input_: torch.Tensor,
@@ -1134,6 +1204,7 @@ class GroupCoordinator:
         )
         return output_tensor
 
+    @trace_big_tp_collective("all_gatherv")
     def all_gatherv(
         self,
         input_: Union[torch.Tensor, List[torch.Tensor]],
@@ -1205,6 +1276,7 @@ class GroupCoordinator:
 
             return output_list
 
+    @trace_big_tp_collective("gather")
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1
     ) -> Optional[torch.Tensor]:
@@ -1240,6 +1312,7 @@ class GroupCoordinator:
             output_tensor = None
         return output_tensor
 
+    @trace_big_tp_collective("broadcast")
     def broadcast(self, input_: torch.Tensor, src: int = 0):
         """Broadcast the input tensor.
         NOTE: `src` is the local rank of the source rank.
@@ -1255,6 +1328,7 @@ class GroupCoordinator:
         )
         return input_
 
+    @trace_big_tp_collective("broadcast_object")
     def broadcast_object(self, obj: Optional[Any] = None, src: int = 0):
         """Broadcast the input object.
         NOTE: `src` is the local rank of the source rank.
@@ -1279,6 +1353,7 @@ class GroupCoordinator:
             )
             return recv[0]
 
+    @trace_big_tp_collective("broadcast_object_list")
     def broadcast_object_list(
         self, obj_list: List[Any], src: int = 0, group: Optional[ProcessGroup] = None
     ):
@@ -1296,6 +1371,7 @@ class GroupCoordinator:
         )
         return obj_list
 
+    @trace_big_tp_collective("all_gather_object")
     def all_gather_object(self, obj: Any) -> List[Any]:
         objs = [None] * self.world_size
         torch.distributed.all_gather_object(objs, obj, group=self.cpu_group)
@@ -1390,6 +1466,7 @@ class GroupCoordinator:
         obj = pickle.loads(object_tensor.numpy())
         return obj
 
+    @trace_big_tp_collective("broadcast_tensor_dict")
     def broadcast_tensor_dict(
         self,
         tensor_dict: Optional[Dict[str, Union[torch.Tensor, Any]]] = None,
@@ -1587,6 +1664,7 @@ class GroupCoordinator:
                 tensor_dict[key] = value
         return tensor_dict
 
+    @trace_big_tp_collective("barrier")
     def barrier(self):
         """Barrier synchronization among the group.
         NOTE: don't use `device_group` here! `barrier` in NCCL is

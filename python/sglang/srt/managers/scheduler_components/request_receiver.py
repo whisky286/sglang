@@ -14,6 +14,7 @@ from typing import (
 import zmq
 from torch.distributed import barrier
 
+from sglang.srt.distributed.collective_trace import trace_collective
 from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
@@ -68,6 +69,32 @@ class SchedulerRequestReceiver:
         if self.max_recv_per_poll < 0:
             return False
         return num_recv_reqs >= self.max_recv_per_poll
+
+    def _broadcast_pyobj_traced(
+        self,
+        data,
+        rank,
+        dist_group,
+        *,
+        src,
+        coordinator,
+        source,
+    ):
+        with trace_collective(
+            "broadcast_pyobj",
+            coordinator=coordinator,
+            process_group=dist_group,
+            scope="scheduler_control",
+            source=source,
+            extra={
+                "reason": "scheduler_request_or_control_broadcast",
+                "profile_device_event_patterns": [
+                    "c10d::broadcast",
+                    "gloo:broadcast",
+                ],
+            },
+        ):
+            return broadcast_pyobj(data, rank, dist_group, src=src)
 
     @scheduler_nvtx_method("scheduler.recv_requests")
     def recv_requests(
@@ -147,19 +174,29 @@ class SchedulerRequestReceiver:
                 control_reqs = None
 
             if self.ps.attn_tp_size != 1:
-                work_reqs = broadcast_pyobj(
+                work_reqs = self._broadcast_pyobj_traced(
                     work_reqs,
                     self.attn_tp_group.rank,
                     self.attn_tp_cpu_group,
                     src=self.attn_tp_group.ranks[0],
+                    coordinator=self.attn_tp_group,
+                    source=(
+                        "SchedulerRequestReceiver._broadcast_reqs_across_ranks."
+                        "work_attn_tp"
+                    ),
                 )
 
             if self.ps.attn_cp_size != 1:
-                work_reqs = broadcast_pyobj(
+                work_reqs = self._broadcast_pyobj_traced(
                     work_reqs,
                     self.attn_cp_group.rank,
                     self.attn_cp_cpu_group,
                     src=self.attn_cp_group.ranks[0],
+                    coordinator=self.attn_cp_group,
+                    source=(
+                        "SchedulerRequestReceiver._broadcast_reqs_across_ranks."
+                        "work_attn_cp"
+                    ),
                 )
 
             # When dp_attention_local_control_broadcast is enabled, each DP
@@ -173,33 +210,52 @@ class SchedulerRequestReceiver:
             )
             if _local_ctrl:
                 if self.ps.attn_tp_size != 1:
-                    control_reqs = broadcast_pyobj(
+                    control_reqs = self._broadcast_pyobj_traced(
                         control_reqs,
                         self.attn_tp_group.rank,
                         self.attn_tp_cpu_group,
                         src=self.attn_tp_group.ranks[0],
+                        coordinator=self.attn_tp_group,
+                        source=(
+                            "SchedulerRequestReceiver._broadcast_reqs_across_ranks."
+                            "control_attn_tp"
+                        ),
                     )
                 if self.ps.attn_cp_size != 1:
-                    control_reqs = broadcast_pyobj(
+                    control_reqs = self._broadcast_pyobj_traced(
                         control_reqs,
                         self.attn_cp_group.rank,
                         self.attn_cp_cpu_group,
                         src=self.attn_cp_group.ranks[0],
+                        coordinator=self.attn_cp_group,
+                        source=(
+                            "SchedulerRequestReceiver._broadcast_reqs_across_ranks."
+                            "control_attn_cp"
+                        ),
                     )
             elif self.ps.tp_size != 1:
-                control_reqs = broadcast_pyobj(
+                control_reqs = self._broadcast_pyobj_traced(
                     control_reqs,
                     self.tp_group.rank,
                     self.tp_cpu_group,
                     src=self.tp_group.ranks[0],
+                    coordinator=self.tp_group,
+                    source=(
+                        "SchedulerRequestReceiver._broadcast_reqs_across_ranks."
+                        "control_full_tp"
+                    ),
                 )
             recv_reqs = work_reqs + control_reqs
         elif self.ps.tp_size != 1:
-            recv_reqs = broadcast_pyobj(
+            recv_reqs = self._broadcast_pyobj_traced(
                 recv_reqs,
                 self.tp_group.rank,
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
+                coordinator=self.tp_group,
+                source=(
+                    "SchedulerRequestReceiver._broadcast_reqs_across_ranks.all_full_tp"
+                ),
             )
         return recv_reqs
 

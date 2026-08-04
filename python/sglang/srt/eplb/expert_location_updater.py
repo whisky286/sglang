@@ -597,6 +597,14 @@ def update_expert_weights_single_layer(
                         "op_count": len(batch_ops),
                         "peers": sorted({op.peer for op in batch_ops}),
                         "direction_counts": dict(direction_counts),
+                        "profile_device_event_patterns": [
+                            "c10d::send",
+                            "c10d::recv",
+                            "hccl:send",
+                            "hccl:recv",
+                            "HcomSend",
+                            "HcomReceive",
+                        ],
                     },
                 ):
                     reqs = torch.distributed.batch_isend_irecv(batch_ops)

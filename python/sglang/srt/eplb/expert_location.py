@@ -25,6 +25,8 @@ import torch
 import torch.distributed
 import torch.nn.functional as F
 
+from sglang.srt.distributed.collective_trace import trace_collective
+
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.server_args import ServerArgs
@@ -518,9 +520,21 @@ def broadcast_global_expert_location_metadata(
     assert metadata is not None
 
     metadata.physical_to_logical_map = metadata.physical_to_logical_map.contiguous()
-    torch.distributed.broadcast(
-        metadata.physical_to_logical_map, src=src_rank, group=group
-    )
+    from sglang.srt.distributed.parallel_state import get_tp_group
+
+    process_group = group if group is not None else torch.distributed.group.WORLD
+    with trace_collective(
+        "broadcast",
+        coordinator=get_tp_group(),
+        process_group=process_group,
+        scope="eplb_world" if group is None else "eplb_explicit_group",
+        source="broadcast_global_expert_location_metadata",
+        tensors=metadata.physical_to_logical_map,
+        extra={"reason": "broadcast_expert_location", "src": src_rank},
+    ):
+        torch.distributed.broadcast(
+            metadata.physical_to_logical_map, src=src_rank, group=group
+        )
     metadata = ExpertLocationMetadata.init_by_mapping(
         server_args,
         model_config,

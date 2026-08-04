@@ -155,7 +155,14 @@ class MLPSyncBatchInfo:
                 scope="scheduler_world",
                 source="MLPSyncBatchInfo.all_gather",
                 tensors=(global_info_tensor, local_info_tensor),
-                extra={"reason": "scheduler_mlp_metadata"},
+                extra={
+                    "reason": "scheduler_mlp_metadata",
+                    "profile_device_event_patterns": [
+                        "c10d::all_reduce",
+                        "hccl:all_reduce",
+                        "HcomAllReduce",
+                    ],
+                },
             ):
                 torch.distributed.all_reduce(
                     global_info_tensor,
@@ -172,7 +179,14 @@ class MLPSyncBatchInfo:
                 scope="scheduler_big_tp",
                 source="MLPSyncBatchInfo.all_gather",
                 tensors=(global_info_tensor, local_info_tensor),
-                extra={"reason": "scheduler_mlp_metadata"},
+                extra={
+                    "reason": "scheduler_mlp_metadata",
+                    "profile_device_event_patterns": [
+                        "c10d::all_gather",
+                        "hccl:all_gather",
+                        "HcomAllGather",
+                    ],
+                },
             ):
                 torch.distributed.all_gather_into_tensor(
                     global_info_tensor.flatten(),

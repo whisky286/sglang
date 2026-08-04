@@ -1034,7 +1034,14 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             scope="eplb_world",
             source="_ExpertDistributionRecorderReal.dump",
             tensors=logical_count_of_buffered_step,
-            extra={"reason": "aggregate_expert_load"},
+            extra={
+                "reason": "aggregate_expert_load",
+                "profile_device_event_patterns": [
+                    "c10d::all_reduce",
+                    "hccl:all_reduce",
+                    "HcomAllReduce",
+                ],
+            },
         ):
             torch.distributed.all_reduce(
                 logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM

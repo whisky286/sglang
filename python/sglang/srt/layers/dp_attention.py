@@ -21,6 +21,7 @@ from sglang.srt.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.collective_trace import trace_collective
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -443,24 +444,37 @@ def _dp_gather_via_all_reduce(
         )
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
-    if world_dp_gather_enabled():
-        torch.distributed.all_reduce(
-            global_tokens,
-            op=torch.distributed.ReduceOp.SUM,
-            group=torch.distributed.group.WORLD,
-        )
-    else:
-        NUM_GPUS_PER_NODE = 8
-        if (
-            not local_tokens.dtype.is_floating_point
-            and get_tensor_model_parallel_world_size() <= NUM_GPUS_PER_NODE
-        ):
-            from sglang.srt.distributed.parallel_state import inplace_all_reduce
-
-            inplace_all_reduce(global_tokens, group_name=get_tp_group().unique_name)
-
+    use_world = world_dp_gather_enabled()
+    process_group = (
+        torch.distributed.group.WORLD if use_world else get_tp_group().device_group
+    )
+    with trace_collective(
+        "all_reduce",
+        coordinator=get_tp_group(),
+        process_group=process_group,
+        scope="dp_attention_world" if use_world else "dp_attention_big_tp",
+        source="_dp_gather_via_all_reduce",
+        tensors=(global_tokens, local_tokens),
+        extra={"reason": "gather_dp_tokens", "is_partial": is_partial},
+    ):
+        if use_world:
+            torch.distributed.all_reduce(
+                global_tokens,
+                op=torch.distributed.ReduceOp.SUM,
+                group=torch.distributed.group.WORLD,
+            )
         else:
-            global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
+            NUM_GPUS_PER_NODE = 8
+            if (
+                not local_tokens.dtype.is_floating_point
+                and get_tensor_model_parallel_world_size() <= NUM_GPUS_PER_NODE
+            ):
+                from sglang.srt.distributed.parallel_state import inplace_all_reduce
+
+                inplace_all_reduce(global_tokens, group_name=get_tp_group().unique_name)
+
+            else:
+                global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
 
 
 def _dp_gather_via_all_gather(
@@ -473,11 +487,20 @@ def _dp_gather_via_all_gather(
 
     if get_attn_tensor_model_parallel_world_size() == 1:
         if use_world:
-            torch.distributed.all_gather_into_tensor(
-                global_tokens,
-                local_tokens,
-                group=torch.distributed.group.WORLD,
-            )
+            with trace_collective(
+                "all_gather_into_tensor",
+                coordinator=get_tp_group(),
+                process_group=torch.distributed.group.WORLD,
+                scope="dp_attention_world",
+                source="_dp_gather_via_all_gather",
+                tensors=(global_tokens, local_tokens),
+                extra={"reason": "gather_dp_tokens", "is_partial": is_partial},
+            ):
+                torch.distributed.all_gather_into_tensor(
+                    global_tokens,
+                    local_tokens,
+                    group=torch.distributed.group.WORLD,
+                )
         else:
             get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
         return
@@ -490,11 +513,20 @@ def _dp_gather_via_all_gather(
     )[get_attn_tensor_model_parallel_rank()]
     get_attn_tp_group().reduce_scatter_tensor(scattered_local_tokens, local_tokens)
     if use_world:
-        torch.distributed.all_gather_into_tensor(
-            global_tokens,
-            scattered_local_tokens,
-            group=torch.distributed.group.WORLD,
-        )
+        with trace_collective(
+            "all_gather_into_tensor",
+            coordinator=get_tp_group(),
+            process_group=torch.distributed.group.WORLD,
+            scope="dp_attention_world",
+            source="_dp_gather_via_all_gather",
+            tensors=(global_tokens, scattered_local_tokens),
+            extra={"reason": "gather_dp_tokens", "is_partial": is_partial},
+        ):
+            torch.distributed.all_gather_into_tensor(
+                global_tokens,
+                scattered_local_tokens,
+                group=torch.distributed.group.WORLD,
+            )
     else:
         get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
 
