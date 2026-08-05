@@ -116,7 +116,6 @@ SERVER_ARGS=(
   --ep-dispatch-algorithm dynamic
   --ep-num-redundant-experts 384
   --eplb-rebalance-num-iterations "${EPLB_REBALANCE_NUM_ITERATIONS}"
-  --disable-overlap-schedule
   --enable-profile-cuda-graph
   --cuda-graph-bs-decode "${GRAPH_BUCKETS[@]}"
   --disable-radix-cache
