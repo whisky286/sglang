@@ -112,7 +112,11 @@ SERVER_ARGS=(
   --moe-a2a-backend deepep
   --deepep-mode low_latency
   --enable-eplb
+  --eplb-algorithm elasticity_aware
+  --ep-dispatch-algorithm dynamic
+  --ep-num-redundant-experts 384
   --eplb-rebalance-num-iterations "${EPLB_REBALANCE_NUM_ITERATIONS}"
+  --disable-overlap-schedule
   --enable-profile-cuda-graph
   --cuda-graph-bs-decode "${GRAPH_BUCKETS[@]}"
   --disable-radix-cache
