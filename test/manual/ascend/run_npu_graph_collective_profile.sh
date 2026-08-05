@@ -114,7 +114,7 @@ SERVER_ARGS=(
   --enable-eplb
   --eplb-algorithm elasticity_aware
   --ep-dispatch-algorithm dynamic
-  --ep-num-redundant-experts 384
+  --ep-num-redundant-experts 32
   --eplb-rebalance-num-iterations "${EPLB_REBALANCE_NUM_ITERATIONS}"
   --enable-profile-cuda-graph
   --cuda-graph-bs-decode "${GRAPH_BUCKETS[@]}"
