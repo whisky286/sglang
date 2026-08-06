@@ -286,3 +286,15 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+# Local NPU EEP research artifacts
+/npu-graph-profile-pointwise-integration-plan.html
+/npu-masked-eep-tp-communication-and-skip-notes.html
+/RAMS_GPU_USAGE_GUIDE.html
+/npu-eep-cpu-control-and-moe-v3-plan.html
+/knowledge/summary_eep_partial_rank_failures.md
+/npu-masked-original-topology-context/
+
+# Local agent tooling and generated code-understanding cache
+/.agents/
+/.ua/
