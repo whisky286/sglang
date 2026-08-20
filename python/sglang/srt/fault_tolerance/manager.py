@@ -77,7 +77,7 @@ class FaultToleranceManager:
 
     def _parse_apply_args(self, obj: Dict[str, Any]) -> Tuple[str, List[int], int]:
         instruction = obj["instruction"]
-        if instruction not in ("retry", "scale_down"):
+        if instruction not in ("retry", "scale_down", "inject_fault"):
             raise ValueError(f"unsupported instruction: {instruction}")
         params = obj["params"]
         timeout = params.get("timeout", self.server_args.fault_tolerance_timeout)
@@ -99,6 +99,9 @@ class FaultToleranceManager:
         try:
             if instruction == "retry":
                 return await self._apply_retry(timeout)
+            if instruction == "inject_fault":
+                target = ranks[0] if ranks else 0
+                return self._apply_inject_fault(target)
             return await self._apply_scale_down(ranks, timeout)
         except Exception as exc:
             self._failstop(f"fault tolerance apply {instruction} failed: {exc}")
@@ -120,6 +123,28 @@ class FaultToleranceManager:
         )
         await self._publish_route_dp_mask(st.expected_dp_mask, timeout)
         return 200, st.finish_retry()
+
+    def _apply_inject_fault(self, rank: int) -> tuple[int, dict]:
+        """Simulate a scheduler exception/crash on the given DP rank so it is
+        observed as an unhealthy (soft) fault, matching the experimental
+        'inject_rank_fault' scenario. This mirrors what happens when a rank's
+        scheduler raises during inference and reports FaultToleranceRankFaultOutput."""
+        if not (0 <= rank < self.state.dp_size):
+            return 400, ft_failure("inject_fault_requires_valid_rank")
+        st = self.state
+        if not st.expected_dp_mask[rank]:
+            return 400, ft_failure("inject_fault_requires_expected_rank")
+        self.handle_rank_fault(
+            FaultToleranceRankFaultOutput(
+                rank=rank,
+                message="injected scheduler exception (fault tolerance test)",
+            )
+        )
+        return 200, {
+            "success": True,
+            "message": "fault_tolerance_rank_fault_injected",
+            "rank": rank,
+        }
 
     async def _apply_scale_down(
         self, ranks: List[int], timeout: int

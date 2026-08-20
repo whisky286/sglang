@@ -256,9 +256,16 @@ def _trigger_scale_down(
     timeout: float = 120.0,
 ) -> Dict[str, Any]:
     logger.info(f"Triggering scale-down for ranks {removed_ranks}...")
-    url = f"{base_url}/fault_tolerance/scale_down"
+    url = f"{base_url}/fault_tolerance/apply"
     resp = _http_json(
-        session, "POST", url, payload={"removed_ranks": removed_ranks}, timeout=timeout
+        session,
+        "POST",
+        url,
+        payload={
+            "instruction": "scale_down",
+            "params": {"ranks": removed_ranks, "timeout": int(timeout)},
+        },
+        timeout=timeout,
     )
     logger.info(f"Scale-down response: {resp}")
     return resp
@@ -562,20 +569,22 @@ def run_exp4_mixed_fault_injection(
     )
     report.warmup_text = warmup.text
 
-    # 1. Soft fault injection via API
+    # 1. Soft fault injection via API (inject a scheduler exception -> unhealthy)
     logger.info(
         f"Injecting soft exception to rank {soft_victim_rank} via API endpoint..."
     )
-    try:
-        _http_json(
-            session,
-            "POST",
-            f"{base_url}/fault_tolerance/inject_rank_fault",
-            payload={"rank": soft_victim_rank},
-            timeout=5.0,
-        )
-    except Exception as exc:
-        logger.info(f"Inject rank fault response/error: {exc}")
+    inject_resp = _http_json(
+        session,
+        "POST",
+        f"{base_url}/fault_tolerance/apply",
+        payload={
+            "instruction": "inject_fault",
+            "params": {"ranks": [soft_victim_rank]},
+        },
+        timeout=5.0,
+    )
+    logger.info(f"Inject fault response: {inject_resp}")
+    assert inject_resp.get("success"), f"inject_fault did not succeed: {inject_resp}"
 
     # 2. Hard fault injection via SIGKILL
     pids = _find_scheduler_pids()
