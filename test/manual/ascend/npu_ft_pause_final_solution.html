@@ -1,0 +1,828 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SGLang Self-Pause 实现方案</title>
+  <style>
+    :root {
+      --bg: #f5f3ef;
+      --surface: #fcfbf8;
+      --surface-2: #eeeae4;
+      --ink: #2d2a26;
+      --muted: #706a62;
+      --line: #ded8cf;
+      --blue: #b65e3c;
+      --blue-dark: #8f452c;
+      --cyan: #687d75;
+      --green: #50725d;
+      --amber: #a66a36;
+      --red: #a85243;
+      --shadow: 0 18px 48px rgba(70, 56, 42, 0.08);
+      --radius: 18px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 88% 2%, rgba(182, 94, 60, 0.08), transparent 28rem),
+        var(--bg);
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
+        "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      line-height: 1.68;
+    }
+
+    a { color: var(--blue-dark); }
+    code {
+      padding: 0.12rem 0.38rem;
+      border-radius: 6px;
+      background: #eee9e2;
+      color: #79412f;
+      font: 0.92em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .hero {
+      padding: 64px 24px 48px;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 88% 12%, rgba(182, 94, 60, 0.13), transparent 25rem),
+        linear-gradient(135deg, #efe9e1, #f8f5f0);
+      border-bottom: 1px solid var(--line);
+      overflow: hidden;
+      position: relative;
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      width: 420px;
+      height: 420px;
+      right: -130px;
+      top: -230px;
+      border-radius: 50%;
+      border: 70px solid rgba(182, 94, 60, 0.06);
+    }
+
+    .hero-inner {
+      width: min(1180px, 100%);
+      margin: 0 auto;
+      position: relative;
+      z-index: 1;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      padding: 5px 11px;
+      border: 1px solid #cec4b8;
+      border-radius: 999px;
+      color: #745f54;
+      font-size: 13px;
+      letter-spacing: 0.04em;
+    }
+
+    h1 {
+      max-width: 850px;
+      margin: 18px 0 12px;
+      font-size: clamp(34px, 5vw, 58px);
+      line-height: 1.13;
+      letter-spacing: -0.025em;
+      font-family: Georgia, "Times New Roman", "Songti SC", serif;
+      font-weight: 600;
+    }
+
+    .subtitle {
+      max-width: 880px;
+      margin: 0;
+      color: #655e56;
+      font-size: 18px;
+    }
+
+    .hero-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 25px;
+    }
+
+    .hero-tag {
+      padding: 7px 12px;
+      border-radius: 9px;
+      background: rgba(255,255,255,0.68);
+      color: #63584f;
+      border: 1px solid #ded5cc;
+      font-size: 13px;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 232px minmax(0, 1fr);
+      gap: 34px;
+      width: min(1180px, calc(100% - 40px));
+      margin: 34px auto 72px;
+    }
+
+    nav {
+      position: sticky;
+      top: 24px;
+      align-self: start;
+      padding: 18px;
+      background: rgba(252,251,248,0.86);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+    }
+
+    nav strong {
+      display: block;
+      margin: 0 0 10px 8px;
+      font-size: 13px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    nav a {
+      display: block;
+      padding: 8px;
+      border-radius: 8px;
+      color: #5e5750;
+      text-decoration: none;
+      font-size: 14px;
+    }
+
+    nav a:hover { background: var(--surface-2); color: var(--blue-dark); }
+
+    main { min-width: 0; }
+
+    section {
+      margin-bottom: 26px;
+      padding: 30px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: 0 8px 28px rgba(70, 56, 42, 0.04);
+    }
+
+    h2 {
+      margin: 0 0 18px;
+      font-size: 26px;
+      line-height: 1.28;
+      letter-spacing: -0.015em;
+      font-family: Georgia, "Times New Roman", "Songti SC", serif;
+      font-weight: 600;
+    }
+
+    h3 {
+      margin: 24px 0 10px;
+      font-size: 18px;
+    }
+
+    p { margin: 9px 0; }
+    ul, ol { padding-left: 1.35rem; }
+    li + li { margin-top: 7px; }
+
+    .decision {
+      display: grid;
+      grid-template-columns: 8px 1fr;
+      overflow: hidden;
+      border-radius: 14px;
+      background: linear-gradient(135deg, #f4e8e1, #faf5f0);
+      border: 1px solid #e0c8ba;
+    }
+
+    .decision::before { content: ""; background: var(--blue); }
+
+    .decision-body { padding: 22px 24px; }
+
+    .decision-title {
+      margin: 0 0 5px;
+      color: var(--blue-dark);
+      font-size: 20px;
+      font-weight: 760;
+    }
+
+    .decision p { margin: 0; }
+
+    .flow {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 28px;
+      margin-top: 20px;
+    }
+
+    .flow-card {
+      position: relative;
+      min-height: 0;
+      padding: 18px 22px;
+      background: #f8f5f0;
+      border: 1px solid #ddd5cb;
+      border-radius: 13px;
+    }
+
+    .flow-card:not(:last-child)::after {
+      content: "↓";
+      position: absolute;
+      left: 50%;
+      bottom: -29px;
+      z-index: 2;
+      width: 28px;
+      height: 28px;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--surface);
+      color: var(--blue);
+      font-weight: 800;
+      transform: translateX(-50%);
+    }
+
+    .step-no {
+      display: inline-grid;
+      place-items: center;
+      width: 28px;
+      height: 28px;
+      border-radius: 8px;
+      color: #fff;
+      background: var(--blue);
+      font-weight: 700;
+      font-size: 13px;
+    }
+
+    .flow-card h3 { margin: 12px 0 6px; font-size: 16px; }
+    .flow-card p { margin: 0; color: var(--muted); font-size: 14px; }
+
+    .split {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .panel {
+      padding: 20px;
+      border-radius: 13px;
+      border: 1px solid var(--line);
+      background: #faf8f4;
+    }
+
+    .panel h3 { margin-top: 0; }
+    .bad { border-top: 4px solid var(--red); }
+    .good { border-top: 4px solid var(--green); }
+    .warn { border-top: 4px solid var(--amber); }
+    .info { border-top: 4px solid var(--cyan); }
+
+    .timeline {
+      margin-top: 20px;
+      border-left: 3px solid #d8c6b9;
+      padding-left: 24px;
+    }
+
+    .event {
+      position: relative;
+      padding: 0 0 24px 4px;
+    }
+
+    .event:last-child { padding-bottom: 0; }
+
+    .event::before {
+      content: "";
+      position: absolute;
+      left: -34px;
+      top: 5px;
+      width: 13px;
+      height: 13px;
+      border: 3px solid var(--surface);
+      border-radius: 50%;
+      background: var(--blue);
+      box-shadow: 0 0 0 2px #d1b8a8;
+    }
+
+    .event-title { font-weight: 740; }
+    .event-note { color: var(--muted); font-size: 14px; }
+
+    .state-machine {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      margin: 22px 0 4px;
+      padding: 22px;
+      background: #f7f3ed;
+      border: 1px dashed #cfc3b7;
+      border-radius: 14px;
+    }
+
+    .state {
+      min-width: 115px;
+      padding: 12px 14px;
+      text-align: center;
+      border-radius: 10px;
+      background: #fdfcf9;
+      border: 1px solid #d6cec4;
+      font-weight: 720;
+    }
+
+    .state.pause { color: #8b5426; border-color: #d6aa7c; background: #fbf0e4; }
+    .state.active { color: #42664f; border-color: #a9c0ae; background: #f0f6f1; }
+    .arrow { color: var(--blue); font-weight: 800; transform: rotate(90deg); }
+
+    .table-wrap { overflow-x: auto; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      font-size: 14px;
+    }
+
+    th, td {
+      padding: 13px 14px;
+      text-align: left;
+      vertical-align: top;
+      border-bottom: 1px solid var(--line);
+    }
+
+    th {
+      background: #f0ece6;
+      color: #625a52;
+      font-weight: 720;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+
+    .badge {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .badge.must { color: #8c463a; background: #f8e8e3; }
+    .badge.keep { color: #496653; background: #eaf1eb; }
+    .badge.change { color: #84572e; background: #f5eadb; }
+
+    .code-block {
+      overflow-x: auto;
+      margin: 14px 0;
+      padding: 18px;
+      border-radius: 12px;
+      background: #302d29;
+      color: #f0ebe4;
+      font: 13px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre;
+    }
+
+    .plain-flow {
+      overflow-x: auto;
+      margin: 18px 0 28px;
+      padding: 22px 24px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #faf8f4;
+      color: #39342f;
+      font: 14px/1.78 ui-monospace, SFMono-Regular, Menlo, Consolas,
+        "PingFang SC", "Microsoft YaHei", monospace;
+      white-space: pre-wrap;
+    }
+
+    .callout {
+      margin-top: 18px;
+      padding: 16px 18px;
+      border-left: 4px solid var(--amber);
+      border-radius: 8px;
+      background: #f8efe4;
+    }
+
+    .acceptance {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      list-style: none;
+      padding: 0;
+    }
+
+    .acceptance li {
+      margin: 0;
+      padding: 14px 14px 14px 42px;
+      position: relative;
+      border: 1px solid #d7e0d8;
+      border-radius: 11px;
+      background: #f3f7f3;
+    }
+
+    .acceptance li::before {
+      content: "✓";
+      position: absolute;
+      left: 14px;
+      top: 13px;
+      color: var(--green);
+      font-weight: 900;
+    }
+
+    .footer {
+      padding: 24px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; }
+      nav { position: static; }
+      nav a { display: inline-block; margin-right: 5px; }
+    }
+
+    @media (max-width: 620px) {
+      .hero { padding: 44px 20px 36px; }
+      .layout { width: min(100% - 24px, 1180px); margin-top: 18px; }
+      section { padding: 22px 18px; }
+      .split, .acceptance { grid-template-columns: 1fr; }
+      .state-machine { align-items: stretch; }
+      .arrow { text-align: center; }
+    }
+
+    @media print {
+      body { background: #fff; }
+      .hero { padding: 32px; print-color-adjust: exact; }
+      .layout { display: block; width: 100%; margin: 18px 0; }
+      nav { display: none; }
+      section { box-shadow: none; break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <div class="hero-inner">
+      <span class="eyebrow">SGLang · Ascend NPU · MC2 Fault Tolerance</span>
+      <h1>SGLang Self-Pause 实现方案</h1>
+      <p class="subtitle">
+        面向“并发推理期间 SIGKILL 一个 DP rank”的硬故障：故障即 pause，废弃全部在途请求，
+        不续推；pause 阶段中断设备，scale-down 阶段恢复设备并重建通信域。
+      </p>
+      <div class="hero-tags">
+        <span class="hero-tag">目标策略：Pause &amp; Discard</span>
+        <span class="hero-tag">故障类型：Hard SIGKILL</span>
+        <span class="hero-tag">执行后端：NPU MC2 / HCCL</span>
+        <span class="hero-tag">测试负载：concurrency = 10</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav aria-label="目录">
+      <strong>目录</strong>
+      <a href="#decision">1. 整体流程</a>
+      <a href="#semantics">2. Pause 语义</a>
+      <a href="#gap">3. 当前问题</a>
+      <a href="#architecture">4. 目标架构</a>
+      <a href="#sequence">5. 故障处理时序</a>
+      <a href="#changes">6. 代码改动方案</a>
+      <a href="#safety">7. 正确性约束</a>
+      <a href="#test">8. 验收标准</a>
+    </nav>
+
+    <main>
+      <section id="decision">
+        <h2>1. 整体流程</h2>
+        <div class="decision">
+          <div class="decision-body">
+            <div class="decision-title">故障检测 → Pause → 清理 → Scale-down → 恢复</div>
+            <ol>
+              <li>检测到 DP rank 退出，集群进入 <code>PAUSING</code>。</li>
+              <li>拒绝新请求，并结束故障时仍未完成的请求。</li>
+              <li>中断存活 rank 上的 MC2/HCCL 执行，清理 batch 与 KV cache。</li>
+              <li>收齐存活 rank 的 <code>PAUSED</code> ACK 后执行 scale-down。</li>
+              <li>恢复设备、重建通信域、更新 active mask，最后恢复服务。</li>
+            </ol>
+          </div>
+        </div>
+
+        <div class="state-machine" aria-label="故障恢复状态机">
+          <div class="state active">RUNNING</div><div class="arrow">→</div>
+          <div class="state pause">PAUSING</div><div class="arrow">→</div>
+          <div class="state pause">PAUSED</div><div class="arrow">→</div>
+          <div class="state">RECONFIGURING</div><div class="arrow">→</div>
+          <div class="state active">RUNNING</div>
+        </div>
+
+        <div class="callout">
+          <strong>关键前提：</strong>pause 的设备中断不能依赖普通 Scheduler event loop。
+          Scheduler 可能正阻塞在 TBE/MC2 调用中，必须由独立的控制路径触发 HCCL abort 或
+          <code>stop_device</code>，让执行线程真正返回。
+        </div>
+      </section>
+
+      <section id="semantics">
+        <h2>2. Pause 语义</h2>
+        <div class="split">
+          <div class="panel info">
+            <h3>请求层</h3>
+            <ul>
+              <li>进入 pause 后，所有新请求直接返回 503。</li>
+              <li>故障发生时仍未完成的请求，由 Tokenizer 统一终止为 503。</li>
+              <li>迟到的旧 Scheduler 输出按 incident epoch 丢弃。</li>
+            </ul>
+          </div>
+          <div class="panel warn">
+            <h3>执行层</h3>
+            <ul>
+              <li>存活 rank 停止当前设备执行，清空 batch、结果队列和 KV cache。</li>
+              <li>被 kill rank 的设备资源由进程退出回收。</li>
+              <li>scale-down 后不恢复旧请求，只接收新请求。</li>
+            </ul>
+          </div>
+        </div>
+        <p>
+          Tokenizer 必须参与请求清理，因为被 SIGKILL 的 Scheduler 无法再发送 <code>AbortReq</code>；
+          Scheduler 则负责清理存活 rank 上的执行状态和 KV cache。
+        </p>
+      </section>
+
+      <section id="gap">
+        <h2>3. 当前问题</h2>
+        <p>
+          当前由进程退出触发的 pause 只会拒绝后续请求，不会主动处理执层的在途请求。
+          现有 discard 仅在 MC2/HCCL 算子异常冒泡到 Scheduler FT event loop 时执行。
+        </p>
+      </section>
+
+      <section id="architecture">
+        <h2>4. 目标架构</h2>
+        <p>
+          故障处理由控制层发起，执行层完成设备中断和本地资源清理。控制器以 incident epoch
+          记录一次完整故障处理过程，并通过 ACK 确保所有存活 rank 清理完成后才进入 scale-down。
+        </p>
+
+        <h3>NPU/HCCL 在途请求清理路径</h3>
+        <div class="plain-flow">初始：
+active_ranks      = [1, 1, 1, 1]
+last_active_ranks = [1, 1, 1, 1]
+
+kill rank 3
+    ↓
+幸存 rank 上正在执行的 MC2/HCCL 算子检测到通信异常
+    ↓
+算子向 Scheduler 抛出异常
+    ↓
+Scheduler 捕获异常并向 DPC/FT 控制器上报 PauseIncident
+上报中的 rank 只是 reporter_rank（异常上报者）
+    ↓
+DPC/FT 控制器确认“发生了 DP 通信故障”
+将 reporter Engine 的服务状态记为 UNHEALTHY，但不把它当作被 kill 的 rank
+    ↓
+控制器创建 incident epoch，并将集群状态切换为 PAUSING
+    ↓
+Tokenizer 拒绝后续请求，并记录需要废弃的在途请求
+    ↓
+控制器通过独立控制路径向所有已配置的 DP Engine 广播 pause/status 探查
+    ↓
+已从算子返回的 Scheduler 直接进入清理
+仍阻塞在设备算子中的幸存 rank 执行 HCCL communicator abort 或 stop_device
+    ↓
+其余正在执行的 MC2/HCCL 操作被中断
+    ↓
+ModelRunner / Scheduler 从设备调用返回
+    ↓
+_ft_discard_inflight_window()
+    ↓
+释放幸存 rank 的 KV cache
+清空 running_batch / last_batch / result_queue
+    ↓
+Tokenizer 将全部在途请求结束为 503
+    ↓
+幸存 Scheduler 返回 PAUSED ACK
+    ↓
+Scheduler self-pause，将本 Engine 标记为 UNHEALTHY，不继续调度
+
+──────────── 存活探查与恢复决策 ────────────
+
+DPC/FT 控制面查询每个已配置 Engine 的状态
+    ↓
+rank 0 / 1 / 2 响应 UNHEALTHY/PAUSED：进程存活，可恢复
+rank 3 无响应，且 DPC 进程监控确认退出：DEAD
+    ↓
+全部预期 rank 均存活时可对 UNHEALTHY Engine 执行 retry
+存在 DEAD rank 时对其执行 scale-down，对幸存 Engine 执行恢复
+
+──────────── scale-down 恢复阶段 ────────────
+
+控制器收齐全部 PAUSED ACK
+    ↓
+active_ranks = [1, 1, 1, 0]
+    ↓
+restart_device
+    ↓
+按 active_ranks 重建 HCCL 通信域
+    ↓
+更新 MC2 metadata、执行 EPLB
+    ↓
+发布新的 route mask
+    ↓
+解除 pause，恢复接收新请求
+
+核心区别：
+Mooncake 通过通信层更新 active_ranks 来触发异常；
+NPU/HCCL 首先通过算子异常触发 pause；如果部分幸存 rank 仍阻塞在设备执行中，
+再由控制层通过 stop_device 使这些 rank 返回到 Scheduler。
+所有幸存 Engine 都进入 UNHEALTHY/PAUSED；具体故障 rank 由 DPC 状态探查结合进程存活检测确认。
+
+与 vLLM 的对应关系：
+vLLM 存活 Engine 自标记 UNHEALTHY  =  SGLang 存活 Scheduler self-pause
+vLLM 外部编排器逐个查询       =  SGLang DPC/FT 控制面广播 status 并结合进程监控
+vLLM 对可恢复实例发 retry       =  SGLang FT Manager 对存活 Engine 发 retry/scale-down 恢复命令
+
+实现注意：
+当前 FaultToleranceRankFaultOutput(rank=self.ps.dp_rank) 中的 rank 是捕获异常的幸存 rank。
+将它加入 unhealthy_dp_ranks 可以表示“该 Engine 仍存活但不可服务”，不能用来推断谁被 kill。
+控制面还应通过广播 pause 使其他幸存 Engine 也进入 UNHEALTHY/PAUSED，
+并单独用 process_alive 或心跳结果表示 DEAD。</div>
+
+        <div class="flow">
+          <div class="flow-card">
+            <span class="step-no">1</span>
+            <h3>异常触发</h3>
+            <p>幸存 rank 的 MC2/HCCL 算子抛出通信异常；Scheduler 自标记 UNHEALTHY 并上报 PauseIncident，但该 rank 只是报警者。</p>
+          </div>
+          <div class="flow-card">
+            <span class="step-no">2</span>
+            <h3>进入 Pause</h3>
+            <p>FT 控制器创建 incident epoch，广播 pause；所有响应的 Engine 进入 UNHEALTHY/PAUSED，Tokenizer 拒绝新请求。</p>
+          </div>
+          <div class="flow-card">
+            <span class="step-no">3</span>
+            <h3>中断并清理执行层</h3>
+            <p>独立控制路径中断存活设备上的 MC2/HCCL；Scheduler 随后清理 batch、结果队列和 KV cache。</p>
+          </div>
+          <div class="flow-card">
+            <span class="step-no">4</span>
+            <h3>故障定位与恢复</h3>
+            <p>DPC 逐个探查 Engine 状态；响应 UNHEALTHY/PAUSED 的为存活实例，无响应且进程退出的为 DEAD，再选择 retry 或 scale-down。</p>
+          </div>
+        </div>
+
+        <h3>设备中断接口</h3>
+        <div class="code-block">DeviceFaultInterrupter.pause(epoch)
+  1. 幂等检查：同一 epoch 只执行一次
+  2. 向所有已配置的 DP Engine 发送 pause/status，收集可达实例的响应
+  3. 优先调用 HCCL communicator abort / 异步故障接口
+  4. 若后端只提供 stop_device，则通过独立且已验证安全的控制线程调用
+  5. 等待执行线程从 MC2/TBE 返回
+  6. 通知 Scheduler 执行本地状态清理</div>
+
+        <p>
+          如果 TorchNPU 明确要求 <code>stop_device</code> 必须由 ModelRunner 的 device-owner 线程调用，
+          就不能简单从 DPC 进程调用它。此时需要 HCCL 的异步 abort 能力，或者调整执行线程模型：
+          保留一个可响应控制命令的设备拥有者，由工作线程承担可能阻塞的 forward。
+        </p>
+      </section>
+
+      <section id="sequence">
+        <h2>5. 完整故障处理时序</h2>
+        <div class="timeline">
+          <div class="event">
+            <div class="event-title">T0 · 推理正常运行</div>
+            <div class="event-note">并发请求已经分配到多个 DP rank，部分请求处于 prefill/decode。</div>
+          </div>
+          <div class="event">
+            <div class="event-title">T1 · SIGKILL 一个 DP rank</div>
+            <div class="event-note">受害进程瞬间退出；其设备上下文和 KV 资源由进程退出回收。</div>
+          </div>
+          <div class="event">
+            <div class="event-title">T2 · MC2/HCCL 算子抛出异常</div>
+            <div class="event-note">幸存 Scheduler 捕获异常，将自身 Engine 标记为 UNHEALTHY 并上报 PauseIncident；该 rank 是 reporter，不等于被 kill 的 rank。</div>
+          </div>
+          <div class="event">
+            <div class="event-title">T3 · Tokenizer 全局 pause</div>
+            <div class="event-note">新请求立即返回 503；故障时仍未结束的请求由 Tokenizer 统一完成为 503。</div>
+          </div>
+          <div class="event">
+            <div class="event-title">T4 · 中断存活设备</div>
+            <div class="event-note">通过不依赖 Scheduler event loop 的路径执行 HCCL abort 或 stop_device。</div>
+          </div>
+          <div class="event">
+            <div class="event-title">T5 · Scheduler 清理并 ACK</div>
+            <div class="event-note">所有响应 pause 的 Scheduler 清空 running/last/current/result_queue/chunked request，释放 KV，以 UNHEALTHY/PAUSED 状态停止调度。</div>
+          </div>
+          <div class="event">
+            <div class="event-title">T6 · DPC 探查 Engine 状态</div>
+            <div class="event-note">逐个查询所有已配置 Engine；响应 UNHEALTHY/PAUSED 的为可恢复存活实例，无响应者再结合进程退出或心跳租约确认为 DEAD。</div>
+          </div>
+          <div class="event">
+            <div class="event-title">T7 · 控制器选择恢复动作</div>
+            <div class="event-note">全部预期 rank 存活则可 retry；存在 DEAD rank 则对其 scale-down。仅在存活 Engine 全部 PAUSED 后进入 RECONFIGURING。</div>
+          </div>
+          <div class="event">
+            <div class="event-title">T8 · restart 与通信域重建</div>
+            <div class="event-note">restart_device，重建图外 HCCL group，更新 MC2 metadata/active mask，并执行 EPLB。</div>
+          </div>
+          <div class="event">
+            <div class="event-title">T9 · 恢复服务</div>
+            <div class="event-note">所有存活 rank 返回 READY ACK 后发布新 route mask，状态回到 RUNNING。</div>
+          </div>
+        </div>
+      </section>
+
+      <section id="changes">
+        <h2>6. 代码改动方案</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>模块</th><th>修改内容</th><th>性质</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>fault_tolerance/controller.py</code></td>
+                <td>增加 incident epoch 与 RUNNING/PAUSING/PAUSED/RECONFIGURING 状态；分离 Engine 服务状态与成员存活状态：<code>unhealthy_dp_ranks</code> 表示存活但已 pause 的 Engine，<code>process_alive_*</code> 表示 HEALTHY/UNHEALTHY 与 DEAD 的边界。</td>
+                <td><span class="badge must">必须新增</span></td>
+              </tr>
+              <tr>
+                <td><code>fault_tolerance/manager.py</code></td>
+                <td>收到算子异常后立即发起全局 pause，广播并收集每个 Engine 的状态；全部预期进程存活时允许 retry，有 DEAD rank 时转 scale-down；pause 超时时 fail-stop。</td>
+                <td><span class="badge change">需要调整</span></td>
+              </tr>
+              <tr>
+                <td><code>managers/io_struct.py</code></td>
+                <td>将算子异常事件定义为 <code>FaultTolerancePauseIncidentOutput</code>，包含 reporter rank 和错误信息；新增带 epoch、Engine 状态和清理结果的 <code>FaultTolerancePauseReq/Output</code>，不在事件中把 reporter 表达为 failed rank。</td>
+                <td><span class="badge must">必须新增</span></td>
+              </tr>
+              <tr>
+                <td><code>managers/tokenizer_manager.py</code></td>
+                <td>原子切换至 pause；快照故障窗口内的请求；将所有未完成请求终止为 SchedulerFault/503；防止旧 epoch 输出污染恢复后的请求。</td>
+                <td><span class="badge must">必须新增</span></td>
+              </tr>
+              <tr>
+                <td><code>managers/data_parallel_controller.py</code></td>
+                <td>对所有已配置 Engine 广播 pause/status 并逐个收集响应；响应者记为 UNHEALTHY/PAUSED，无响应者结合子进程退出/心跳才记为 DEAD；设备中断通道不经普通推理队列。</td>
+                <td><span class="badge change">需要调整</span></td>
+              </tr>
+              <tr>
+                <td><code>managers/scheduler.py</code></td>
+                <td>捕获 MC2/HCCL 算子异常后立即将本 Engine 设为 UNHEALTHY，复用 <code>_ft_discard_inflight_window()</code> 并上报 PauseIncident；其他存活 Scheduler 在收到 pause 后进入同一状态；清理完成返回带 epoch 的 PAUSED ACK。</td>
+                <td><span class="badge keep">复用为主</span></td>
+              </tr>
+              <tr>
+                <td><code>model_executor/model_runner.py</code></td>
+                <td>拆分现有 stop/restart：<code>prepare_fault_tolerance_pause()</code> 负责 stop/abort；<code>apply_fault_tolerance_scale_down()</code> 负责 restart、重建和 mask 提交。</td>
+                <td><span class="badge change">核心调整</span></td>
+              </tr>
+              <tr>
+                <td><code>elastic_ep/npu_mc2.py</code> 与 NPU metadata</td>
+                <td>在 restart 后按 survivor mask 重建图外通信域；固定图内 metadata 只在通信域稳定后一次性提交。</td>
+                <td><span class="badge keep">沿用并收紧顺序</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="safety">
+        <h2>7. 正确性与安全约束</h2>
+        <ol>
+          <li><strong>顺序约束：</strong>先 pause/stop/clean，再 restart/rebuild/route；不得交叉。</li>
+          <li><strong>状态分离：</strong>UNHEALTHY/PAUSED 表示 Engine 仍存活但不可服务；只有进程退出或心跳租约失效才可确认 DEAD，不能仅凭单次探查超时判死。</li>
+          <li><strong>ACK 屏障：</strong>DPC 完成存活探查并固定 survivor 集合后，没有收齐该集合的 PAUSED ACK，不能开始 scale-down/retry。</li>
+          <li><strong>幂等：</strong>stop、清理、restart 和 ACK 都以 incident epoch 去重。</li>
+          <li><strong>超时策略：</strong>任何 survivor 无法 pause 或清理时执行 fail-stop，不允许带着未知通信状态恢复。</li>
+          <li><strong>路由原子性：</strong>新 route mask 只能在通信域和 MC2 metadata 全部就绪后发布。</li>
+          <li><strong>线程安全：</strong>正式采用独立线程调用 stop_device 前，必须验证 TorchNPU 对调用线程及设备上下文的约束。</li>
+        </ol>
+      </section>
+
+      <section id="test">
+        <h2>8. inflight_scale_down 验收标准</h2>
+        <p>测试场景保持不变：并发度 10，持续推理过程中 SIGKILL 一个 DP rank，随后执行 scale-down。</p>
+
+        <ul class="acceptance">
+          <li>故障检测后，新请求全部返回 503，直到恢复完成。</li>
+          <li>故障窗口内未完成的请求在限定时间内全部终止，不允许客户端超时。</li>
+          <li>在途请求终态为 503/SchedulerFault，<code>traffic_errors == 0</code>。</li>
+          <li>所有存活 Scheduler 日志包含同一 epoch 的 pause、discard 与 ACK。</li>
+          <li>恢复决策前，状态探查显示幸存 Engine 为 UNHEALTHY/PAUSED，被 kill rank 经进程存活检测确认为 DEAD。</li>
+          <li>scale-down 前至少一次 device stop；恢复阶段包含 restart 和通信域重建。</li>
+          <li>无额外 TBE 进程退出、无 survivor 崩溃、无永久阻塞。</li>
+          <li>恢复后的新请求返回 200，输出与故障前基线一致。</li>
+          <li>连续执行多轮故障注入仍满足以上条件，无残留请求或旧 epoch 输出。</li>
+        </ul>
+
+        <div class="callout">
+          <strong>需要收紧现有测试：</strong>当前测试记录了 <code>traffic_errors</code>，但没有断言其为零。
+          最终测试必须区分“故障前已经完成的 200”和“故障时仍在途的请求”，并明确断言后者全部收到 503，
+          否则偶然超时也可能被报告为 PASS。
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <footer class="footer">
+    SGLang NPU MC2 Fault Tolerance · Self-Pause / Discard / Scale-Down Design
+  </footer>
+</body>
+</html>

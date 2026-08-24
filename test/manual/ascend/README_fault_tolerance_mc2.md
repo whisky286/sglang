@@ -31,9 +31,9 @@ fuzz when using a different DeepEP source commit.
 Start a disposable server with the target topology (adapt model and log paths):
 
 ```bash
-DEEP_USE_MODE=default python -m sglang.launch_server \
-  --model-path Qwen/Qwen3-30B-A3B \
-  --host 0.0.0.0 \
+DEEP_USE_MODE=ops python -m sglang.launch_server \
+  --model-path "${MODEL_PATH}" \
+  --host 127.0.0.1 \
   --port 30000 \
   --device npu \
   --tp-size 4 \
@@ -48,12 +48,23 @@ DEEP_USE_MODE=default python -m sglang.launch_server \
   --deepep-mode low_latency \
   --enable-eplb \
   --eplb-algorithm elasticity_aware \
-  --ep-num-redundant-experts 44 \
+  --ep-dispatch-algorithm dynamic \
+  --ep-num-redundant-experts 128 \
+  --cuda-graph-bs-decode 1 2 4 8 \
+  --disable-radix-cache \
+  --mem-fraction-static 0.5 \
+  --max-running-requests 8 \
+  --max-total-tokens 4096 \
+  --context-length 1024 \
+  --watchdog-timeout 30 \
+  --nnodes 1 \
+  --node-rank 0 \
+  --trust-remote-code \
   --elastic-ep-backend mc2 \
   --enable-fault-tolerance \
   --fault-tolerance-on-error-strategy pause \
   --fault-tolerance-timeout 600 \
-  2>&1 | tee /tmp/sglang-npu-ft.log
+  2>&1 | tee artifacts/npu_ft/sglang-npu-ft.log
 ```
 
 Qwen3-30B-A3B has 128 logical experts. With one of four ranks removed, each
@@ -107,7 +118,7 @@ Find a non-controller Scheduler PID and its original DP rank, then run:
 python test/manual/ascend/test_fault_tolerance_mc2_scale_down.py \
   --victim-rank 1 \
   --victim-pid <scheduler-pid-for-rank-1> \
-  --server-log /tmp/sglang-npu-ft.log
+  --server-log artifacts/npu_ft/sglang-npu-ft.log
 ```
 
 The test requires all four ranks to be healthy first. It sends a deterministic
@@ -133,21 +144,32 @@ To run the extended fault-injection test scenarios, use the **two-terminal workf
 
 **[Terminal 1] Launch Command**:
 ```bash
-DEEP_USE_MODE=default python -m sglang.launch_server \
-  --model-path Qwen/Qwen3-30B-A3B \
-  --host 0.0.0.0 \
+DEEP_USE_MODE=ops python -m sglang.launch_server \
+  --model-path "${MODEL_PATH}" \
+  --host 127.0.0.1 \
   --port 30000 \
   --device npu \
   --tp-size 4 --dp-size 4 --ep-size 4 \
   --moe-dense-tp-size 1 --moe-dp-size 1 --attn-cp-size 1 \
   --enable-dp-attention --enable-dp-lm-head \
   --moe-a2a-backend deepep --deepep-mode low_latency \
-  --enable-eplb --eplb-algorithm elasticity_aware \
-  --ep-num-redundant-experts 44 --elastic-ep-backend mc2 \
+  --enable-eplb --eplb-algorithm elasticity_aware --ep-dispatch-algorithm dynamic \
+  --ep-num-redundant-experts 128 \
+  --cuda-graph-bs-decode 1 2 4 8 \
+  --disable-radix-cache \
+  --mem-fraction-static 0.5 \
+  --max-running-requests 8 \
+  --max-total-tokens 4096 \
+  --context-length 1024 \
+  --watchdog-timeout 30 \
+  --nnodes 1 \
+  --node-rank 0 \
+  --trust-remote-code \
+  --elastic-ep-backend mc2 \
   --enable-fault-tolerance \
   --fault-tolerance-on-error-strategy pause \
   --fault-tolerance-timeout 600 \
-  2>&1 | tee /tmp/sglang-npu-ft.log
+  2>&1 | tee artifacts/npu_ft/sglang-npu-ft.log
 ```
 
 **[Terminal 2] Test Execution**:
@@ -171,21 +193,32 @@ python test/manual/ascend/test_fault_tolerance_suite.py --test-case cascading_sc
 
 **[Terminal 1] Launch Command** (using `--fault-tolerance-on-error-strategy continue`):
 ```bash
-DEEP_USE_MODE=default python -m sglang.launch_server \
-  --model-path Qwen/Qwen3-30B-A3B \
-  --host 0.0.0.0 \
+DEEP_USE_MODE=ops python -m sglang.launch_server \
+  --model-path "${MODEL_PATH}" \
+  --host 127.0.0.1 \
   --port 30000 \
   --device npu \
   --tp-size 4 --dp-size 4 --ep-size 4 \
   --moe-dense-tp-size 1 --moe-dp-size 1 --attn-cp-size 1 \
   --enable-dp-attention --enable-dp-lm-head \
   --moe-a2a-backend deepep --deepep-mode low_latency \
-  --enable-eplb --eplb-algorithm elasticity_aware \
-  --ep-num-redundant-experts 44 --elastic-ep-backend mc2 \
+  --enable-eplb --eplb-algorithm elasticity_aware --ep-dispatch-algorithm dynamic \
+  --ep-num-redundant-experts 128 \
+  --cuda-graph-bs-decode 1 2 4 8 \
+  --disable-radix-cache \
+  --mem-fraction-static 0.5 \
+  --max-running-requests 8 \
+  --max-total-tokens 4096 \
+  --context-length 1024 \
+  --watchdog-timeout 30 \
+  --nnodes 1 \
+  --node-rank 0 \
+  --trust-remote-code \
+  --elastic-ep-backend mc2 \
   --enable-fault-tolerance \
   --fault-tolerance-on-error-strategy continue \
   --fault-tolerance-timeout 600 \
-  2>&1 | tee /tmp/sglang-npu-ft.log
+  2>&1 | tee artifacts/npu_ft/sglang-npu-ft.log
 ```
 
 **[Terminal 2] Test Execution**:
@@ -199,21 +232,32 @@ python test/manual/ascend/test_fault_tolerance_suite.py --test-case strategy_con
 
 **[Terminal 1] Launch Command** (4 cards: DP=2, TP=2, EP=2):
 ```bash
-DEEP_USE_MODE=default python -m sglang.launch_server \
-  --model-path Qwen/Qwen3-30B-A3B \
-  --host 0.0.0.0 \
+DEEP_USE_MODE=ops python -m sglang.launch_server \
+  --model-path "${MODEL_PATH}" \
+  --host 127.0.0.1 \
   --port 30000 \
   --device npu \
   --tp-size 4 --dp-size 2 --ep-size 2 \
   --moe-dense-tp-size 2 --moe-dp-size 1 --attn-cp-size 1 \
   --enable-dp-attention --enable-dp-lm-head \
   --moe-a2a-backend deepep --deepep-mode low_latency \
-  --enable-eplb --eplb-algorithm elasticity_aware \
-  --ep-num-redundant-experts 44 --elastic-ep-backend mc2 \
+  --enable-eplb --eplb-algorithm elasticity_aware --ep-dispatch-algorithm dynamic \
+  --ep-num-redundant-experts 128 \
+  --cuda-graph-bs-decode 1 2 4 8 \
+  --disable-radix-cache \
+  --mem-fraction-static 0.5 \
+  --max-running-requests 8 \
+  --max-total-tokens 4096 \
+  --context-length 1024 \
+  --watchdog-timeout 30 \
+  --nnodes 1 \
+  --node-rank 0 \
+  --trust-remote-code \
+  --elastic-ep-backend mc2 \
   --enable-fault-tolerance \
   --fault-tolerance-on-error-strategy pause \
   --fault-tolerance-timeout 600 \
-  2>&1 | tee /tmp/sglang-npu-ft.log
+  2>&1 | tee artifacts/npu_ft/sglang-npu-ft.log
 ```
 
 **[Terminal 2] Test Execution**:

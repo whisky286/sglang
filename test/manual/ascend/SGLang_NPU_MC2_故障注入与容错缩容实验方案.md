@@ -214,7 +214,7 @@ DEEP_USE_MODE=default python -m sglang.launch_server \
   --deepep-mode low_latency \
   --enable-eplb \
   --eplb-algorithm elasticity_aware \
-  --ep-num-redundant-experts 44 \
+  --ep-num-redundant-experts 128 \
   --elastic-ep-backend mc2 \
   --enable-fault-tolerance \
   --fault-tolerance-on-error-strategy pause \
@@ -263,7 +263,7 @@ DEEP_USE_MODE=default python -m sglang.launch_server \
   --deepep-mode low_latency \
   --enable-eplb \
   --eplb-algorithm elasticity_aware \
-  --ep-num-redundant-experts 44 \
+  --ep-num-redundant-experts 128 \
   --elastic-ep-backend mc2 \
   --enable-fault-tolerance \
   --fault-tolerance-on-error-strategy continue \
@@ -302,7 +302,7 @@ DEEP_USE_MODE=default python -m sglang.launch_server \
   --deepep-mode low_latency \
   --enable-eplb \
   --eplb-algorithm elasticity_aware \
-  --ep-num-redundant-experts 44 \
+  --ep-num-redundant-experts 128 \
   --elastic-ep-backend mc2 \
   --enable-fault-tolerance \
   --fault-tolerance-on-error-strategy pause \
