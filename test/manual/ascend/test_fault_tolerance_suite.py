@@ -857,11 +857,7 @@ def run_exp7_inflight_request_pause_scale_down(
     )
 
     status = _get_ft_status(session, base_url)
-    report.strategy = str(status.get("strategy", "unknown"))
-    assert report.strategy == "pause", (
-        "Server must be launched with --fault-tolerance-on-error-strategy pause, "
-        f"got {status}"
-    )
+    report.details["initial_status"] = status
 
     warmup_prompt = "Reply with exactly FT_OK and nothing else."
     warmup = _generate_single(
@@ -947,6 +943,10 @@ def run_exp7_inflight_request_pause_scale_down(
         "Pause strategy did not reject a new request with HTTP 503 after the rank "
         f"incident: status={pause_probe.status_code}, error={pause_probe.error!r}"
     )
+
+    # The status endpoint does not expose the configured strategy. The observed
+    # 503 admission rejection after the incident is the behavioral proof of pause.
+    report.strategy = "pause"
 
     logger.info("Pause confirmed by HTTP 503. Triggering scale down...")
     t_scale_start = time.monotonic()
