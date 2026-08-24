@@ -7,6 +7,7 @@ This script implements the complete fault-injection validation plan covering:
 4. Mixed fault injection (application exception + watchdog SIGKILL)
 5. Tensor Parallelism TP > 1 fault tolerance & DP-unit isolation
 6. Multi-victim & cascading sequential scale-down (4 -> 3 -> 2)
+7. SIGKILL during one active inference request -> pause -> scale-down recovery
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import os
 import re
 import signal
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -222,6 +224,80 @@ def _generate_single(
     except Exception as exc:
         end = time.monotonic()
         return RequestResult(req_id, start, end, 0, error=str(exc))
+
+
+def _generate_streaming_request(
+    base_url: str,
+    prompt: str,
+    first_chunk_event: threading.Event,
+    *,
+    req_id: int = 0,
+    max_new_tokens: int = 512,
+    timeout: float = 120.0,
+) -> RequestResult:
+    """Run one streaming request and signal after the first generated chunk arrives."""
+    start = time.monotonic()
+    text_parts: List[str] = []
+    url = f"{base_url}/v1/chat/completions"
+    payload = {
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_new_tokens,
+        "temperature": 0.0,
+        "stream": True,
+    }
+
+    try:
+        with requests.Session() as stream_session:
+            with stream_session.post(
+                url, json=payload, stream=True, timeout=timeout
+            ) as resp:
+                if resp.status_code != 200:
+                    return RequestResult(
+                        req_id,
+                        start,
+                        time.monotonic(),
+                        resp.status_code,
+                        error=resp.text,
+                    )
+
+                for raw_line in resp.iter_lines(decode_unicode=True):
+                    if not raw_line:
+                        continue
+                    line = raw_line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data_text = line[5:].strip()
+                    if data_text == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_text)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    content = delta.get("content") or ""
+                    if content:
+                        text_parts.append(content)
+                        first_chunk_event.set()
+
+                return RequestResult(
+                    req_id,
+                    start,
+                    time.monotonic(),
+                    200,
+                    text="".join(text_parts),
+                )
+    except Exception as exc:
+        return RequestResult(
+            req_id,
+            start,
+            time.monotonic(),
+            0,
+            text="".join(text_parts),
+            error=str(exc),
+        )
 
 
 def _wait_for_incident(
@@ -760,6 +836,172 @@ def run_exp6_cascading_scale_down(
     return report
 
 
+# ==============================================================================
+# Scenario 7: Kill a Rank During One Active Inference -> Pause -> Scale-Down
+# ==============================================================================
+def run_exp7_inflight_request_pause_scale_down(
+    session: requests.Session,
+    base_url: str,
+    victim_rank: int,
+    log_path: Path,
+    *,
+    max_new_tokens: int = 512,
+    stream_start_timeout: float = 30.0,
+    inflight_completion_timeout: float = 15.0,
+) -> ExperimentReport:
+    logger.info("=== [EXP-7] Starting In-Flight Request Pause + Scale-Down Test ===")
+    report = ExperimentReport(
+        test_case="inflight_request_pause_scale_down",
+        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        victim_ranks=[victim_rank],
+    )
+
+    status = _get_ft_status(session, base_url)
+    report.strategy = str(status.get("strategy", "unknown"))
+    assert report.strategy == "pause", (
+        "Server must be launched with --fault-tolerance-on-error-strategy pause, "
+        f"got {status}"
+    )
+
+    warmup_prompt = "Reply with exactly FT_OK and nothing else."
+    warmup = _generate_single(
+        session, base_url, warmup_prompt, max_new_tokens=8, timeout=30.0
+    )
+    assert warmup.status_code == 200, f"Warmup failed: {warmup}"
+    report.warmup_text = warmup.text
+
+    pids = _find_scheduler_pids()
+    victim_pid = pids.get(victim_rank)
+    assert victim_pid is not None, f"Could not find PID for DP rank {victim_rank}"
+
+    first_chunk_event = threading.Event()
+    inflight_result: Dict[str, RequestResult] = {}
+
+    def run_inflight_request() -> None:
+        inflight_result["result"] = _generate_streaming_request(
+            base_url,
+            (
+                "Write a detailed numbered explanation of how distributed inference "
+                "works. Keep generating until you reach the token limit."
+            ),
+            first_chunk_event,
+            req_id=7000,
+            max_new_tokens=max_new_tokens,
+            timeout=max(120.0, inflight_completion_timeout + 30.0),
+        )
+
+    request_thread = threading.Thread(
+        target=run_inflight_request,
+        name="ft-inflight-request",
+        daemon=True,
+    )
+    request_thread.start()
+
+    wait_started = time.monotonic()
+    stream_started = first_chunk_event.wait(timeout=stream_start_timeout)
+    first_chunk_wait_sec = time.monotonic() - wait_started
+    if not stream_started:
+        early_result = inflight_result.get("result")
+        raise TimeoutError(
+            "The streaming request did not produce a first chunk before the timeout; "
+            f"result={early_result}"
+        )
+    assert request_thread.is_alive(), (
+        "Streaming request completed before fault injection; increase "
+        "--inflight-max-new-tokens"
+    )
+
+    logger.info(
+        "Streaming request is in flight (first chunk received after %.2fs). "
+        "Killing DP rank %d (PID %d)...",
+        first_chunk_wait_sec,
+        victim_rank,
+        victim_pid,
+    )
+    kill_time = time.monotonic()
+    os.kill(victim_pid, signal.SIGKILL)
+
+    incident_status = _wait_for_incident(session, base_url, [victim_rank])
+    incident_detect_latency = time.monotonic() - kill_time
+    logger.info(
+        "Incident detected after %.2fs. Probing admission to verify pause...",
+        incident_detect_latency,
+    )
+
+    pause_probe = _generate_single(
+        session,
+        base_url,
+        "Pause admission probe",
+        req_id=7001,
+        max_new_tokens=1,
+        timeout=5.0,
+    )
+    report.traffic_total = 1
+    if pause_probe.status_code == 503:
+        report.traffic_503_paused = 1
+    elif pause_probe.status_code == 200:
+        report.traffic_200_ok = 1
+    else:
+        report.traffic_errors = 1
+    assert pause_probe.status_code == 503, (
+        "Pause strategy did not reject a new request with HTTP 503 after the rank "
+        f"incident: status={pause_probe.status_code}, error={pause_probe.error!r}"
+    )
+
+    logger.info("Pause confirmed by HTTP 503. Triggering scale down...")
+    t_scale_start = time.monotonic()
+    scale_response = _trigger_scale_down(session, base_url, [victim_rank])
+    report.scale_down_latency_sec = time.monotonic() - t_scale_start
+
+    request_thread.join(timeout=inflight_completion_timeout)
+    request_still_running = request_thread.is_alive()
+    original_result = inflight_result.get("result")
+
+    post_check = _generate_single(
+        session, base_url, warmup_prompt, max_new_tokens=8, timeout=30.0
+    )
+    assert post_check.status_code == 200, f"Post-scale-down request failed: {post_check}"
+    report.post_recovery_text = post_check.text
+    report.exact_match = post_check.text == warmup.text
+
+    report.details.update(
+        {
+            "victim_pid": victim_pid,
+            "stream_started_before_kill": True,
+            "first_chunk_wait_sec": first_chunk_wait_sec,
+            "incident_detect_latency_sec": incident_detect_latency,
+            "incident_status": incident_status,
+            "pause_probe_status": pause_probe.status_code,
+            "pause_probe_error": pause_probe.error,
+            "scale_down_response": scale_response,
+            "inflight_request_completed_after_scale_down": not request_still_running,
+            "inflight_request_status": (
+                original_result.status_code if original_result is not None else None
+            ),
+            "inflight_request_error": (
+                original_result.error if original_result is not None else "still running"
+            ),
+            "inflight_partial_text": (
+                original_result.text if original_result is not None else ""
+            ),
+        }
+    )
+
+    stops, restarts, rebuilds = _verify_server_log_rebuild(
+        log_path, expected_generation=1
+    )
+    report.device_stops_detected = stops
+    report.device_restarts_detected = restarts
+    report.group_rebuilds_detected = rebuilds
+    report.verdict = "PASS"
+    logger.info(
+        "=== [EXP-7] In-Flight Request Pause + Scale-Down Test PASSED "
+        "(in-flight completed=%s) ===",
+        not request_still_running,
+    )
+    return report
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Comprehensive Ascend MC2 Fault-Tolerance Test Suite"
@@ -778,6 +1020,7 @@ def main():
             "mixed_fault_injection",
             "tp_parallel_scale_down",
             "cascading_scale_down",
+            "inflight_request_pause_scale_down",
         ],
         required=True,
         help="Test case scenario to execute",
@@ -817,6 +1060,24 @@ def main():
         type=int,
         default=10,
         help="Concurrency for in-flight traffic test",
+    )
+    parser.add_argument(
+        "--inflight-max-new-tokens",
+        type=int,
+        default=512,
+        help="Token budget for the single streaming request in EXP-7",
+    )
+    parser.add_argument(
+        "--stream-start-timeout",
+        type=float,
+        default=30.0,
+        help="Seconds to wait for the first streaming chunk before EXP-7 kills a rank",
+    )
+    parser.add_argument(
+        "--inflight-completion-timeout",
+        type=float,
+        default=15.0,
+        help="Seconds to observe whether the original EXP-7 request completes after scale-down",
     )
     parser.add_argument(
         "--log-path",
@@ -872,6 +1133,16 @@ def main():
             report = run_exp6_cascading_scale_down(
                 session, args.base_url, args.cascading_ranks, args.log_path
             )
+        elif args.test_case == "inflight_request_pause_scale_down":
+            report = run_exp7_inflight_request_pause_scale_down(
+                session,
+                args.base_url,
+                args.victim_rank,
+                args.log_path,
+                max_new_tokens=args.inflight_max_new_tokens,
+                stream_start_timeout=args.stream_start_timeout,
+                inflight_completion_timeout=args.inflight_completion_timeout,
+            )
     except Exception as exc:
         logger.error(f"Test case {args.test_case} failed with exception: {exc}", exc_info=True)
         if report is None:
@@ -895,4 +1166,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
