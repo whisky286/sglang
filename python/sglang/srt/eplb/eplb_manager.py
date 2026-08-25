@@ -223,6 +223,18 @@ class EPLBManager:
 
         self._log_rebalance_layout_after_update(update_layer_ids=all_update_layer_ids)
 
+        if (
+            recovering_from_rank_fault
+            and self._server_args.device == "npu"
+        ):
+            logger.info(
+                "[NPU FT] synchronizing expert recovery before scale-down commit"
+            )
+            torch.get_device_module().synchronize()
+            logger.info(
+                "[NPU FT] expert recovery synchronized"
+            )
+
         msg = f"[EPLBManager] rebalance end"
         if enable_timing:
             torch.get_device_module().synchronize()

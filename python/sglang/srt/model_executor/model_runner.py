@@ -1425,6 +1425,18 @@ class ModelRunner:
                 reinit_attn_backend,
                 split_forward_count,
             )
+            if is_npu() and self.server_args.enable_fault_tolerance and self.server_args.elastic_ep_backend == "mc2":
+                logger.info(
+                    "[NPU FT] synchronizing first forward "
+                    "before membership check dp_rank=%s",
+                    self.ps.dp_rank,
+                )
+                torch.npu.synchronize()
+                logger.info(
+                    "[NPU FT] first forward synchronized "
+                    "dp_rank=%s",
+                    self.ps.dp_rank,
+                )
             if self.enable_elastic_ep:
                 output = self._maybe_rebalance_after_rank_fault(
                     output,

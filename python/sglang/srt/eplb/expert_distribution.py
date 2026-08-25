@@ -193,7 +193,14 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             self._on_forward_pass_start(forward_batch)
             try:
                 yield outputs
-            finally:
+            except Exception:
+                logger.warning(
+                    "Skip expert distribution collection because "
+                    "forward pass %s failed.",
+                    forward_pass_id,
+                )
+                raise
+            else:
                 self._on_forward_pass_end(forward_pass_id, outputs)
 
     @contextmanager

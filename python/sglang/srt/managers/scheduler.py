@@ -589,6 +589,10 @@ class Scheduler(
 
         self.init_batch_result_processor()
 
+        import torch_npu
+        abort_timeout = 3
+        torch_npu.npu.set_op_timeout_ms(abort_timeout * 1000)
+
         self.is_initializing = False
 
     def init_zbal_on_npu(self):
@@ -1575,6 +1579,45 @@ class Scheduler(
                 dispatch_event_loop(self)
                 return
             except Exception as exc:
+                logger.exception("FT scheduler caught exception before discard")
+
+                defer_npu_kv_release = (
+                    _is_npu
+                    and self.server_args.elastic_ep_backend == "mc2"
+                    and self.server_args.fault_tolerance_on_error_strategy == "pause"
+                )
+
+                # NPU communication/device faults may leave the device in a poisoned
+                # state. Publish the fault before touching device-backed KV state.
+                if defer_npu_kv_release:
+                    self._engine_paused = True
+                    self._ft_pause_deadline = (
+                        time.monotonic()
+                        + self.server_args.fault_tolerance_pause_timeout
+                    )
+
+                    self.ipc_channels.send_to_tokenizer.send_output(
+                        FaultToleranceRankFaultOutput(
+                            rank=self.ps.dp_rank,
+                            message=str(exc),
+                        )
+                    )
+
+                    self._ft_discard_inflight_window(
+                        exc,
+                        defer_kv_release=True,
+                    )
+                    continue
+
+                batch = getattr(self, "cur_batch", None)
+
+                logger.warning(
+                    "[FT DEBUG] fault batch: dp_rank=%s batch_none=%s rids=%s finished=%s",
+                    self.ps.dp_rank,
+                    batch is None,
+                    [] if batch is None else [req.rid for req in batch.reqs],
+                    [] if batch is None else [req.finished() for req in batch.reqs],
+                )
                 recovered = self._ft_discard_inflight_window(exc)
                 should_continue = (
                     self.server_args.fault_tolerance_on_error_strategy == "continue"
@@ -1595,7 +1638,7 @@ class Scheduler(
                 if should_continue:
                     continue
 
-    def _ft_discard_inflight_window(self, exc: Exception) -> bool:
+    def _ft_discard_inflight_window(self, exc: Exception, *, defer_kv_release: bool = False) -> bool:
         window_batches = [
             self.cur_batch_for_debug,
             self.last_batch,
@@ -1622,12 +1665,24 @@ class Scheduler(
                     req.kv_committed_len,
                     len(req.origin_input_ids) + len(req.output_ids),
                 )
-                release_kv_cache(
-                    req,
-                    self.tree_cache,
-                    is_insert=False,
-                    allow_non_spec_overallocated=True,
-                )
+                if defer_kv_release:
+                    deferred_reqs = getattr(
+                        self,
+                        "_ft_deferred_kv_release_reqs",
+                        None,
+                    )
+                    if deferred_reqs is None:
+                        deferred_reqs = {}
+                        self._ft_deferred_kv_release_reqs = deferred_reqs
+
+                    deferred_reqs.setdefault(req.rid, req)
+                else:
+                    release_kv_cache(
+                        req,
+                        self.tree_cache,
+                        is_insert=False,
+                        allow_non_spec_overallocated=True,
+                    )
                 abort_reason = FINISH_ABORT(
                     message=f"Request discarded after scheduler exception: {exc}",
                     status_code=HTTPStatus.SERVICE_UNAVAILABLE,
@@ -1658,6 +1713,32 @@ class Scheduler(
             exc,
         )
         return success
+
+    def _ft_release_deferred_kv_cache(self) -> None:
+        deferred_reqs = getattr(
+            self,
+            "_ft_deferred_kv_release_reqs",
+            None,
+        )
+        if not deferred_reqs:
+            return
+
+        released = 0
+
+        for rid, req in list(deferred_reqs.items()):
+            release_kv_cache(
+                req,
+                self.tree_cache,
+                is_insert=False,
+                allow_non_spec_overallocated=True,
+            )
+            deferred_reqs.pop(rid, None)
+            released += 1
+
+        logger.warning(
+            "FT released deferred KV state for %d request(s) after device recovery",
+            released,
+        )
 
     def _process_next_overlap_result(self) -> None:
         batch, result = self.result_queue[0]
@@ -1705,6 +1786,11 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                logger.warning(
+                    "[FT DEBUG] run batch: dp_rank=%s rids=%s",
+                    self.ps.dp_rank,
+                    [req.rid for req in batch.reqs],
+                )
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
@@ -4532,6 +4618,11 @@ class Scheduler(
                 self.tp_worker.model_runner.apply_fault_tolerance_scale_down(
                     recv_req.active_mask
                 )
+
+                # The NPU device has now been stopped/restarted and survivor
+                # communication state rebuilt. Device-backed KV cleanup is safe again.
+                self._ft_release_deferred_kv_cache()
+
                 message = "scaled down"
             else:
                 logger.warning(

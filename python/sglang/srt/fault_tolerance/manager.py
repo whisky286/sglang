@@ -365,28 +365,105 @@ class FaultToleranceManager:
         targets = set(target_ranks)
         if not targets:
             return set()
+
         request_id = uuid.uuid4().hex
         pending = PendingFTCommand(
-            target_ranks=targets, future=self.event_loop.create_future()
+            target_ranks=targets,
+            future=self.event_loop.create_future(),
         )
         self._pending_commands[request_id] = pending
+
         req = FaultToleranceCommandReqInput(
             request_id=request_id,
             command=command,
             target_ranks=sorted(targets),
-            # This command is consumed by per-scheduler Elastic EP control, so
-            # its active_mask remains a physical scheduler/global-rank mask.
             active_mask=active_global_rank_mask,
         )
-        await self.send_to_scheduler(req)
+
+        # FT commands must not go through the ordinary tokenizer -> DPC workload
+        # PUSH socket.  They need explicit fan-out through the dedicated DPC
+        # control channel, because every target DP leader must receive the command.
+        target_global_ranks = set(
+            self.state.global_ranks_for_dps(targets)
+        )
+        target_nodes = sorted(
+            node
+            for node, (_, owned_ranks) in self._watchdog_leases.items()
+            if target_global_ranks.intersection(owned_ranks)
+        )
+
+        if not target_nodes:
+            self._pending_commands.pop(request_id, None)
+            raise RuntimeError(
+                "no live DPC control endpoint for fault tolerance command: "
+                f"command={command} "
+                f"targets={sorted(targets)} "
+                f"global_targets={sorted(target_global_ranks)}"
+            )
+
         try:
-            await asyncio.wait_for(pending.future, timeout=timeout_sec)
+            logger.warning(
+                "FT command send begin: "
+                "request_id=%s command=%s targets=%s nodes=%s",
+                request_id,
+                command,
+                sorted(targets),
+                target_nodes,
+            )
+
+            if (
+                self.server_args.device == "npu"
+                and self.server_args.elastic_ep_backend == "mc2"
+            ):
+                # Dedicated tokenizer -> DPC control channel.
+                # Each DPC then explicitly sends the command to obj.target_ranks.
+                await asyncio.wait_for(
+                    self.send_to_dpc(target_nodes, req),
+                    timeout=timeout_sec,
+                )
+            else:
+                # Preserve the existing path for non-NPU FT for now.
+                await asyncio.wait_for(
+                    self.send_to_scheduler(req),
+                    timeout=timeout_sec,
+                )
+
+            logger.warning(
+                "FT command send done: "
+                "request_id=%s command=%s targets=%s nodes=%s",
+                request_id,
+                command,
+                sorted(targets),
+                target_nodes,
+            )
+
+            await asyncio.wait_for(
+                pending.future,
+                timeout=timeout_sec,
+            )
+
+        except asyncio.TimeoutError as exc:
+            missing = (
+                targets
+                - pending.acked
+                - set(pending.failed.keys())
+            )
+            raise RuntimeError(
+                f"fault tolerance command {command} timed out: "
+                f"acked={sorted(pending.acked)} "
+                f"failed={pending.failed} "
+                f"missing={sorted(missing)}"
+            ) from exc
+
         finally:
             self._pending_commands.pop(request_id, None)
+
         if pending.failed:
             raise RuntimeError(
-                f"fault tolerance command {command} failed: {pending.failed}"
+                f"fault tolerance command {command} failed: "
+                f"{pending.failed}"
             )
+
         return pending.acked
 
     def _finish_shutdown_if_ready(self) -> None:

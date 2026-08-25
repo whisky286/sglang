@@ -486,7 +486,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
 
     async def _async_send_to_dpc(
-        self, nodes: List[int], obj: FaultToleranceDPCShutdownReqInput
+        self, nodes: List[int], obj: Any
     ) -> None:
         for node in nodes:
             await async_sock_send(self._dpc_control_sockets[node], obj)
