@@ -1,0 +1,20 @@
+diff --git a/csrc/deepep/ops/op_kernel/moe_distribute_dispatch_v2.h b/csrc/deepep/ops/op_kernel/moe_distribute_dispatch_v2.h
+index 8ce9c0e..2289c32 100644
+--- a/csrc/deepep/ops/op_kernel/moe_distribute_dispatch_v2.h
++++ b/csrc/deepep/ops/op_kernel/moe_distribute_dispatch_v2.h
+@@ -1276,6 +1276,15 @@ __aicore__ inline void MoeDistributeDispatchV2<TemplateMC2TypeFunc>::LocalWindow
+             xQueue_.EnQue(xTmpTensor_);
+             xTmpTensor_ = xQueue_.DeQue<ExpandXOutType>();
+             xTmpTensorInt = xTmpTensor_.template ReinterpretCast<int32_t>();
++
++            // FT debug experiment:
++            // Under scale-down, reconstruct the source effective rank from the
++            // receive-block layout instead of trusting the rank stored in the payload.
++            if (isScalingDownFlag_ && sharedExpertRankNum_ == 0) {
++                xTmpTensorInt.SetValue(
++                    tokenQuantAlign_,
++                    static_cast<int32_t>(index % epWorldSize_));
++            }
+             DataCopyPad(expandIdxGMTensor_[(beginIdx + j) * EXPAND_IDX_INFO], xTmpTensorInt[tokenQuantAlign_],
+                         dataCopyExpandIdxParams);
+             if constexpr (DynamicQuant || StaticQuant) {

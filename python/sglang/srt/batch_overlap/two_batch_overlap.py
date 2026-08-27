@@ -1097,7 +1097,21 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         return self._inners[0].expert_mask_gpu
 
     def _execute(self, name, tbo_subbatch_index: Optional[int] = None, **kwargs):
-        return getattr(self._inners[tbo_subbatch_index or 0], name)(**kwargs)
+        idx = tbo_subbatch_index or 0
+        inner = self._inners[idx]
+        impl = inner._get_impl()
+
+        print(
+            "[NPU FT TBO] "
+            f"op={name} "
+            f"subbatch={idx} "
+            f"inner={hex(id(inner))} "
+            f"impl={hex(id(impl))} "
+            f"seq={getattr(impl, '_ft_debug_dispatch_seq', None)}",
+            flush=True,
+        )
+
+        return getattr(inner, name)(**kwargs)
 
     def dispatch(self, **kwargs) -> DispatchOutput:
         return self._execute("dispatch", **kwargs)

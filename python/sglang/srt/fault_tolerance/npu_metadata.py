@@ -347,6 +347,34 @@ class NpuFTSurvivorProcessGroups:
                 "NPU FT graph-external process groups have not been rebuilt"
             )
 
+    def barrier(self, *, timeout_sec: float = 60.0) -> None:
+        """Wait until every rebuilt survivor reaches the same FT phase."""
+
+        self._require_rebuilt()
+
+        if self.world_size == 1:
+            return
+
+        work = dist.barrier(
+            group=self.cpu_group,
+            async_op=True,
+        )
+
+        try:
+            completed = work.wait(
+                timeout=timedelta(seconds=timeout_sec)
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "NPU MC2 survivor recovery barrier failed"
+            ) from exc
+
+        if completed is False:
+            raise TimeoutError(
+                "NPU MC2 survivor recovery barrier timed out "
+                f"after {timeout_sec:g}s"
+            )
+
 
 def init_npu_ft_metadata_group(
     endpoint: str,

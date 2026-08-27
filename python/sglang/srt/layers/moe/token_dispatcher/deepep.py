@@ -818,6 +818,19 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 **fp8_deepgemm_scale_opts,
             )
         )
+        self._ft_debug_dispatch_seq = getattr(
+            self, "_ft_debug_dispatch_seq", 0
+        ) + 1
+
+        print(
+            "[NPU FT HANDLE DISPATCH] "
+            f"dispatcher={hex(id(self))} "
+            f"seq={self._ft_debug_dispatch_seq} "
+            f"handle={hex(id(self.handle))} "
+            f"src_info_ptr={hex(self.handle[0].data_ptr())} "
+            f"layout_range_ptr={hex(self.handle[1].data_ptr())}",
+            flush=True,
+        )
         return packed_recv_hidden, self.packed_recv_count, event, hook
 
     def combine_a(
@@ -880,6 +893,15 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         with ctx:
             _deepep_precompile_tp_barrier()
+            print(
+                "[NPU FT HANDLE COMBINE] "
+                f"dispatcher={hex(id(self))} "
+                f"seq={getattr(self, '_ft_debug_dispatch_seq', None)} "
+                f"handle={None if self.handle is None else hex(id(self.handle))} "
+                f"src_info_ptr={None if self.handle is None else hex(self.handle[0].data_ptr())} "
+                f"layout_range_ptr={None if self.handle is None else hex(self.handle[1].data_ptr())}",
+                flush=True,
+            )
             combined_hidden_states, event, hook = buffer.low_latency_combine(
                 x=hidden_states,
                 topk_idx=topk_ids,

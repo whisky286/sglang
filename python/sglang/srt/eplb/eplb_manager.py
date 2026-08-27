@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+import os
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch.cuda
@@ -128,13 +129,36 @@ class EPLBManager:
             time_start = time.time()
 
         if recovering_from_rank_fault:
-            old_expert_location_metadata = get_global_expert_location_metadata()
-            expert_location_metadata = ExpertLocationMetadata.init_for_fault_recovery(
-                self._server_args,
-                old_expert_location_metadata,
-                elastic_ep_state.active_ranks_cpu,
-                moe_ep_rank=self._ps.tp_rank,
+            old_expert_location_metadata = (
+                get_global_expert_location_metadata()
             )
+
+            recovery_layout_strategy = os.environ.get(
+                "SGLANG_NPU_FT_EXPERT_RECOVERY_LAYOUT",
+                "minimal",
+            ).strip().lower()
+
+            if recovery_layout_strategy not in (
+                "minimal",
+                "shuffle",
+            ):
+                raise ValueError(
+                    "Invalid "
+                    "SGLANG_NPU_FT_EXPERT_RECOVERY_LAYOUT="
+                    f"{recovery_layout_strategy!r}; "
+                    "expected minimal or shuffle"
+                )
+
+            expert_location_metadata = (
+                ExpertLocationMetadata.init_for_fault_recovery(
+                    self._server_args,
+                    old_expert_location_metadata,
+                    elastic_ep_state.active_ranks_cpu,
+                    moe_ep_rank=self._ps.tp_rank,
+                    strategy=recovery_layout_strategy,
+                )
+            )
+
             changed_slots = int(
                 (
                     expert_location_metadata.physical_to_logical_map_cpu
@@ -143,10 +167,14 @@ class EPLBManager:
                 .sum()
                 .item()
             )
-            logger.info(
-                "[NPU FT] minimal expert recovery layout: rank=%d "
-                "active_original_ranks=%s changed_physical_slots=%d",
+
+            logger.warning(
+                "[NPU FT] expert recovery layout: "
+                "rank=%d strategy=%s "
+                "active_original_ranks=%s "
+                "changed_physical_slots=%d",
                 self._ps.tp_rank,
+                recovery_layout_strategy,
                 torch.nonzero(
                     elastic_ep_state.active_ranks_cpu,
                     as_tuple=False,

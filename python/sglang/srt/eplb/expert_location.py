@@ -224,6 +224,51 @@ class ExpertLocationMetadata:
         old_metadata: "ExpertLocationMetadata",
         active_ranks: Sequence[bool] | torch.Tensor,
         moe_ep_rank: Optional[int] = None,
+        strategy: str = "minimal",
+    ) -> "ExpertLocationMetadata":
+        """Build an expert layout for rank-fault recovery.
+
+        strategy:
+        - minimal:
+            Production recovery strategy. Preserve survivor slots whenever
+            possible and reload only logical experts that disappeared with
+            failed ranks.
+
+        - shuffle:
+            Debug/stress strategy. Start from a valid minimal survivor layout,
+            then deliberately reshuffle expert slots across survivor ranks in
+            order to exercise EPLB P2P/internal-format weight movement.
+        """
+
+        strategy = strategy.strip().lower()
+
+        if strategy == "minimal":
+            return ExpertLocationMetadata.init_for_fault_recovery_minimal(
+                server_args=server_args,
+                old_metadata=old_metadata,
+                active_ranks=active_ranks,
+                moe_ep_rank=moe_ep_rank,
+            )
+
+        if strategy == "shuffle":
+            return ExpertLocationMetadata.init_for_fault_recovery_shuffle(
+                server_args=server_args,
+                old_metadata=old_metadata,
+                active_ranks=active_ranks,
+                moe_ep_rank=moe_ep_rank,
+            )
+
+        raise ValueError(
+            "Unsupported FT expert recovery strategy: "
+            f"{strategy!r}. Expected one of: minimal, shuffle"
+        )
+
+    @staticmethod
+    def init_for_fault_recovery_minimal(
+        server_args: ServerArgs,
+        old_metadata: "ExpertLocationMetadata",
+        active_ranks: Sequence[bool] | torch.Tensor,
+        moe_ep_rank: Optional[int] = None,
     ) -> "ExpertLocationMetadata":
         """Build a survivor-only layout with the minimum required movement.
 
@@ -391,6 +436,287 @@ class ExpertLocationMetadata:
             physical_to_logical_map=physical_to_logical_map_cpu.to(device=device),
             logical_to_all_physical_map=logical_to_all_physical_map_cpu.to(
                 device=device
+            ),
+            moe_ep_rank=moe_ep_rank,
+        )
+    @staticmethod
+    def init_for_fault_recovery_shuffle(
+        server_args: ServerArgs,
+        old_metadata: "ExpertLocationMetadata",
+        active_ranks: Sequence[bool] | torch.Tensor,
+        moe_ep_rank: Optional[int] = None,
+    ) -> "ExpertLocationMetadata":
+        """Build a deliberately shuffled survivor-only FT layout.
+
+        This is a DEBUG/STRESS strategy, not the production recovery policy.
+
+        Procedure:
+        1. Build the normal minimal recovery layout first. This guarantees that
+            every logical expert is represented by at least one survivor slot.
+        2. Rotate whole expert blocks among survivor ranks.
+        3. Also rotate local slots by one position to maximize changed slots.
+
+        The global multiset of logical experts on survivor slots is unchanged, so
+        logical-expert coverage remains identical to the valid minimal layout.
+
+        Failed-rank physical slots remain untouched. Only survivor slots are
+        reshuffled.
+        """
+
+        if isinstance(active_ranks, torch.Tensor):
+            active_rank_values = (
+                active_ranks.detach().to(device="cpu").tolist()
+            )
+        else:
+            active_rank_values = list(active_ranks)
+
+        if len(active_rank_values) != old_metadata.ep_size:
+            raise ValueError(
+                "active_ranks length must match expert metadata EP size "
+                f"({old_metadata.ep_size}), got {len(active_rank_values)}"
+            )
+
+        active_original_ranks = [
+            rank
+            for rank, is_active in enumerate(active_rank_values)
+            if bool(is_active)
+        ]
+
+        if len(active_original_ranks) < 2:
+            raise RuntimeError(
+                "FT shuffle recovery requires at least two survivor ranks, "
+                f"got {active_original_ranks}"
+            )
+
+        #
+        # First create the known-correct minimal layout.
+        #
+        minimal_metadata = (
+            ExpertLocationMetadata.init_for_fault_recovery_minimal(
+                server_args=server_args,
+                old_metadata=old_metadata,
+                active_ranks=active_rank_values,
+                moe_ep_rank=moe_ep_rank,
+            )
+        )
+
+        num_local_physical_experts = (
+            old_metadata.num_local_physical_experts
+        )
+        num_logical_experts = old_metadata.num_logical_experts
+
+        #
+        # Keep dead-rank slots unchanged. Only modify active-rank slots.
+        #
+        physical_to_logical_map_cpu = (
+            minimal_metadata.physical_to_logical_map_cpu.clone()
+        )
+
+        #
+        # Read from an immutable snapshot so that the shuffle itself cannot
+        # overwrite a source block before another destination consumes it.
+        #
+        minimal_map_cpu = (
+            minimal_metadata.physical_to_logical_map_cpu.clone()
+        )
+
+        for layer_id in range(old_metadata.num_layers):
+            source_blocks = {}
+
+            for rank in active_original_ranks:
+                begin = rank * num_local_physical_experts
+                end = begin + num_local_physical_experts
+
+                source_blocks[rank] = (
+                    minimal_map_cpu[layer_id, begin:end].clone()
+                )
+
+            #
+            # Rotate rank blocks:
+            #
+            #   survivor[0] <- survivor[-1]
+            #   survivor[1] <- survivor[0]
+            #   survivor[2] <- survivor[1]
+            #
+            # Therefore an expert that existed only on one survivor is forced to
+            # cross ranks instead of merely changing a local slot.
+            #
+            for dst_rank_index, dst_rank in enumerate(
+                active_original_ranks
+            ):
+                src_rank = active_original_ranks[
+                    (dst_rank_index - 1)
+                    % len(active_original_ranks)
+                ]
+
+                shuffled_block = source_blocks[src_rank]
+
+                #
+                # Also rotate local slots. This makes the debug layout much less
+                # likely to accidentally match the old layout when replicas happen
+                # to exist on multiple survivor ranks.
+                #
+                if num_local_physical_experts > 1:
+                    shuffled_block = torch.roll(
+                        shuffled_block,
+                        shifts=1,
+                        dims=0,
+                    )
+
+                dst_begin = (
+                    dst_rank * num_local_physical_experts
+                )
+                dst_end = (
+                    dst_begin + num_local_physical_experts
+                )
+
+                physical_to_logical_map_cpu[
+                    layer_id,
+                    dst_begin:dst_end,
+                ] = shuffled_block
+
+        #
+        # Verify that the debug shuffle actually changed survivor slots.
+        #
+        active_physical_ids = [
+            rank * num_local_physical_experts + local_slot
+            for rank in active_original_ranks
+            for local_slot in range(num_local_physical_experts)
+        ]
+
+        changed_active_slots = int(
+            (
+                physical_to_logical_map_cpu[
+                    :, active_physical_ids
+                ]
+                != minimal_map_cpu[
+                    :, active_physical_ids
+                ]
+            )
+            .sum()
+            .item()
+        )
+
+        if changed_active_slots == 0:
+            raise RuntimeError(
+                "FT shuffle recovery produced no changed survivor slots; "
+                "the debug strategy did not exercise expert movement"
+            )
+
+        #
+        # Rebuild logical -> active physical mapping.
+        #
+        # IMPORTANT:
+        # Only ACTIVE physical IDs participate here. Dead-rank slots stay in the
+        # physical map solely because FT preserves the immutable original-rank
+        # namespace; they must not become dispatch destinations.
+        #
+        logical_to_physical_by_layer = []
+        max_replica_count = 0
+
+        for layer_id in range(old_metadata.num_layers):
+            layer_map = physical_to_logical_map_cpu[layer_id]
+
+            layer_logical_to_physical = [
+                [] for _ in range(num_logical_experts)
+            ]
+
+            for physical_id in active_physical_ids:
+                logical_id = int(
+                    layer_map[physical_id].item()
+                )
+
+                if not (
+                    0 <= logical_id < num_logical_experts
+                ):
+                    raise RuntimeError(
+                        "FT shuffle produced invalid logical expert ID: "
+                        f"layer={layer_id} "
+                        f"physical_id={physical_id} "
+                        f"logical_id={logical_id}"
+                    )
+
+                layer_logical_to_physical[
+                    logical_id
+                ].append(physical_id)
+
+            missing_logical_ids = [
+                logical_id
+                for logical_id, physical_ids
+                in enumerate(layer_logical_to_physical)
+                if not physical_ids
+            ]
+
+            if missing_logical_ids:
+                raise RuntimeError(
+                    "FT shuffle lost logical-expert coverage: "
+                    f"layer={layer_id} "
+                    f"missing_logical_ids={missing_logical_ids}"
+                )
+
+            max_replica_count = max(
+                max_replica_count,
+                max(
+                    len(physical_ids)
+                    for physical_ids
+                    in layer_logical_to_physical
+                ),
+            )
+
+            logical_to_physical_by_layer.append(
+                layer_logical_to_physical
+            )
+
+        logical_to_all_physical_map_cpu = torch.full(
+            (
+                old_metadata.num_layers,
+                num_logical_experts,
+                max_replica_count,
+            ),
+            -1,
+            dtype=physical_to_logical_map_cpu.dtype,
+            device="cpu",
+        )
+
+        for layer_id, layer_mapping in enumerate(
+            logical_to_physical_by_layer
+        ):
+            for logical_id, physical_ids in enumerate(
+                layer_mapping
+            ):
+                logical_to_all_physical_map_cpu[
+                    layer_id,
+                    logical_id,
+                    : len(physical_ids),
+                ] = torch.tensor(
+                    physical_ids,
+                    dtype=(
+                        logical_to_all_physical_map_cpu.dtype
+                    ),
+                )
+
+        logger.warning(
+            "[NPU FT DEBUG] shuffled expert recovery layout: "
+            "active_original_ranks=%s "
+            "changed_active_slots=%d",
+            active_original_ranks,
+            changed_active_slots,
+        )
+
+        device = old_metadata.physical_to_logical_map.device
+
+        return ExpertLocationMetadata._init_raw(
+            server_args=server_args,
+            ep_size=old_metadata.ep_size,
+            physical_to_logical_map=(
+                physical_to_logical_map_cpu.to(
+                    device=device
+                )
+            ),
+            logical_to_all_physical_map=(
+                logical_to_all_physical_map_cpu.to(
+                    device=device
+                )
             ),
             moe_ep_rank=moe_ep_rank,
         )

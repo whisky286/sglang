@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 import logging
+import os
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
@@ -35,6 +36,20 @@ logger = logging.getLogger(__name__)
 _LOG_INPUT = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT")
 _LOG_P2P_SCHEDULE = get_bool_env_var(
     "SGLANG_EXPERT_LOCATION_UPDATER_LOG_P2P_SCHEDULE"
+)
+
+_VALIDATE_NPU_NZ_EXPERT_COPY = get_bool_env_var(
+    "SGLANG_VALIDATE_NPU_NZ_EXPERT_COPY"
+)
+
+_NPU_NZ_COPY_VALIDATE_COUNT = 0
+
+_VALIDATE_NPU_P2P_NAN = get_bool_env_var(
+    "SGLANG_VALIDATE_NPU_P2P_NAN"
+)
+
+_NPU_P2P_NAN_LAYER = int(
+    os.environ.get("SGLANG_NPU_P2P_NAN_LAYER", "0")
 )
 
 
@@ -230,6 +245,7 @@ def _update_expert_weights_raw(
             missing_logical_experts_info=missing_logical_experts_info,
             survivor_process_groups=survivor_process_groups,
             log_metrics=log_metrics,
+            layer_id=layer_id,
         )
         if len(missing_logical_experts_info) > 0:
             missing_logical_experts_by_layers[layer_id] = list(
@@ -243,11 +259,14 @@ def create_temp_buffers(sample_tensors):
 
 
 def _copy_expert_tensor_(
-    destination_tensor: torch.Tensor, source_tensor: torch.Tensor
+    destination_tensor: torch.Tensor, source_tensor: torch.Tensor, *, debug_context: str = ""
 ) -> None:
     """Copy an expert while preserving an NPU internal-format slot layout."""
 
+    global _NPU_NZ_COPY_VALIDATE_COUNT
+
     if destination_tensor.device.type == "npu":
+        import torch_npu
         from sglang.srt.hardware_backend.npu.utils import (
             copy_npu_formatted_tensor_,
             is_npu_internal_format_tensor,
@@ -258,22 +277,246 @@ def _copy_expert_tensor_(
             torch.float32,
             torch.bfloat16,
         )
-        if supports_offset_zero_alias and is_npu_internal_format_tensor(
-            destination_tensor
-        ):
-            copy_npu_formatted_tensor_(destination_tensor, source_tensor)
+
+        is_nz_copy = (
+            supports_offset_zero_alias
+            and is_npu_internal_format_tensor(destination_tensor)
+        )
+
+        if is_nz_copy:
+            src_format = torch_npu.get_npu_format(source_tensor)
+            dst_format = torch_npu.get_npu_format(destination_tensor)
+
+            source_snapshot = None
+
+            should_validate = (
+                _VALIDATE_NPU_NZ_EXPERT_COPY
+                and debug_context.startswith("p2p_recv_stage")
+                and _NPU_NZ_COPY_VALIDATE_COUNT < 20
+            )
+
+            if should_validate:
+                # Snapshot BEFORE the copy. This is important: if the copy
+                # accidentally overwrites the source region as well, comparing
+                # source and destination only after the copy could hide it.
+                try:
+                    source_snapshot = source_tensor.detach().cpu()
+                except Exception:
+                    logger.exception(
+                        "[NPU FT NZ COPY] source read failed BEFORE copy: "
+                        "context=%s "
+                        "shape=%s dtype=%s "
+                        "src_format=%s src_ptr=%d src_offset=%d "
+                        "dst_format=%s dst_ptr=%d dst_offset=%d",
+                        debug_context,
+                        tuple(source_tensor.shape),
+                        source_tensor.dtype,
+                        src_format,
+                        source_tensor.data_ptr(),
+                        source_tensor.storage_offset(),
+                        dst_format,
+                        destination_tensor.data_ptr(),
+                        destination_tensor.storage_offset(),
+                    )
+                    raise
+
+            try:
+                copy_npu_formatted_tensor_(
+                    destination_tensor,
+                    source_tensor,
+                )
+            except Exception:
+                logger.exception(
+                    "[NPU FT NZ COPY] formatted copy itself failed: "
+                    "context=%s "
+                    "shape=%s dtype=%s "
+                    "src_format=%s src_ptr=%d src_offset=%d "
+                    "dst_format=%s dst_ptr=%d dst_offset=%d",
+                    debug_context,
+                    tuple(source_tensor.shape),
+                    source_tensor.dtype,
+                    src_format,
+                    source_tensor.data_ptr(),
+                    source_tensor.storage_offset(),
+                    dst_format,
+                    destination_tensor.data_ptr(),
+                    destination_tensor.storage_offset(),
+                )
+                raise
+
+            if should_validate:
+                try:
+                    destination_snapshot = destination_tensor.detach().cpu()
+                except Exception:
+                    logger.exception(
+                        "[NPU FT NZ COPY] destination read failed AFTER copy: "
+                        "context=%s "
+                        "shape=%s dtype=%s "
+                        "src_format=%s src_ptr=%d src_offset=%d "
+                        "dst_format=%s dst_ptr=%d dst_offset=%d",
+                        debug_context,
+                        tuple(destination_tensor.shape),
+                        destination_tensor.dtype,
+                        src_format,
+                        source_tensor.data_ptr(),
+                        source_tensor.storage_offset(),
+                        dst_format,
+                        destination_tensor.data_ptr(),
+                        destination_tensor.storage_offset(),
+                    )
+                    raise
+
+                src_flat = source_snapshot.reshape(-1)
+                dst_flat = destination_snapshot.reshape(-1)
+
+                is_float = source_snapshot.is_floating_point()
+
+                # 1. Compute mismatch mask.
+                # Treat NaN at the same position as equal for copy validation.
+                if is_float:
+                    src_nan = torch.isnan(src_flat)
+                    dst_nan = torch.isnan(dst_flat)
+
+                    both_nan = src_nan & dst_nan
+                    value_equal = src_flat == dst_flat
+
+                    mismatch_mask = ~(value_equal | both_nan)
+
+                    src_nan_count = int(src_nan.sum().item())
+                    dst_nan_count = int(dst_nan.sum().item())
+                else:
+                    mismatch_mask = src_flat != dst_flat
+
+                    # These must still be defined for the success log below.
+                    src_nan_count = 0
+                    dst_nan_count = 0
+
+                mismatch_indices = torch.nonzero(
+                    mismatch_mask,
+                    as_tuple=False,
+                ).flatten()
+
+                # 2. Compute max_abs_diff for logging.
+                # Ignore NaN / Inf pairs here.
+                if is_float:
+                    finite_pair_mask = (
+                        torch.isfinite(src_flat)
+                        & torch.isfinite(dst_flat)
+                    )
+                else:
+                    finite_pair_mask = torch.ones_like(
+                        src_flat,
+                        dtype=torch.bool,
+                    )
+
+                if bool(finite_pair_mask.any().item()):
+                    max_abs_diff = float(
+                        (
+                            src_flat[finite_pair_mask].float()
+                            - dst_flat[finite_pair_mask].float()
+                        )
+                        .abs()
+                        .max()
+                        .item()
+                    )
+                else:
+                    max_abs_diff = float("nan")
+
+                # 3. Fail only on a real mismatch.
+                if mismatch_indices.numel() > 0:
+                    mismatch_count = int(mismatch_indices.numel())
+                    first_mismatch = int(mismatch_indices[0].item())
+
+                    src_value = src_flat[first_mismatch].item()
+                    dst_value = dst_flat[first_mismatch].item()
+
+                    logger.error(
+                        "[NPU FT NZ COPY] VALIDATION FAILED: "
+                        "context=%s "
+                        "shape=%s dtype=%s "
+                        "src_format=%s src_ptr=%d src_offset=%d "
+                        "dst_format=%s dst_ptr=%d dst_offset=%d "
+                        "src_nan_count=%d dst_nan_count=%d "
+                        "mismatch_count=%d first_mismatch=%d "
+                        "src_value=%s dst_value=%s "
+                        "max_abs_diff=%s",
+                        debug_context,
+                        tuple(source_tensor.shape),
+                        source_tensor.dtype,
+                        src_format,
+                        source_tensor.data_ptr(),
+                        source_tensor.storage_offset(),
+                        dst_format,
+                        destination_tensor.data_ptr(),
+                        destination_tensor.storage_offset(),
+                        src_nan_count,
+                        dst_nan_count,
+                        mismatch_count,
+                        first_mismatch,
+                        src_value,
+                        dst_value,
+                        max_abs_diff,
+                    )
+
+                    raise AssertionError(
+                        "NPU FT NZ expert copy validation failed: "
+                        f"context={debug_context} "
+                        f"src_offset={source_tensor.storage_offset()} "
+                        f"dst_offset={destination_tensor.storage_offset()} "
+                        f"mismatch_count={mismatch_count} "
+                        f"first_mismatch={first_mismatch}"
+                    )
+
+                # 4. Success path.
+                _NPU_NZ_COPY_VALIDATE_COUNT += 1
+
+                if (
+                    _NPU_NZ_COPY_VALIDATE_COUNT <= 10
+                    or _NPU_NZ_COPY_VALIDATE_COUNT % 100 == 0
+                ):
+                    logger.warning(
+                        "[NPU FT NZ COPY] validation success: "
+                        "count=%d context=%s "
+                        "shape=%s dtype=%s "
+                        "src_offset=%d dst_offset=%d "
+                        "src_nan_count=%d dst_nan_count=%d "
+                        "max_abs_diff=%s",
+                        _NPU_NZ_COPY_VALIDATE_COUNT,
+                        debug_context,
+                        tuple(source_tensor.shape),
+                        source_tensor.dtype,
+                        source_tensor.storage_offset(),
+                        destination_tensor.storage_offset(),
+                        src_nan_count,
+                        dst_nan_count,
+                        max_abs_diff,
+                    )
+
             return
 
     destination_tensor.copy_(source_tensor)
 
 
 def _needs_npu_p2p_staging(tensor: torch.Tensor) -> bool:
-    return tensor.device.type == "npu" and tensor.storage_offset() != 0
+    if tensor.device.type != "npu":
+        return False
 
+    from sglang.srt.hardware_backend.npu.utils import is_npu_internal_format_tensor
+
+    return (
+        tensor.storage_offset() != 0
+        or is_npu_internal_format_tensor(tensor)
+    )
+
+def _debug_npu_p2p_nan_count(tensor: torch.Tensor) -> int:
+    if not tensor.is_floating_point():
+        return 0
+
+    return int(torch.isnan(tensor).sum().item())
 
 def _stage_npu_p2p_ops(
     p2p_ops: List[P2POp],
-) -> Tuple[List[P2POp], List[Tuple[torch.Tensor, torch.Tensor]]]:
+) -> Tuple[List[P2POp], List[Tuple[torch.Tensor, torch.Tensor, str]]]:
     """Give HCCL offset-zero buffers for internal-format tensor views.
 
     Expert weights are stored with the local-expert dimension first, so
@@ -293,7 +536,7 @@ def _stage_npu_p2p_ops(
             continue
 
         if op.op == torch.distributed.irecv:
-            staged_tensor = torch.empty_like(tensor)
+            staged_tensor = _new_npu_nd_staging_like(tensor)
             recv_copy_infos.append((staged_tensor, tensor))
         elif op.op == torch.distributed.isend:
             # A single expert tensor can be sent to multiple peers. Reuse one
@@ -309,8 +552,10 @@ def _stage_npu_p2p_ops(
             )
             staged_tensor = staged_send_tensors.get(send_key)
             if staged_tensor is None:
-                staged_tensor = torch.empty_like(tensor)
-                _copy_expert_tensor_(staged_tensor, tensor)
+                staged_tensor = _new_npu_nd_staging_like(tensor)
+                # ND destination <- logical NZ source.
+                # Here we intentionally want format conversion, not raw formatted-byte copy.
+                staged_tensor.copy_(tensor)
                 staged_send_tensors[send_key] = staged_tensor
         else:
             raise ValueError(f"Unsupported P2P operation: {op.op}")
@@ -332,12 +577,70 @@ def _stage_npu_p2p_ops(
 
     return staged_ops, recv_copy_infos
 
+def _new_npu_nd_staging_like(tensor: torch.Tensor) -> torch.Tensor:
+    import torch_npu
+
+    from sglang.srt.hardware_backend.npu.utils import NPUACLFormat
+
+    staged = torch_npu.empty_with_format(
+        tuple(tensor.shape),
+        dtype=tensor.dtype,
+        device=tensor.device,
+        acl_format=int(NPUACLFormat.ACL_FORMAT_ND),
+    )
+
+    if staged.storage_offset() != 0:
+        raise RuntimeError(
+            "NPU EPLB ND staging tensor must have storage_offset=0"
+        )
+
+    actual_format = torch_npu.get_npu_format(staged)
+    if actual_format != int(NPUACLFormat.ACL_FORMAT_ND):
+        raise RuntimeError(
+            f"NPU EPLB staging tensor is not ND: format={actual_format}"
+        )
+
+    return staged
+
 
 def _copy_staged_p2p_recvs(
     recv_copy_infos: List[Tuple[torch.Tensor, torch.Tensor]],
 ):
     for staged_tensor, destination_tensor in recv_copy_infos:
-        _copy_expert_tensor_(destination_tensor, staged_tensor)
+        if destination_tensor.device.type == "npu":
+            import torch_npu
+
+            from sglang.srt.hardware_backend.npu.utils import (
+                NPUACLFormat,
+                is_npu_internal_format_tensor,
+            )
+
+            if is_npu_internal_format_tensor(destination_tensor):
+                dst_format = torch_npu.get_npu_format(
+                    destination_tensor
+                )
+
+                # HCCL received into ND.
+                # Convert the complete offset-zero expert tensor back to
+                # destination's physical format first.
+                formatted_staged_tensor = torch.ops.npu.npu_format_cast(
+                    staged_tensor,
+                    dst_format,
+                )
+
+                # Now both tensors have the same physical format.
+                # Existing formatted-copy implementation safely updates
+                # the non-zero-offset destination block.
+                _copy_expert_tensor_(
+                    destination_tensor,
+                    formatted_staged_tensor,
+                )
+                continue
+
+        _copy_expert_tensor_(
+            destination_tensor,
+            staged_tensor,
+        )
 
 
 def update_expert_weights_single_layer(
@@ -353,6 +656,7 @@ def update_expert_weights_single_layer(
     survivor_process_groups=None,
     debug: bool = False,
     log_metrics: bool = False,
+    layer_id: Optional[int] = None,
 ):
     assert all(
         tensor.shape[0] == num_local_physical_experts
@@ -388,6 +692,9 @@ def update_expert_weights_single_layer(
         def _to_peer_rank(original_rank: int) -> int:
             return original_rank
 
+        def _from_peer_rank(peer_rank: int) -> int:
+            return peer_rank
+
     else:
         active_rank_mask = [
             original_rank in survivor_process_groups.active_original_ranks
@@ -397,6 +704,13 @@ def update_expert_weights_single_layer(
 
         def _to_peer_rank(original_rank: int) -> int:
             return survivor_process_groups.group_rank(original_rank)
+
+        def _from_peer_rank(peer_rank: int) -> int:
+            return int(
+                survivor_process_groups.active_original_ranks[
+                    peer_rank
+                ]
+            )
 
     def _rank_is_active(original_rank: int) -> bool:
         return active_rank_mask[original_rank]
@@ -458,6 +772,14 @@ def update_expert_weights_single_layer(
                     _copy_expert_tensor_(
                         _get_tensor(temp_buffers, i, dst_expert_location),
                         _get_tensor(routed_experts_weights, i, src_expert_location),
+                        debug_context=(
+                            f"same_gpu_to_temp "
+                            f"layer={layer_id} "
+                            f"logical_expert={logical_expert_id} "
+                            f"tensor_idx={i} "
+                            f"src_global_slot={src_expert_location} "
+                            f"dst_global_slot={dst_expert_location}"
+                        ),
                     )
                 buffer2weight_copy_infos.append(
                     (dst_expert_location, dst_expert_location)
@@ -725,28 +1047,262 @@ def update_expert_weights_single_layer(
         ops_by_expert = {eid: ops for eid, ops in sorted_infos}
         for start in range(0, num_physical_experts, batch_chunk_size):
             batch_ops = []
+            batch_debug_infos = []
+
             for eid in range(
-                start, min(start + batch_chunk_size, num_physical_experts)
+                start,
+                min(
+                    start + batch_chunk_size,
+                    num_physical_experts,
+                ),
             ):
-                if eid in ops_by_expert:
-                    batch_ops.extend(ops_by_expert[eid])
-            if batch_ops:
-                batch_ops, recv_copy_infos = _stage_npu_p2p_ops(batch_ops)
-                reqs = torch.distributed.batch_isend_irecv(batch_ops)
-                for req in reqs:
-                    req.wait()
-                if reqs:
-                    del req
-                _copy_staged_p2p_recvs(recv_copy_infos)
-                # Release the offset-zero staging tensors before constructing
-                # the next batch. The device allocator can reuse their blocks.
-                del reqs, recv_copy_infos, batch_ops
+                if eid not in ops_by_expert:
+                    continue
+
+                expert_ops = ops_by_expert[eid]
+
+                for op_index, op in enumerate(expert_ops):
+                    #
+                    # _create_isend_ops() / recv creation both arrange
+                    # tensors in tensor-index order. For send, each peer
+                    # owns one contiguous num_tensors-sized block.
+                    #
+                    tensor_index = op_index % num_tensors
+
+                    if op.op == torch.distributed.isend:
+                        src_original_rank = rank
+                        dst_original_rank = _from_peer_rank(
+                            op.peer
+                        )
+                        direction = "send"
+
+                    elif op.op == torch.distributed.irecv:
+                        src_original_rank = _from_peer_rank(
+                            op.peer
+                        )
+                        dst_original_rank = rank
+                        direction = "recv"
+
+                    else:
+                        raise ValueError(
+                            f"Unsupported P2P operation: {op.op}"
+                        )
+
+                    batch_ops.append(op)
+
+                    batch_debug_infos.append(
+                        {
+                            "logical_expert_id": eid,
+                            "tensor_index": tensor_index,
+                            "src_rank": src_original_rank,
+                            "dst_rank": dst_original_rank,
+                            "direction": direction,
+                            "tag": op.tag,
+                            #
+                            # Remember whether _stage_npu_p2p_ops()
+                            # is expected to replace this tensor.
+                            #
+                            "was_staged": _needs_npu_p2p_staging(
+                                op.tensor
+                            ),
+                            "original_offset": (
+                                op.tensor.storage_offset()
+                            ),
+                        }
+                    )
+
+            if not batch_ops:
+                continue
+
+            #
+            # Existing behavior:
+            #
+            # non-zero-offset internal-format tensor
+            #     -> offset-zero staging tensor
+            #
+            batch_ops, recv_copy_infos = _stage_npu_p2p_ops(
+                batch_ops
+            )
+
+
+            def _is_target_nan_case(info):
+                return (
+                    layer_id == 0
+                    and info["logical_expert_id"] in (0, 32)
+                    and info["tensor_index"] in (0, 1)
+                    and info["src_rank"] == 0
+                    and info["dst_rank"] == 3
+                )
+
+            #
+            # ============================================================
+            # CHECKPOINT A:
+            # after send staging has been populated,
+            # BEFORE batch_isend_irecv().
+            # ============================================================
+            #
+            if _VALIDATE_NPU_P2P_NAN:
+                for op, info in zip(batch_ops, batch_debug_infos):
+                    if op.op != torch.distributed.isend:
+                        continue
+
+                    if not _is_target_nan_case(info):
+                        continue
+
+                    nan_count = _debug_npu_p2p_nan_count(op.tensor)
+
+                    logger.warning(
+                        "[NPU FT P2P TARGET] PRE_SEND "
+                        "layer=%d logical_expert=%d tensor_idx=%d "
+                        "src_rank=%d dst_rank=%d "
+                        "was_staged=%s "
+                        "original_offset=%d staging_offset=%d "
+                        "nan_count=%d numel=%d",
+                        layer_id,
+                        info["logical_expert_id"],
+                        info["tensor_index"],
+                        info["src_rank"],
+                        info["dst_rank"],
+                        info["was_staged"],
+                        info["original_offset"],
+                        op.tensor.storage_offset(),
+                        nan_count,
+                        op.tensor.numel(),
+                    )
+
+            #
+            # Actual HCCL P2P. Unchanged.
+            #
+            reqs = torch.distributed.batch_isend_irecv(batch_ops)
+
+            for req in reqs:
+                req.wait()
+
+            if reqs:
+                del req
+
+
+            #
+            # ============================================================
+            # CHECKPOINT B:
+            # HCCL recv has completed,
+            # BEFORE recv staging -> expert weight copy.
+            # ============================================================
+            #
+            if _VALIDATE_NPU_P2P_NAN:
+                for op, info in zip(batch_ops, batch_debug_infos):
+                    if op.op != torch.distributed.irecv:
+                        continue
+
+                    if not _is_target_nan_case(info):
+                        continue
+
+                    nan_count = _debug_npu_p2p_nan_count(op.tensor)
+
+                    logger.warning(
+                        "[NPU FT P2P TARGET] POST_RECV "
+                        "layer=%d logical_expert=%d tensor_idx=%d "
+                        "src_rank=%d dst_rank=%d "
+                        "was_staged=%s "
+                        "original_offset=%d staging_offset=%d "
+                        "nan_count=%d numel=%d",
+                        layer_id,
+                        info["logical_expert_id"],
+                        info["tensor_index"],
+                        info["src_rank"],
+                        info["dst_rank"],
+                        info["was_staged"],
+                        info["original_offset"],
+                        op.tensor.storage_offset(),
+                        nan_count,
+                        op.tensor.numel(),
+                    )
+
+            recv_dst_by_ptr = {
+                staged_tensor.data_ptr(): destination_tensor
+                for staged_tensor, destination_tensor in recv_copy_infos
+            }
+            #
+            # Existing behavior. Do not change.
+            #
+            _copy_staged_p2p_recvs(
+                recv_copy_infos
+            )
+            if _VALIDATE_NPU_P2P_NAN:
+                for op, info in zip(batch_ops, batch_debug_infos):
+                    if op.op != torch.distributed.irecv:
+                        continue
+
+                    target = (
+                        layer_id == 0
+                        and info["logical_expert_id"] in (0, 32)
+                        and info["tensor_index"] in (0, 1)
+                        and info["src_rank"] == 0
+                        and info["dst_rank"] == 3
+                    )
+                    if not target:
+                        continue
+
+                    destination_tensor = recv_dst_by_ptr.get(
+                        op.tensor.data_ptr()
+                    )
+                    if destination_tensor is None:
+                        raise RuntimeError(
+                            "target recv staging has no destination"
+                        )
+
+                    # op.tensor is the received ND staging.
+                    src = op.tensor.detach().cpu()
+                    dst = destination_tensor.detach().cpu()
+
+                    src_flat = src.reshape(-1)
+                    dst_flat = dst.reshape(-1)
+
+                    if src.is_floating_point():
+                        both_nan = (
+                            torch.isnan(src_flat)
+                            & torch.isnan(dst_flat)
+                        )
+                        mismatch = ~(
+                            (src_flat == dst_flat)
+                            | both_nan
+                        )
+                    else:
+                        mismatch = src_flat != dst_flat
+
+                    mismatch_count = int(mismatch.sum().item())
+
+                    logger.warning(
+                        "[NPU FT FINAL WEIGHT] "
+                        "layer=%d expert=%d tensor=%d "
+                        "src_rank=%d dst_rank=%d "
+                        "src_offset=%d dst_offset=%d "
+                        "mismatch_count=%d numel=%d",
+                        layer_id,
+                        info["logical_expert_id"],
+                        info["tensor_index"],
+                        info["src_rank"],
+                        info["dst_rank"],
+                        op.tensor.storage_offset(),
+                        destination_tensor.storage_offset(),
+                        mismatch_count,
+                        src.numel(),
+                    )
+            del (
+                reqs,
+                recv_copy_infos,
+                batch_ops,
+                batch_debug_infos,
+            )
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
         for (
             temp_buffers_expert_location,
             routed_experts_weights_expert_location,
         ) in buffer2weight_copy_infos:
+            logical_expert_id = new_physical_to_logical_map[
+                routed_experts_weights_expert_location
+            ]
             for i in range(num_tensors):
                 _copy_expert_tensor_(
                     _get_tensor(
@@ -755,6 +1311,15 @@ def update_expert_weights_single_layer(
                         routed_experts_weights_expert_location,
                     ),
                     _get_tensor(temp_buffers, i, temp_buffers_expert_location),
+                     debug_context=(
+                        f"temp_to_weight "
+                        f"layer={layer_id} "
+                        f"logical_expert={logical_expert_id} "
+                        f"tensor_idx={i} "
+                        f"temp_global_slot={temp_buffers_expert_location} "
+                        f"dst_global_slot="
+                        f"{routed_experts_weights_expert_location}"
+                    ),
                 )
 
     def _get_tensor(tensors, tensor_index: int, expert_location: int) -> torch.Tensor:

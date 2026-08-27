@@ -2000,13 +2000,151 @@ class ModelRunner:
         # rebuild_all_resource(s)=True on newer TorchNPU releases rebuilds
         # streams and can mark existing tensors unsafe, which is incompatible
         # with replaying the already captured graph and its fixed buffers.
-        restart_device(device_id)
+        restart_result = restart_device(
+            device_id,
+            rebuild_all_resources=True,
+            disable_tensor_unsafe_check=True,
+        )
+
+        if restart_result not in (None, 0):
+            raise RuntimeError(
+                "NPU FT restart_device failed: "
+                f"device_id={device_id}, result={restart_result}"
+            )
         logger.info(
-            "[NPU FT] restarted survivor device without rebuilding graph "
-            "resources: rank=%d device_id=%d thread_id=%d",
+            "[NPU FT] restarted survivor device with stream-resource rebuild "
+            "and tensor unsafe check disabled: "
+            "rank=%d device_id=%d thread_id=%d",
             self.ps.dp_rank,
             device_id,
             current_thread_id,
+        )
+
+    def _debug_probe_nz_expert_weight(self, stage: str):
+        """Locally read one NZ expert weight without any HCCL/DeepEP communication."""
+        import torch_npu
+
+        from sglang.srt.hardware_backend.npu.utils import (
+            NPUACLFormat,
+            is_npu_internal_format_tensor,
+        )
+
+        candidates = []
+
+        # Prefer expert weights. This keeps the probe close to the failing MoE path.
+        for name, param in self.model.named_parameters():
+            if param.device.type != "npu":
+                continue
+            if "expert" not in name.lower():
+                continue
+            if not is_npu_internal_format_tensor(param):
+                continue
+            candidates.append((name, param))
+
+        # Fallback: any internal-format model weight.
+        if not candidates:
+            for name, param in self.model.named_parameters():
+                if (
+                    param.device.type == "npu"
+                    and is_npu_internal_format_tensor(param)
+                ):
+                    candidates.append((name, param))
+
+        if not candidates:
+            raise RuntimeError(
+                "[NPU FT DEBUG] no internal-format/NZ model parameter found"
+            )
+
+        # Pick the smallest one to keep this debug probe cheap.
+        name, param = min(
+            candidates,
+            key=lambda item: item[1].numel(),
+        )
+
+        src = param.detach()
+
+        # If this is a stacked expert tensor such as
+        # [num_experts, ..., ...], only inspect expert 0.
+        # expert 0 also avoids a non-zero leading storage offset.
+        if src.dim() >= 3:
+            src = src.narrow(0, 0, 1)
+
+        fmt = torch_npu.get_npu_format(src)
+
+        logger.warning(
+            "[NPU FT DEBUG] NZ probe begin: "
+            "stage=%s rank=%d name=%s shape=%s dtype=%s "
+            "format=%s data_ptr=%d storage_offset=%d",
+            stage,
+            self.ps.dp_rank,
+            name,
+            tuple(src.shape),
+            src.dtype,
+            fmt,
+            src.data_ptr(),
+            src.storage_offset(),
+        )
+
+        # Convert the selected NZ weight to ordinary ND locally.
+        # This forces the NPU to actually read the existing NZ tensor.
+        nd = torch.ops.npu.npu_format_cast(
+            src,
+            int(NPUACLFormat.ACL_FORMAT_ND),
+        )
+
+        # Read only a small sample from the converted tensor.
+        flat = nd.reshape(-1)
+        sample_size = min(1024, flat.numel())
+
+        checksum_tensor = flat[:sample_size].float().sum()
+
+        # Make sure any asynchronous device error is observed HERE,
+        # rather than later in the scheduler/HCCL path.
+        torch.get_device_module().synchronize()
+
+        checksum = float(checksum_tensor.item())
+
+        logger.warning(
+            "[NPU FT DEBUG] NZ probe success: "
+            "stage=%s rank=%d name=%s format=%s "
+            "sample_size=%d checksum=%.9g",
+            stage,
+            self.ps.dp_rank,
+            name,
+            fmt,
+            sample_size,
+            checksum,
+        )
+
+        return name, checksum
+
+
+    def debug_restart_only_and_check_nz_weight(self) -> None:
+        logger.warning(
+            "[NPU FT DEBUG] restart/NZ experiment begin: rank=%d",
+            self.ps.dp_rank,
+        )
+
+        before_name, before_checksum = self._debug_probe_nz_expert_weight(
+            "before_restart"
+        )
+
+        self._stop_and_restart_npu_device_for_fault_tolerance()
+
+        after_name, after_checksum = self._debug_probe_nz_expert_weight(
+            "after_restart"
+        )
+
+        logger.warning(
+            "[NPU FT DEBUG] restart/NZ experiment result: "
+            "rank=%d before_name=%s after_name=%s "
+            "before_checksum=%.9g after_checksum=%.9g equal=%s",
+            self.ps.dp_rank,
+            before_name,
+            after_name,
+            before_checksum,
+            after_checksum,
+            before_name == after_name and before_checksum == after_checksum,
         )
 
     def apply_fault_tolerance_scale_down(self, active_mask: list[bool]) -> None:
@@ -2075,6 +2213,19 @@ class ModelRunner:
                 state.active_ranks_cpu.tolist(),
                 elastic_info.data_ptr(),
                 elastic_info.detach().cpu().tolist(),
+            )
+            logger.info(
+                "[NPU FT] waiting for survivor recovery barrier: "
+                "rank=%d active_original_ranks=%s",
+                self.ps.dp_rank,
+                survivor_process_groups.active_original_ranks,
+            )
+
+            survivor_process_groups.barrier(timeout_sec=120.0)
+
+            logger.info(
+                "[NPU FT] survivor recovery barrier passed: rank=%d",
+                self.ps.dp_rank,
             )
         state.snapshot_active_to_last()
 

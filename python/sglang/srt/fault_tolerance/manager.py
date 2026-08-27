@@ -77,7 +77,8 @@ class FaultToleranceManager:
 
     def _parse_apply_args(self, obj: Dict[str, Any]) -> Tuple[str, List[int], int]:
         instruction = obj["instruction"]
-        if instruction not in ("retry", "scale_down", "inject_fault"):
+        # 临时debug代码
+        if instruction not in ("retry", "scale_down", "inject_fault", "restart_only"):
             raise ValueError(f"unsupported instruction: {instruction}")
         params = obj["params"]
         timeout = params.get("timeout", self.server_args.fault_tolerance_timeout)
@@ -102,6 +103,8 @@ class FaultToleranceManager:
             if instruction == "inject_fault":
                 target = ranks[0] if ranks else 0
                 return self._apply_inject_fault(target)
+            if instruction == "restart_only":
+                return await self._apply_restart_only(timeout)
             return await self._apply_scale_down(ranks, timeout)
         except Exception as exc:
             self._failstop(f"fault tolerance apply {instruction} failed: {exc}")
@@ -179,6 +182,29 @@ class FaultToleranceManager:
         )
         await self._publish_route_dp_mask(candidate_dp_mask, timeout)
         return 200, st.finish_scale_down(requested)
+
+    ## 临时debug代码
+    async def _apply_restart_only(self, timeout: int) -> tuple[int, dict]:
+        st = self.state
+
+        targets = st.expected_dp_ranks()
+
+        logger.warning(
+            "[NPU FT DEBUG] restart-only command: targets=%s",
+            targets,
+        )
+
+        await self._send_command_collect(
+            command="restart_only",
+            target_ranks=targets,
+            timeout_sec=timeout,
+        )
+
+        return 200, {
+            "success": True,
+            "message": "restart_only_complete",
+            "ranks": targets,
+        }
 
     def validate_routed_rank(self, rank: int) -> None:
         if not 0 <= rank < len(self._route_dp_mask) or not self._route_dp_mask[rank]:

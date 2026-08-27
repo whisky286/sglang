@@ -4614,6 +4614,10 @@ class Scheduler(
                 state.active_ranks.copy_(state.last_active_ranks)
                 state.active_ranks_cpu.copy_(state.last_active_ranks.detach().cpu())
                 message = "retried"
+            ## 临时debug代码
+            elif recv_req.command == "restart_only":
+                self.tp_worker.model_runner.debug_restart_only_and_check_nz_weight()
+                message = "restart/NZ probe completed"
             elif recv_req.command == "scale_down":
                 self.tp_worker.model_runner.apply_fault_tolerance_scale_down(
                     recv_req.active_mask
