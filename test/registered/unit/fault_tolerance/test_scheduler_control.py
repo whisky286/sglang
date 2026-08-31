@@ -154,6 +154,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
                 "handle_fault_tolerance_command",
                 "_check_ft_pause_deadline",
                 "_ft_discard_inflight_window",
+                "_ft_release_deferred_kv_cache",
                 "_process_next_overlap_result",
             },
             {
@@ -183,6 +184,9 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         cls.handle_command = staticmethod(scheduler["handle_fault_tolerance_command"])
         cls.check_deadline = staticmethod(scheduler["_check_ft_pause_deadline"])
         cls.discard = staticmethod(scheduler["_ft_discard_inflight_window"])
+        cls.release_deferred_kv = staticmethod(
+            scheduler["_ft_release_deferred_kv_cache"]
+        )
         cls.process_overlap = staticmethod(scheduler["_process_next_overlap_result"])
 
         server_args = load_class_methods(
@@ -319,8 +323,8 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             future_map=SimpleNamespace(publish_ready=object(), _publish_fresh=True),
             _engine_paused=True,
             _ft_pause_deadline=130.0,
-            _ft_pending_discard_reason=None,
             _ft_discard_inflight_window=Mock(return_value=True),
+            _ft_release_deferred_kv_cache=Mock(),
         )
         scheduler._rebuild_npu_fault_tolerance_control_runtime = lambda: (
             self.rebuild_streams(scheduler)
@@ -379,7 +383,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertEqual(output.message, "scaled down")
         self.assertFalse(scheduler._engine_paused)
 
-    def test_npu_scale_down_recovers_discards_then_applies(self):
+    def test_npu_scale_down_recovers_releases_deferred_kv_then_applies(self):
         events = []
         scheduler = self.make_scheduler()
         model_runner = scheduler.tp_worker.model_runner
@@ -404,9 +408,8 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         model_runner.apply_fault_tolerance_scale_down.side_effect = lambda mask: (
             events.append(("scale_down", mask))
         )
-        scheduler._ft_pending_discard_reason = "mlp-sync failed"
-        scheduler._ft_discard_inflight_window.side_effect = lambda reason: (
-            events.append(("discard", reason)) or True
+        scheduler._ft_release_deferred_kv_cache.side_effect = lambda: events.append(
+            "release_deferred_kv"
         )
         request = FaultToleranceCommandReqInput(
             request_id="s",
@@ -427,15 +430,14 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             [
                 "recover_device",
                 "rebuild_control_runtime",
-                ("discard", "mlp-sync failed"),
                 ("scale_down", [True, False]),
+                "release_deferred_kv",
                 "schedule_sync",
                 "forward_wait",
                 ("dummy_batch", [True, False]),
                 "health_sync",
             ],
         )
-        self.assertIsNone(scheduler._ft_pending_discard_reason)
         self.assertEqual(output.message, "scaled down")
         log_text = "\n".join(captured.output)
         expected_log_steps = [
@@ -444,10 +446,10 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             "step=recover_device phase=complete",
             "step=rebuild_control_runtime phase=begin",
             "step=rebuild_control_runtime phase=complete",
-            "step=discard_inflight phase=begin",
-            "step=discard_inflight phase=complete",
             "step=apply_elastic_scale_down phase=begin",
             "step=apply_elastic_scale_down phase=complete",
+            "step=release_deferred_kv phase=begin",
+            "step=release_deferred_kv phase=complete",
             "step=schedule_stream_synchronize phase=begin",
             "step=schedule_stream_synchronize phase=complete",
             "step=device_probe phase=skipped",
@@ -493,10 +495,11 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         recover = scheduler.tp_worker.model_runner.recover_npu_device_for_fault_tolerance_scale_down
         recover.assert_not_called()
 
-    def test_npu_scale_down_returns_failed_ack_when_discard_validation_fails(self):
+    def test_npu_scale_down_returns_failed_ack_when_deferred_kv_release_fails(self):
         scheduler = self.make_scheduler()
-        scheduler._ft_pending_discard_reason = "mlp-sync failed"
-        scheduler._ft_discard_inflight_window.return_value = False
+        scheduler._ft_release_deferred_kv_cache.side_effect = RuntimeError(
+            "release failed"
+        )
         request = FaultToleranceCommandReqInput(
             request_id="s",
             command="scale_down",
@@ -515,7 +518,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         apply_scale_down = (
             scheduler.tp_worker.model_runner.apply_fault_tolerance_scale_down
         )
-        apply_scale_down.assert_not_called()
+        apply_scale_down.assert_called_once_with([True, False])
         scheduler.tp_worker.model_runner.run_npu_fault_tolerance_dummy_batch.assert_not_called()
 
     def test_npu_scale_down_returns_failed_ack_when_dummy_batch_fails(self):
@@ -614,7 +617,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
 
         self.assertEqual(events, ["fault", "discarded", "report"])
 
-    def test_npu_mc2_defers_inflight_discard_until_recovery(self):
+    def test_npu_mc2_discards_host_state_but_defers_kv_release(self):
         events = []
         dispatched = False
 
@@ -628,8 +631,13 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
 
         self.run_ft_loop.__globals__["dispatch_event_loop"] = dispatch
         self.run_ft_loop.__globals__["_is_npu"] = True
+
+        def discard(exc, *, defer_kv_release=False):
+            events.append(("discarded", str(exc), defer_kv_release))
+            return True
+
         scheduler = SimpleNamespace(
-            _ft_discard_inflight_window=lambda exc: events.append("discarded") or True,
+            _ft_discard_inflight_window=discard,
             ipc_channels=SimpleNamespace(
                 send_to_tokenizer=SimpleNamespace(
                     send_output=lambda *_: events.append("report")
@@ -644,7 +652,6 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             ),
             _engine_paused=False,
             _ft_pause_deadline=None,
-            _ft_pending_discard_reason=None,
         )
 
         try:
@@ -658,9 +665,10 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             [
                 "fault",
                 "report",
+                ("discarded", "mlp-sync failed", True),
             ],
         )
-        self.assertEqual(scheduler._ft_pending_discard_reason, "mlp-sync failed")
+        self.assertTrue(scheduler._engine_paused)
 
     def test_npu_continue_strategy_is_normalized_during_startup(self):
         module = ModuleType("sglang.srt.fault_tolerance.controller")
@@ -1033,6 +1041,50 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         self.assertEqual(current.kv_committed_len, 11)
         self.assertEqual(scheduler.running_batch.reqs, [])
         self.assertEqual(scheduler.result_queue, deque())
+
+    def test_deferred_kv_release_runs_only_after_explicit_recovery_step(self):
+        req = FakeReq(
+            "current", origin_input_ids=list(range(10)), output_ids=[10], committed=12
+        )
+        running = FakeBatch([req])
+        sender = Sender()
+        release = Mock()
+        self.discard.__globals__["release_kv_cache"] = release
+        scheduler = SimpleNamespace(
+            ps=SimpleNamespace(dp_rank=1),
+            cur_batch_for_debug=running,
+            last_batch=running,
+            result_queue=deque(),
+            running_batch=running,
+            chunked_req=None,
+            tree_cache=object(),
+            ipc_channels=SimpleNamespace(send_to_tokenizer=sender),
+        )
+
+        self.assertTrue(
+            self.discard(
+                scheduler,
+                RuntimeError("mlp-sync failed"),
+                defer_kv_release=True,
+            )
+        )
+
+        release.assert_not_called()
+        self.assertEqual(
+            list(scheduler._ft_deferred_kv_release_reqs),
+            ["current"],
+        )
+        self.assertEqual(scheduler.running_batch.reqs, [])
+
+        self.release_deferred_kv(scheduler)
+
+        release.assert_called_once_with(
+            req,
+            scheduler.tree_cache,
+            is_insert=False,
+            allow_non_spec_overallocated=True,
+        )
+        self.assertEqual(scheduler._ft_deferred_kv_release_reqs, {})
 
     def test_failed_discard_keeps_inflight_window_for_diagnosis(self):
         req = FakeReq("current")
