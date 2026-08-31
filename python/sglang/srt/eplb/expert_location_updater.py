@@ -198,21 +198,77 @@ def _copy_expert_tensor_(
     destination_tensor.copy_(source_tensor)
 
 
+def _needs_npu_p2p_staging(tensor: torch.Tensor) -> bool:
+    if tensor.device.type != "npu":
+        return False
+
+    from sglang.srt.hardware_backend.npu.utils import (
+        is_npu_internal_format_tensor,
+    )
+
+    return tensor.storage_offset() != 0 or is_npu_internal_format_tensor(tensor)
+
+
+def _new_npu_nd_staging_like(tensor: torch.Tensor) -> torch.Tensor:
+    import torch_npu
+
+    from sglang.srt.hardware_backend.npu.utils import NPUACLFormat
+
+    staged = torch_npu.empty_with_format(
+        tuple(tensor.shape),
+        dtype=tensor.dtype,
+        device=tensor.device,
+        acl_format=int(NPUACLFormat.ACL_FORMAT_ND),
+    )
+
+    if staged.storage_offset() != 0:
+        raise RuntimeError(
+            "NPU EPLB ND staging tensor must have storage_offset=0"
+        )
+
+    actual_format = torch_npu.get_npu_format(staged)
+    if actual_format != int(NPUACLFormat.ACL_FORMAT_ND):
+        raise RuntimeError(
+            f"NPU EPLB staging tensor is not ND: format={actual_format}"
+        )
+
+    return staged
+
+
 def _stage_npu_p2p_ops(
     p2p_ops: List[P2POp],
 ) -> Tuple[List[P2POp], List[Tuple[torch.Tensor, torch.Tensor]]]:
     staged_ops = []
     recv_copy_infos = []
+    staged_send_tensors = {}
     for op in p2p_ops:
-        if op.tensor.storage_offset() == 0:
+        tensor = op.tensor
+        if not _needs_npu_p2p_staging(tensor):
             staged_ops.append(op)
             continue
 
-        staged_tensor = torch.empty_like(op.tensor)
         if op.op == torch.distributed.irecv:
-            recv_copy_infos.append((staged_tensor, op.tensor))
+            staged_tensor = _new_npu_nd_staging_like(tensor)
+            recv_copy_infos.append((staged_tensor, tensor))
+        elif op.op == torch.distributed.isend:
+            send_key = (
+                tensor.device,
+                tensor.data_ptr(),
+                tensor.storage_offset(),
+                tuple(tensor.shape),
+                tuple(tensor.stride()),
+                tensor.dtype,
+            )
+            staged_tensor = staged_send_tensors.get(send_key)
+            if staged_tensor is None:
+                staged_tensor = _new_npu_nd_staging_like(tensor)
+                # This is a logical copy from the internal format (normally NZ)
+                # into ND, rather than a raw copy of the formatted storage.
+                staged_tensor.copy_(tensor)
+                staged_send_tensors[send_key] = staged_tensor
         else:
-            _copy_expert_tensor_(staged_tensor, op.tensor)
+            raise ValueError(f"Unsupported P2P operation: {op.op}")
+
         staged_ops.append(
             P2POp(
                 op=op.op,
@@ -223,6 +279,29 @@ def _stage_npu_p2p_ops(
             )
         )
     return staged_ops, recv_copy_infos
+
+
+def _copy_staged_p2p_recvs(
+    recv_copy_infos: List[Tuple[torch.Tensor, torch.Tensor]],
+) -> None:
+    for staged_tensor, destination_tensor in recv_copy_infos:
+        if destination_tensor.device.type == "npu":
+            import torch_npu
+
+            from sglang.srt.hardware_backend.npu.utils import (
+                is_npu_internal_format_tensor,
+            )
+
+            if is_npu_internal_format_tensor(destination_tensor):
+                destination_format = torch_npu.get_npu_format(destination_tensor)
+                formatted_staged_tensor = torch.ops.npu.npu_format_cast(
+                    staged_tensor,
+                    destination_format,
+                )
+                _copy_expert_tensor_(destination_tensor, formatted_staged_tensor)
+                continue
+
+        _copy_expert_tensor_(destination_tensor, staged_tensor)
 
 
 def update_expert_weights_single_layer(
@@ -582,14 +661,11 @@ def update_expert_weights_single_layer(
                 if eid in ops_by_expert:
                     batch_ops.extend(ops_by_expert[eid])
             if batch_ops:
-                recv_copy_infos = []
-                if process_group_context.device_group is not None:
-                    batch_ops, recv_copy_infos = _stage_npu_p2p_ops(batch_ops)
+                batch_ops, recv_copy_infos = _stage_npu_p2p_ops(batch_ops)
                 reqs = torch.distributed.batch_isend_irecv(batch_ops)
                 for req in reqs:
                     req.wait()
-                for staged_tensor, destination_tensor in recv_copy_infos:
-                    _copy_expert_tensor_(destination_tensor, staged_tensor)
+                _copy_staged_p2p_recvs(recv_copy_infos)
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
         for (
