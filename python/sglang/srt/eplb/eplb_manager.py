@@ -275,15 +275,55 @@ def update_expert_location_with_recovery(
             expert_backup_client.update_weights(weight_name_filter)
         else:
             # Load the missing weights from disk
-            update_weights_from_disk_callable(
+            update_result = update_weights_from_disk_callable(
                 get_server_args().model_path,
                 get_server_args().load_format,
                 weight_name_filter=weight_name_filter,
+            )
+            _validate_missing_expert_disk_reload(
+                update_result=update_result,
+                weight_name_filter=weight_name_filter,
+                tp_rank=tp_rank,
             )
 
     # Re-init LPLB solvers after expert location update
     if ep_dispatch_algorithm == "lp":
         init_lplb_solvers_callable()
+
+
+def _validate_missing_expert_disk_reload(
+    *,
+    update_result,
+    weight_name_filter,
+    tp_rank: int,
+) -> None:
+    if isinstance(update_result, tuple) and not update_result[0]:
+        raise RuntimeError(
+            "NPU FT failed to reload missing experts from disk: "
+            f"{update_result[1]}"
+        )
+
+    reload_stats = getattr(weight_name_filter, "_sglang_ft_reload_stats", None)
+    if reload_stats is None:
+        return
+
+    expected_pairs = reload_stats["expected_pairs"]
+    selected_pairs = reload_stats["selected_pairs"]
+    unmatched_pairs = sorted(expected_pairs - selected_pairs)
+    logger.info(
+        "[NPU FT] missing-expert checkpoint coverage: rank=%d "
+        "expected_pairs=%d selected_pairs=%d selected_tensors=%d",
+        tp_rank,
+        len(expected_pairs),
+        len(selected_pairs),
+        reload_stats["selected_weight_names"],
+    )
+    if unmatched_pairs:
+        raise RuntimeError(
+            "NPU FT checkpoint filter did not find every requested expert: "
+            f"rank={tp_rank} unmatched_pairs={unmatched_pairs[:32]} "
+            f"unmatched_count={len(unmatched_pairs)}"
+        )
 
 
 def _chunk_list(items: List, chunk_size):

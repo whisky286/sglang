@@ -32,6 +32,40 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _should_skip_full_model_postprocess_for_filtered_npu_reload(
+    device: str,
+    model_config: Any,
+    weight_name_filter: Optional[Callable[[str], bool]],
+) -> bool:
+    """Preserve serving layouts for a filtered, unquantized NPU reload."""
+    return (
+        device == "npu"
+        and weight_name_filter is not None
+        and getattr(model_config, "quantization", None) is None
+    )
+
+
+def _load_weights_for_disk_update(
+    loader: DefaultModelLoader,
+    model: Any,
+    weights: Any,
+    target_device: torch.device,
+    *,
+    skip_full_model_postprocess: bool,
+) -> Any:
+    if skip_full_model_postprocess:
+        # The selected expert tensors are written into existing serving
+        # storage. Re-running full-model postprocess would touch unrelated,
+        # already formatted NPU weights and may replace captured storage.
+        model.load_weights(weights)
+        finalize = getattr(model, "finalize_ft_filtered_weight_reload", None)
+        if callable(finalize):
+            finalize()
+    else:
+        loader.load_weights_and_postprocess(model, weights, target_device)
+    return model
+
+
 def _unsupported_derived_weight_cache_error() -> Optional[str]:
     """Reject online weight updates that derived-weight caches cannot survive.
 
@@ -166,6 +200,17 @@ class WeightUpdater:
             message = f"Failed to get model loader: {loader}."
             return False, message
 
+        skip_full_model_postprocess = (
+            _should_skip_full_model_postprocess_for_filtered_npu_reload(
+                self.device, self.model_config, weight_name_filter
+            )
+        )
+        if skip_full_model_postprocess:
+            logger.info(
+                "[NPU FT] filtered expert reload will preserve existing NPU "
+                "weight layouts without full-model postprocess."
+            )
+
         def get_weight_iter(config):
             iter = loader._get_weights_iterator(
                 DefaultModelLoader.Source.init_new(config, self.get_model())
@@ -178,8 +223,13 @@ class WeightUpdater:
             return iter
 
         def model_load_weights(model, iter):
-            loader.load_weights_and_postprocess(model, iter, target_device)
-            return model
+            return _load_weights_for_disk_update(
+                loader,
+                model,
+                iter,
+                target_device,
+                skip_full_model_postprocess=skip_full_model_postprocess,
+            )
 
         with set_default_torch_dtype(self.model_config.dtype):
             try:

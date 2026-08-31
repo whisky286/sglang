@@ -1094,6 +1094,56 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
         self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
+    @classmethod
+    def generate_weight_name_filter(
+        cls, logical_experts_map: Dict[int, List[int]]
+    ):
+        """Select missing routed-expert checkpoint tensors for FT reload."""
+
+        import re
+
+        pattern = re.compile(r"layers\.(\d+)\.mlp\.experts\.(\d+)\.")
+        reload_stats = {
+            "expected_pairs": {
+                (int(layer_id), int(expert_id))
+                for layer_id, expert_ids in logical_experts_map.items()
+                for expert_id in expert_ids
+            },
+            "selected_pairs": set(),
+            "selected_weight_names": 0,
+        }
+
+        def weight_name_filter(name: str) -> bool:
+            match = pattern.search(name)
+            if match is None:
+                return False
+            layer_id, expert_id = (int(value) for value in match.groups())
+            selected = (
+                layer_id in logical_experts_map
+                and expert_id in logical_experts_map[layer_id]
+            )
+            if selected:
+                reload_stats["selected_pairs"].add((layer_id, expert_id))
+                reload_stats["selected_weight_names"] += 1
+            return selected
+
+        # EPLB checks this after the lazy checkpoint iterator is consumed, so
+        # a checkpoint naming mismatch cannot silently leave an expert stale.
+        weight_name_filter._sglang_ft_reload_stats = reload_stats
+        return weight_name_filter
+
+    def finalize_ft_filtered_weight_reload(self) -> None:
+        """Reject a filtered reload that left a fused expert incomplete."""
+
+        for layer in self.model.layers:
+            mlp = getattr(layer, "mlp", None)
+            experts = getattr(mlp, "experts", None)
+            finalize = getattr(
+                experts, "finalize_npu_formatted_expert_reload", None
+            )
+            if callable(finalize):
+                finalize()
+
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
