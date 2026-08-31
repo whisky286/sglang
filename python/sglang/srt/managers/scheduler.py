@@ -1566,7 +1566,26 @@ class Scheduler(
                 dispatch_event_loop(self)
                 return
             except Exception as exc:
-                recovered = self._ft_discard_inflight_window(exc)
+                defer_discard = (
+                    _is_npu and self.server_args.elastic_ep_backend == "mc2"
+                )
+                if defer_discard:
+                    # A failed MC2 forward can leave the NPU stream in an error
+                    # state. Releasing KV cache here may enqueue more device work
+                    # on that stream and prevent this rank from entering pause.
+                    # Keep the host-side request state until device recovery has
+                    # completed; the scale-down recovery path consumes this reason
+                    # and discards the in-flight window before rebuilding groups.
+                    self._ft_pending_discard_reason = str(exc)
+                    recovered = False
+                    logger.warning(
+                        "NPU FT pause step=defer_inflight_discard "
+                        "phase=complete dp_rank=%s error=%s",
+                        self.ps.dp_rank,
+                        exc,
+                    )
+                else:
+                    recovered = self._ft_discard_inflight_window(exc)
                 should_continue = (
                     self.server_args.fault_tolerance_on_error_strategy == "continue"
                     and recovered
@@ -1577,6 +1596,13 @@ class Scheduler(
                         time.monotonic()
                         + self.server_args.fault_tolerance_pause_timeout
                     )
+                    if defer_discard:
+                        logger.info(
+                            "NPU FT pause step=self_pause phase=complete "
+                            "dp_rank=%s deadline=%s",
+                            self.ps.dp_rank,
+                            self._ft_pause_deadline,
+                        )
                 self.ipc_channels.send_to_tokenizer.send_output(
                     FaultToleranceRankFaultOutput(
                         rank=self.ps.dp_rank,
