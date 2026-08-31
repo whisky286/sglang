@@ -199,14 +199,12 @@ def _copy_expert_tensor_(
 
 
 def _needs_npu_p2p_staging(tensor: torch.Tensor) -> bool:
-    if tensor.device.type != "npu":
-        return False
-
-    from sglang.srt.hardware_backend.npu.utils import (
-        is_npu_internal_format_tensor,
-    )
-
-    return tensor.storage_offset() != 0 or is_npu_internal_format_tensor(tensor)
+    # Always give HCCL an explicit offset-zero ND buffer on NPU. Selectively
+    # bypassing staging for offset-zero tensors relies on view-format metadata
+    # remaining trustworthy across device recovery; in practice that path can
+    # silently corrupt EPLB-moved expert weights after scale-down. EPLB runs
+    # only during rebalancing, so prefer the extra copy over unsafe zero-copy.
+    return tensor.device.type == "npu"
 
 
 def _new_npu_nd_staging_like(tensor: torch.Tensor) -> torch.Tensor:
