@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.eplb import expert_location_updater
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -45,6 +46,7 @@ class TestExpertLocationUpdaterNPUP2P(CustomTestCase):
         )
 
         with (
+            envs.SGLANG_NPU_EPLB_P2P_USE_ND_STAGING.override(True),
             patch.object(expert_location_updater, "P2POp", _FakeP2POp),
             patch.object(
                 expert_location_updater,
@@ -62,13 +64,34 @@ class TestExpertLocationUpdaterNPUP2P(CustomTestCase):
         self.assertEqual(staged_ops[0].tag, 7)
         self.assertEqual(recv_copy_infos, [(staged, original)])
 
+    def test_ablation_switch_keeps_original_npu_p2p_tensor(self):
+        original = _FakeTensor("npu", storage_offset=9)
+        op = _FakeP2POp(torch.distributed.irecv, original, peer=1)
+
+        with (
+            envs.SGLANG_NPU_EPLB_P2P_USE_ND_STAGING.override(False),
+            patch.object(
+                expert_location_updater,
+                "_new_npu_nd_staging_like",
+            ) as new_staging,
+        ):
+            staged_ops, recv_copy_infos = (
+                expert_location_updater._stage_npu_p2p_ops([op])
+            )
+
+        new_staging.assert_not_called()
+        self.assertIs(staged_ops[0], op)
+        self.assertIs(staged_ops[0].tensor, original)
+        self.assertEqual(recv_copy_infos, [])
+
     def test_non_npu_tensor_keeps_zero_copy_path(self):
         original = _FakeTensor("cuda", storage_offset=9)
         op = _FakeP2POp(torch.distributed.isend, original, peer=1)
 
-        staged_ops, recv_copy_infos = expert_location_updater._stage_npu_p2p_ops(
-            [op]
-        )
+        with envs.SGLANG_NPU_EPLB_P2P_USE_ND_STAGING.override(True):
+            staged_ops, recv_copy_infos = (
+                expert_location_updater._stage_npu_p2p_ops([op])
+            )
 
         self.assertIs(staged_ops[0], op)
         self.assertEqual(recv_copy_infos, [])

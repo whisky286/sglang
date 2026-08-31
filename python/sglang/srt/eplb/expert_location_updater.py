@@ -199,12 +199,16 @@ def _copy_expert_tensor_(
 
 
 def _needs_npu_p2p_staging(tensor: torch.Tensor) -> bool:
-    # Always give HCCL an explicit offset-zero ND buffer on NPU. Selectively
-    # bypassing staging for offset-zero tensors relies on view-format metadata
-    # remaining trustworthy across device recovery; in practice that path can
-    # silently corrupt EPLB-moved expert weights after scale-down. EPLB runs
-    # only during rebalancing, so prefer the extra copy over unsafe zero-copy.
-    return tensor.device.type == "npu"
+    # By default, always give HCCL an explicit offset-zero ND buffer on NPU.
+    # Selectively bypassing staging for offset-zero tensors relies on view-format
+    # metadata remaining trustworthy across device recovery; in practice that
+    # path can silently corrupt EPLB-moved expert weights after scale-down. The
+    # switch exists only for an A/B ablation against direct P2P of the original
+    # tensor; EPLB runs only during rebalancing, so keep the safe path enabled.
+    return (
+        tensor.device.type == "npu"
+        and envs.SGLANG_NPU_EPLB_P2P_USE_ND_STAGING.get()
+    )
 
 
 def _new_npu_nd_staging_like(tensor: torch.Tensor) -> torch.Tensor:

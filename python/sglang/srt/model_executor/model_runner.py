@@ -2091,8 +2091,9 @@ class ModelRunner:
         if is_npu_ft_mc2:
             logger.info(
                 "NPU FT elastic step=rebalance_experts phase=begin dp_rank=%s "
-                "original_mc2_hccl_group=reused",
+                "original_mc2_hccl_group=reused p2p_nd_staging=%s",
                 self.ps.dp_rank,
+                envs.SGLANG_NPU_EPLB_P2P_USE_ND_STAGING.get(),
             )
             for _ in self.eplb_manager.rebalance(force=True):
                 pass
