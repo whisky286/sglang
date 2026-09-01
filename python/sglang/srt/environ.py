@@ -682,8 +682,12 @@ class Envs:
     SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE = EnvIntWithAlias(
         32, deprecated_name="SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE"
     )
-    # Convert NPU EPLB P2P tensors to explicit offset-zero ND buffers before
-    # HCCL transfer. Set to false only to ablate the ND staging correctness fix.
+    # NPU EPLB P2P staging policy: "nd" stages every tensor in an offset-zero
+    # ND buffer, "offset" only stages nonzero-offset views while preserving
+    # their NPU format, and "direct" sends the original tensor to HCCL.
+    # If unset, the legacy boolean below selects "nd" (true) or "direct" (false).
+    SGLANG_NPU_EPLB_P2P_STAGING_MODE = EnvStr(None)
+    # Deprecated compatibility switch. Prefer SGLANG_NPU_EPLB_P2P_STAGING_MODE.
     SGLANG_NPU_EPLB_P2P_USE_ND_STAGING = EnvBool(True)
 
     # TBO

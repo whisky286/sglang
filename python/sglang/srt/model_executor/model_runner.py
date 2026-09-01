@@ -68,7 +68,10 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
 )
-from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.eplb.expert_location_updater import (
+    ExpertLocationUpdater,
+    get_npu_eplb_p2p_staging_mode,
+)
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
@@ -2091,9 +2094,9 @@ class ModelRunner:
         if is_npu_ft_mc2:
             logger.info(
                 "NPU FT elastic step=rebalance_experts phase=begin dp_rank=%s "
-                "original_mc2_hccl_group=reused p2p_nd_staging=%s",
+                "original_mc2_hccl_group=reused p2p_staging_mode=%s",
                 self.ps.dp_rank,
-                envs.SGLANG_NPU_EPLB_P2P_USE_ND_STAGING.get(),
+                get_npu_eplb_p2p_staging_mode(),
             )
             for _ in self.eplb_manager.rebalance(force=True):
                 pass

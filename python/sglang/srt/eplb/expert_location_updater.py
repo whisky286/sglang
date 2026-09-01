@@ -198,17 +198,37 @@ def _copy_expert_tensor_(
     destination_tensor.copy_(source_tensor)
 
 
-def _needs_npu_p2p_staging(tensor: torch.Tensor) -> bool:
-    # By default, always give HCCL an explicit offset-zero ND buffer on NPU.
-    # Selectively bypassing staging for offset-zero tensors relies on view-format
-    # metadata remaining trustworthy across device recovery; in practice that
-    # path can silently corrupt EPLB-moved expert weights after scale-down. The
-    # switch exists only for an A/B ablation against direct P2P of the original
-    # tensor; EPLB runs only during rebalancing, so keep the safe path enabled.
-    return (
-        tensor.device.type == "npu"
-        and envs.SGLANG_NPU_EPLB_P2P_USE_ND_STAGING.get()
-    )
+_NPU_EPLB_P2P_STAGING_MODES = frozenset(("nd", "offset", "direct"))
+
+
+def get_npu_eplb_p2p_staging_mode() -> str:
+    """Resolve the NPU EPLB P2P staging mode, including the legacy switch."""
+    mode = envs.SGLANG_NPU_EPLB_P2P_STAGING_MODE.get()
+    if mode is None:
+        return (
+            "nd"
+            if envs.SGLANG_NPU_EPLB_P2P_USE_ND_STAGING.get()
+            else "direct"
+        )
+
+    mode = mode.strip().lower()
+    if mode not in _NPU_EPLB_P2P_STAGING_MODES:
+        valid_modes = ", ".join(sorted(_NPU_EPLB_P2P_STAGING_MODES))
+        raise ValueError(
+            "SGLANG_NPU_EPLB_P2P_STAGING_MODE must be one of "
+            f"{{{valid_modes}}}, got {mode!r}"
+        )
+    return mode
+
+
+def _needs_npu_p2p_staging(tensor: torch.Tensor, mode: str) -> bool:
+    if tensor.device.type != "npu" or mode == "direct":
+        return False
+    if mode == "nd":
+        return True
+    # The offset-only ablation keeps offset-zero tensors on the original direct
+    # path and gives only nonzero-offset views their own offset-zero storage.
+    return tensor.storage_offset() != 0
 
 
 def _new_npu_nd_staging_like(tensor: torch.Tensor) -> torch.Tensor:
@@ -237,20 +257,53 @@ def _new_npu_nd_staging_like(tensor: torch.Tensor) -> torch.Tensor:
     return staged
 
 
+def _new_npu_offset_zero_staging_like(tensor: torch.Tensor) -> torch.Tensor:
+    """Allocate offset-zero NPU storage without changing the tensor format."""
+    import torch_npu
+
+    source_format = torch_npu.get_npu_format(tensor)
+    staged = torch_npu.empty_with_format(
+        tuple(tensor.shape),
+        dtype=tensor.dtype,
+        device=tensor.device,
+        acl_format=source_format,
+    )
+
+    if staged.storage_offset() != 0:
+        raise RuntimeError(
+            "NPU EPLB offset staging tensor must have storage_offset=0"
+        )
+
+    actual_format = torch_npu.get_npu_format(staged)
+    if actual_format != source_format:
+        raise RuntimeError(
+            "NPU EPLB offset staging changed the tensor format: "
+            f"source_format={source_format}, staged_format={actual_format}"
+        )
+
+    return staged
+
+
 def _stage_npu_p2p_ops(
     p2p_ops: List[P2POp],
 ) -> Tuple[List[P2POp], List[Tuple[torch.Tensor, torch.Tensor]]]:
+    mode = get_npu_eplb_p2p_staging_mode()
     staged_ops = []
     recv_copy_infos = []
     staged_send_tensors = {}
     for op in p2p_ops:
         tensor = op.tensor
-        if not _needs_npu_p2p_staging(tensor):
+        if not _needs_npu_p2p_staging(tensor, mode):
             staged_ops.append(op)
             continue
 
+        new_staging_like = (
+            _new_npu_nd_staging_like
+            if mode == "nd"
+            else _new_npu_offset_zero_staging_like
+        )
         if op.op == torch.distributed.irecv:
-            staged_tensor = _new_npu_nd_staging_like(tensor)
+            staged_tensor = new_staging_like(tensor)
             recv_copy_infos.append((staged_tensor, tensor))
         elif op.op == torch.distributed.isend:
             send_key = (
@@ -263,10 +316,15 @@ def _stage_npu_p2p_ops(
             )
             staged_tensor = staged_send_tensors.get(send_key)
             if staged_tensor is None:
-                staged_tensor = _new_npu_nd_staging_like(tensor)
-                # This is a logical copy from the internal format (normally NZ)
-                # into ND, rather than a raw copy of the formatted storage.
-                staged_tensor.copy_(tensor)
+                staged_tensor = new_staging_like(tensor)
+                if mode == "nd":
+                    # This is a logical copy from the internal format (normally
+                    # NZ) into ND, not a raw copy of the formatted storage.
+                    staged_tensor.copy_(tensor)
+                else:
+                    # The offset-only path keeps the source NPU format, so copy
+                    # the formatted storage into a standalone offset-zero tensor.
+                    _copy_expert_tensor_(staged_tensor, tensor)
                 staged_send_tensors[send_key] = staged_tensor
         else:
             raise ValueError(f"Unsupported P2P operation: {op.op}")
@@ -296,10 +354,13 @@ def _copy_staged_p2p_recvs(
 
             if is_npu_internal_format_tensor(destination_tensor):
                 destination_format = torch_npu.get_npu_format(destination_tensor)
-                formatted_staged_tensor = torch.ops.npu.npu_format_cast(
-                    staged_tensor,
-                    destination_format,
-                )
+                staged_format = torch_npu.get_npu_format(staged_tensor)
+                formatted_staged_tensor = staged_tensor
+                if staged_format != destination_format:
+                    formatted_staged_tensor = torch.ops.npu.npu_format_cast(
+                        staged_tensor,
+                        destination_format,
+                    )
                 _copy_expert_tensor_(destination_tensor, formatted_staged_tensor)
                 continue
 
