@@ -111,16 +111,38 @@ rank 按可见设备的本地编号选择 NPU。探针在父进程保留独立 T
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 PYTHONPATH=python \
   python test/manual/ep/probe_npu_rank_recovery.py \
-  --backend hccl --world-size 4 --fault-rank 2 --mc2 --timeout 120
+  --backend hccl --world-size 4 --fault-rank 2 \
+  --mc2 --mc2-strategy default --timeout 120
 ```
 
 新增 `--mc2` 模式会在每个阶段创建新的 DeepEP 低延迟 buffer，执行 BF16 dispatch → 恒等专家计算 → combine，并要求输出与输入乘以 top-k 完全相等。每个 rank 的专家槽位数固定（默认 32），候选组内总物理槽位数随成员数变化（默认 128→96→128）；输入路由使用候选组内的连续编号。
 
-首次执行会输出 torch/torch-npu/已安装算子包版本、wrapper 路径、dispatch/combine 签名和 `DEEP_USE_MODE`，各 rank 报告数值误差、接收计数、策略类与可见的 HCCL 通信域名。环境变量沿用现有配置，探针不会擅自切换策略或通信算法。
+首次执行会输出 torch/torch-npu/已安装算子包版本、wrapper 路径、dispatch/combine 签名和继承的 `DEEP_USE_MODE`。`--mc2-strategy` 默认明确选择 `default`，仅在创建当前 buffer 时临时设置该环境变量，随后还原；不会修改服务环境。该 wrapper 在构造函数内重新读取环境变量，不能只依靠构造函数的同名策略参数。
+
+每阶段首次 dispatch 前还会输出实际策略、`comm_alg`（`default` 策略没有此属性，显示 `null`）与通信域名。如果 wrapper 没有采用请求的策略，探针立即拒绝执行。各 rank 的成功报告包含上述信息及数值误差、接收计数。`default` 仍然执行 DeepEP 自定义 C++/NPU 通信算子；它不是 CPU 或 Gloo 替代路径。
+
+可显式使用 `--mc2-strategy ops` 诊断 torch-npu 路径；不会在失败后自动回退。下面记录的 CANN 9.0 环境中，该路径的 EP=4 基线已经失败，不能据此假设 EP=3 或 `16→15→16` 可用，也不能把切换 fullmesh 当作已验证的卡数限制修复。
 
 可按已验证模型调整 `--mc2-hidden`（默认 2048）、`--mc2-local-experts`（32）、`--mc2-tokens`（16）与 `--mc2-topk`（8）。这些参数是否被当前算子支持必须由目标环境验证；`--mc2` 不支持 Gloo 模式。
 
 **本模式仍不验证原 rank 的 `elastic_info`、旧 buffer 复用、执行图重放、专家权重加载或完整模型服务。** 成功只表明新建候选设备组上的全新低延迟 buffer 能完成数值正确的往返。旧 buffer 保留到进程退出，其安全退休方式仍需后续验证。
+
+### MC2 首次实机失败与策略修正（日志日期 2026-10-28）
+
+用户运行 `36fab44207` 的 `--mc2` 探针时，继承了 `DEEP_USE_MODE=ops`，报告的软件版本为：
+
+| 组件 | 用户日志版本 |
+|---|---|
+| torch | `2.10.0+cpu` |
+| torch-npu | `2.10.0.post2` |
+| sgl-kernel-npu | `2026.6.1` |
+| deep-ep | `1.0.0+7a396def.cann.9.0.0.b237` |
+
+wrapper 的 dispatch/combine 签名包含可选 `elastic_info`。本次没有传入该参数，错误发生于 **epoch 0、四卡初始基线的第一次 dispatch**，尚未执行杀进程、缩容或回归。调用链为 `OpsLowLatencyCommStrategy → torch_npu.npu_moe_distribute_dispatch_v2 → aclnnMoeDistributeDispatchV4`，tiling 拒绝 `epWorldSize=4`，报 `epWorldSize should be 16 Aligned, but got 4`。前面的内部格式警告不是终止原因。
+
+已有提交 `0489321022` 的 `test/manual/ascend/README_fault_tolerance_mc2.md` 记录过同一栈的四卡限制，并要求 EP=4 使用 `DEEP_USE_MODE=default`。该提交中的 fullmesh 修正针对原 EP=16 且传入 `elastic_info` 的 ops 路径，不是本探针的无 `elastic_info` 四卡基线。因此本轮修正明确选择 `default` 并增加生效检查与调用前诊断，保留 `ops` 作为显式选项。
+
+**修正后的 `default` 路径仍待用户在目标 NPU 上重测。** 本次失败不推翻此前候选 HCCL 组验证通过的结果，也不证明 MC2 能够完成 `4→3→4`。
 
 ## 单元验证
 
@@ -142,9 +164,11 @@ PYTHONPATH=python python -m pytest \
 
 本机缺少完整 CUDA/NPU 与 SGLang 依赖，逻辑测试使用隔离加载：实际执行恢复/控制器/manager/专家布局/MC2 模块，替代非相关服务框架导入，并按既有 AST 单元测试方式执行 Scheduler/MLP-sync 逻辑。这是 CPU 逻辑验证，不是完整服务启动或 NPU 集成测试。
 
-初始提交的隔离 CPU 验证结果为 **75 passed，20 subtests passed**；另通过真实 Gloo 多进程 `4→3→4` 探针。用户已报告目标 NPU 环境的 HCCL 探针通过；新增 `--mc2` 模式的实机验证仍待执行。
+初始提交的隔离 CPU 验证结果为 **75 passed，20 subtests passed**；另通过真实 Gloo 多进程 `4→3→4` 探针。用户已报告目标 NPU 环境的 HCCL 探针通过；MC2 首轮实机失败与待重测状态见上文。
 
-加入 MC2 数值门禁的 CPU mock 测试后，当前隔离验证范围为 **80 passed，24 subtests passed**，并再次通过原有真实 Gloo 多进程流程。新增测试检查每次创建新 buffer、候选组内路由有效且无重复、BF16 模式、数值/NaN/形状/dtype 错误拒绝、空通信域名拒绝，以及 `--mc2` 不得以 Gloo 代替 NPU 执行。
+加入 MC2 数值门禁的 CPU mock 测试后，当时隔离验证范围为 **80 passed，24 subtests passed**，并再次通过原有真实 Gloo 多进程流程。新增测试检查每次创建新 buffer、候选组内路由有效且无重复、BF16 模式、数值/NaN/形状/dtype 错误拒绝、空通信域名拒绝，以及 `--mc2` 不得以 Gloo 代替 NPU 执行。
+
+本轮策略修正后，隔离 CPU 回归结果为 **84 passed，26 subtests passed**，Ruff 检查通过。新增覆盖默认策略覆盖继承的 `ops`、构造成功/失败后还原环境、显式 `ops` 不自动回退，以及 wrapper 未采用请求策略时在 dispatch 前拒绝执行。尚未执行本轮修正的 NPU 集成验证。
 
 ## 继续实现前的验收门槛
 

@@ -2,10 +2,11 @@
 
 import importlib.util
 import io
+import os
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -29,7 +30,14 @@ class TestMC2RecoveryProbe(CustomTestCase):
 
     def setUp(self):
         self.buffers = []
-        self.config = {"hidden": 16, "tokens": 4, "local_experts": 8, "topk": 4}
+        self.config = {
+            "hidden": 16,
+            "tokens": 4,
+            "local_experts": 8,
+            "topk": 4,
+            "strategy": "default",
+        }
+        self.effective_strategy_override = None
         self.output_mode = "correct"
         self.dispatch_mode = "bf16"
         self.comm_name = "candidate_hccl"
@@ -42,6 +50,11 @@ class TestMC2RecoveryProbe(CustomTestCase):
                 self.group = group
                 self.kwargs = kwargs
                 self.moe_all_to_all_group_name = test.comm_name
+                mode = test.effective_strategy_override or os.getenv("DEEP_USE_MODE")
+                self.low_latency_strategy = SimpleNamespace(
+                    get_name=lambda: mode,
+                    comm_alg="hierarchy" if mode == "ops" else None,
+                )
                 test.buffers.append(self)
 
             def low_latency_dispatch(self, x, ids, max_tokens, experts, **kwargs):
@@ -106,12 +119,58 @@ class TestMC2RecoveryProbe(CustomTestCase):
             self.assertFalse(buffer.dispatch_kwargs["async_finish"])
             self.assertEqual(report["max_abs_error"], 0)
             self.assertEqual(report["group_size"], size)
+            self.assertEqual(report["effective_strategy"], "default")
             self.assertEqual(synchronize.call_count, 2)
             self.assertTrue(bool((buffer.ids >= 0).all()))
             self.assertTrue(bool((buffer.ids < buffer.experts).all()))
             for row in buffer.ids:
                 self.assertEqual(row.unique().numel(), self.config["topk"])
         self.assertEqual(len({id(buffer) for buffer in self.buffers}), 3)
+
+    def test_default_strategy_overrides_inherited_ops_for_this_buffer_only(self):
+        group = Mock()
+        group.size.return_value, group.rank.return_value = 4, 1
+        for inherited in ("ops", None):
+            with self.subTest(inherited=inherited), patch.dict(os.environ):
+                if inherited is None:
+                    os.environ.pop("DEEP_USE_MODE", None)
+                else:
+                    os.environ["DEEP_USE_MODE"] = inherited
+                (_, report), _ = self.run_roundtrip(group)
+                self.assertEqual(report["effective_strategy"], "default")
+                self.assertIsNone(report["comm_alg"])
+                self.assertEqual(os.getenv("DEEP_USE_MODE"), inherited)
+
+    def test_explicit_ops_is_reported_without_silent_fallback(self):
+        group = Mock()
+        group.size.return_value, group.rank.return_value = 16, 1
+        self.config["strategy"] = "ops"
+        with patch.dict(os.environ, {"DEEP_USE_MODE": "default"}):
+            (_, report), _ = self.run_roundtrip(group)
+            self.assertEqual(report["effective_strategy"], "ops")
+            self.assertEqual(report["comm_alg"], "hierarchy")
+            self.assertEqual(os.getenv("DEEP_USE_MODE"), "default")
+
+    def test_constructor_failure_restores_environment(self):
+        group = Mock()
+        group.size.return_value, group.rank.return_value = 4, 1
+        with (
+            patch.dict(os.environ, {"DEEP_USE_MODE": "ops"}),
+            patch.object(
+                self.deep_ep.Buffer, "__init__", side_effect=RuntimeError("init failed")
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "init failed"):
+                self.run_roundtrip(group)
+            self.assertEqual(os.getenv("DEEP_USE_MODE"), "ops")
+
+    def test_rejects_wrapper_ignoring_requested_strategy_before_dispatch(self):
+        group = Mock()
+        group.size.return_value, group.rank.return_value = 4, 1
+        self.effective_strategy_override = "ops"
+        with self.assertRaisesRegex(RuntimeError, "strategy mismatch"):
+            self.run_roundtrip(group)
+        self.assertFalse(hasattr(self.buffers[-1], "input"))
 
     def test_rejects_wrong_output_nan_and_wrong_shape(self):
         group = Mock()

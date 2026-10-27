@@ -63,16 +63,49 @@ def _mc2_roundtrip(group, *, original_rank, config, device, synchronize):
     rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(
         max_tokens, hidden, group.size(), num_experts
     )
-    buffer = deep_ep.Buffer(
-        group,
-        0,
-        rdma_bytes,
-        low_latency_mode=True,
-        num_qps_per_rank=local_experts,
-        allow_mnnvl=False,
-    )
+    # This wrapper selects its strategy from DEEP_USE_MODE in Buffer.__init__;
+    # its constructor strategy argument is overwritten by that environment.
+    # Select only this fresh buffer's strategy, then restore the worker's env.
+    inherited_mode = os.environ.get("DEEP_USE_MODE")
+    try:
+        os.environ["DEEP_USE_MODE"] = config["strategy"]
+        buffer = deep_ep.Buffer(
+            group,
+            0,
+            rdma_bytes,
+            low_latency_mode=True,
+            num_qps_per_rank=local_experts,
+            allow_mnnvl=False,
+        )
+    finally:
+        if inherited_mode is None:
+            os.environ.pop("DEEP_USE_MODE", None)
+        else:
+            os.environ["DEEP_USE_MODE"] = inherited_mode
     if getattr(buffer, "moe_all_to_all_group_name", None) == "":
         raise RuntimeError("fresh DeepEP buffer has an empty HCCL communicator name")
+    strategy = getattr(buffer, "low_latency_strategy", None)
+    get_name = getattr(strategy, "get_name", None)
+    effective_strategy = get_name() if callable(get_name) else None
+    if effective_strategy != config["strategy"]:
+        raise RuntimeError(
+            f"DeepEP strategy mismatch: requested {config['strategy']!r}, "
+            f"got {effective_strategy!r} ({type(strategy).__name__})"
+        )
+    buffer_info = {
+        "group_size": group.size(),
+        "compact_rank": group.rank(),
+        "requested_strategy": config["strategy"],
+        "effective_strategy": effective_strategy,
+        "strategy": type(strategy).__name__,
+        "comm_alg": getattr(strategy, "comm_alg", None),
+        "hccl_comm_name": getattr(buffer, "moe_all_to_all_group_name", None),
+    }
+    if group.rank() == 0:
+        print(
+            json.dumps({"stage": "MC2 buffer ready before dispatch", **buffer_info}),
+            flush=True,
+        )
 
     # Small integral values keep the identity result exact in BF16, even when
     # top-k contributions are accumulated in a different order.
@@ -122,16 +155,13 @@ def _mc2_roundtrip(group, *, original_rank, config, device, synchronize):
             f"MC2 identity dispatch/combine mismatch: max_abs_error={error}"
         )
     return buffer, {
+        **buffer_info,
         "success": True,
-        "group_size": group.size(),
-        "compact_rank": group.rank(),
         "num_experts": num_experts,
         "local_experts": local_experts,
         "max_abs_error": error,
         "received_counts": counts.detach().cpu().tolist(),
         "wrapper": str(deep_ep.__file__),
-        "strategy": type(getattr(buffer, "low_latency_strategy", None)).__name__,
-        "hccl_comm_name": getattr(buffer, "moe_all_to_all_group_name", None),
     }
 
 
@@ -284,6 +314,14 @@ def main():
     parser.add_argument("--mc2-local-experts", type=int, default=32)
     parser.add_argument("--mc2-tokens", type=int, default=16)
     parser.add_argument("--mc2-topk", type=int, default=8)
+    parser.add_argument(
+        "--mc2-strategy",
+        choices=("default", "ops"),
+        default="default",
+        help="fresh-buffer strategy, independent of inherited DEEP_USE_MODE; "
+        "default uses custom C++ ops (the torch-npu ops path rejects EP=4 "
+        "on the tested CANN 9.0 stack)",
+    )
     args = parser.parse_args()
     if (
         args.world_size < 3
@@ -303,6 +341,7 @@ def main():
         if args.mc2_topk > min(args.mc2_local_experts, 32):
             parser.error("MC2 probe requires topk <= min(local-experts, 32)")
         mc2_config = {
+            "strategy": args.mc2_strategy,
             "hidden": args.mc2_hidden,
             "local_experts": args.mc2_local_experts,
             "tokens": args.mc2_tokens,
