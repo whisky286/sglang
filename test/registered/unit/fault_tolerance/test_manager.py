@@ -113,6 +113,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
             command="scale_down",
             target_ranks=[0, 1, 3],
             timeout_sec=1,
+            membership_epoch=1,
             active_global_rank_mask=[
                 True,
                 True,
@@ -124,6 +125,28 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
                 True,
             ],
         )
+
+    async def test_successive_membership_changes_have_distinct_controller_epochs(self):
+        manager = make_manager(dp_size=4)
+        manager._shutdown_dp_processes = AsyncMock()
+        manager._send_command_collect = AsyncMock()
+        manager._publish_route_dp_mask = AsyncMock()
+
+        for rank in (2, 3):
+            manager.state.unhealthy_dp_ranks.add(0)
+            status, _ = await manager.apply(
+                {"instruction": "scale_down", "params": {"ranks": [rank]}}
+            )
+            self.assertEqual(status, 200)
+
+        self.assertEqual(
+            [
+                call.kwargs["membership_epoch"]
+                for call in manager._send_command_collect.await_args_list
+            ],
+            [1, 2],
+        )
+        self.assertEqual(manager.state.membership_epoch, 2)
 
     async def test_pause_native_ready_automatically_reopens_route(self):
         manager = make_manager()

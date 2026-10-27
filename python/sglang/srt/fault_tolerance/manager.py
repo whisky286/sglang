@@ -141,6 +141,7 @@ class FaultToleranceManager:
             return 400, ft_failure("cannot_scale_down_all_expected_ranks")
 
         st.ft_operation_in_progress = True
+        st.membership_epoch += 1
         await self._shutdown_dp_processes(requested, timeout)
         await self._send_command_collect(
             command="scale_down",
@@ -151,6 +152,7 @@ class FaultToleranceManager:
             active_global_rank_mask=st.expand_dp_mask_to_global_rank_mask(
                 candidate_dp_mask
             ),
+            membership_epoch=st.membership_epoch,
         )
         await self._publish_route_dp_mask(candidate_dp_mask, timeout)
         return 200, st.finish_scale_down(requested)
@@ -336,6 +338,7 @@ class FaultToleranceManager:
         target_ranks: List[int],
         timeout_sec: int,
         active_global_rank_mask: Optional[List[bool]] = None,
+        membership_epoch: Optional[int] = None,
     ) -> set[int]:
         targets = set(target_ranks)
         if not targets:
@@ -352,6 +355,7 @@ class FaultToleranceManager:
             # This command is consumed by per-scheduler Elastic EP control, so
             # its active_mask remains a physical scheduler/global-rank mask.
             active_mask=active_global_rank_mask,
+            membership_epoch=membership_epoch,
         )
         await self.send_to_scheduler(req)
         try:

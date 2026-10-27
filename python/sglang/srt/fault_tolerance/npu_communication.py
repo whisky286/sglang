@@ -40,10 +40,18 @@ class NpuFTCommunication:
     def rebuild_survivor_groups(
         self,
         active_mask: Sequence[bool],
+        *,
+        membership_epoch: int | None = None,
     ) -> None:
         active_ranks = tuple(rank for rank, active in enumerate(active_mask) if active)
+        if self.original_rank not in active_ranks:
+            raise ValueError("local rank must belong to the candidate membership")
         compact_rank = active_ranks.index(self.original_rank)
-        generation = self.generation + 1
+        generation = (
+            self.generation + 1 if membership_epoch is None else membership_epoch
+        )
+        if type(generation) is not int or generation <= self.generation:
+            raise ValueError("membership_epoch must advance the local generation")
         membership = "".join("1" if active else "0" for active in active_mask)
         prefix = f"npu-ft/{membership}/{generation}"
         timeout = timedelta(seconds=self.timeout_sec)

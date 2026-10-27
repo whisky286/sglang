@@ -20,7 +20,10 @@ class Struct:
 
 
 class FaultToleranceCommandReqInput(Struct):
-    pass
+    def __init__(self, **kwargs):
+        super().__init__(
+            membership_epoch=kwargs.pop("membership_epoch", None), **kwargs
+        )
 
 
 class FaultToleranceCommandReqOutput(Struct):
@@ -318,7 +321,9 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             _ft_release_deferred_kv_cache=Mock(),
         )
         scheduler._recover_npu_fault_tolerance_scale_down = (
-            lambda active_mask: self.recover_scale_down(scheduler, active_mask)
+            lambda active_mask, **kwargs: self.recover_scale_down(
+                scheduler, active_mask, **kwargs
+            )
         )
         return scheduler
 
@@ -388,8 +393,8 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         scheduler.schedule_stream.synchronize.side_effect = lambda: events.append(
             "schedule_sync"
         )
-        model_runner.apply_fault_tolerance_scale_down.side_effect = lambda mask: (
-            events.append(("scale_down", mask))
+        model_runner.apply_fault_tolerance_scale_down.side_effect = (
+            lambda mask, **kwargs: events.append(("scale_down", mask))
         )
         scheduler._ft_release_deferred_kv_cache.side_effect = lambda: events.append(
             "release_deferred_kv"
@@ -399,6 +404,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             command="scale_down",
             target_ranks=[1],
             active_mask=[True, False],
+            membership_epoch=2,
         )
 
         self.handle_command.__globals__["_is_npu"] = True
@@ -420,6 +426,10 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
             ],
         )
         self.assertEqual(output.message, "scaled down")
+
+        model_runner.apply_fault_tolerance_scale_down.assert_called_once_with(
+            [True, False], membership_epoch=2
+        )
 
     def test_retry_does_not_recover_device(self):
         state = SimpleNamespace(
@@ -475,7 +485,7 @@ class TestSchedulerFaultToleranceControl(unittest.TestCase):
         apply_scale_down = (
             scheduler.tp_worker.model_runner.apply_fault_tolerance_scale_down
         )
-        apply_scale_down.assert_called_once_with([True, False])
+        apply_scale_down.assert_called_once_with([True, False], membership_epoch=None)
         scheduler.tp_worker.model_runner.run_npu_fault_tolerance_dummy_batch.assert_not_called()
 
     def test_npu_scale_down_returns_failed_ack_when_dummy_batch_fails(self):

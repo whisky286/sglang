@@ -4573,12 +4573,16 @@ class Scheduler(
             self.disagg_decode_prealloc_queue.enqueue_held_rebootstrap()
         self._engine_paused = False
 
-    def _recover_npu_fault_tolerance_scale_down(self, active_mask: list[bool]) -> None:
+    def _recover_npu_fault_tolerance_scale_down(
+        self, active_mask: list[bool], *, membership_epoch: Optional[int] = None
+    ) -> None:
         model_runner = self.tp_worker.model_runner
         model_runner.recover_npu_device_for_fault_tolerance_scale_down()
 
         with self.device_module.StreamContext(self.schedule_stream):
-            model_runner.apply_fault_tolerance_scale_down(active_mask)
+            model_runner.apply_fault_tolerance_scale_down(
+                active_mask, membership_epoch=membership_epoch
+            )
             self._ft_release_deferred_kv_cache()
 
         self.schedule_stream.synchronize()
@@ -4610,7 +4614,9 @@ class Scheduler(
             model_runner = self.tp_worker.model_runner
             if _is_npu and self.server_args.elastic_ep_backend == "mc2":
                 try:
-                    self._recover_npu_fault_tolerance_scale_down(recv_req.active_mask)
+                    self._recover_npu_fault_tolerance_scale_down(
+                        recv_req.active_mask, membership_epoch=recv_req.membership_epoch
+                    )
                 except Exception as exc:
                     message = f"NPU FT scale-down recovery failed: {exc}"
                     logger.exception("NPU FT scale-down recovery failed")

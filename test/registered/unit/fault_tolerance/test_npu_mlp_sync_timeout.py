@@ -154,6 +154,100 @@ class TestNpuMLPSyncTimeout(CustomTestCase):
         self.assertTrue(context.control_group_uses_cpu)
         self.assertEqual(communication.active_original_ranks, (1, 2, 3))
 
+    def test_returning_process_uses_controller_epoch_instead_of_local_counter(self):
+        prefixes = []
+        with (
+            patch("sglang.srt.utils.init_custom_process_group", return_value=object()),
+            patch(
+                "sglang.srt.distributed.parallel_state.get_moe_ep_group",
+                return_value=Mock(device_group=object()),
+            ),
+            patch(
+                "sglang.srt.fault_tolerance.npu_communication.PrefixStore",
+                side_effect=lambda prefix, store: prefixes.append(prefix) or store,
+            ),
+            patch("sglang.srt.fault_tolerance.npu_communication.dist.barrier"),
+            patch(
+                "sglang.srt.fault_tolerance.npu_communication.set_eplb_process_group_context"
+            ),
+        ):
+            for rank, generation in ((0, 1), (2, 0)):
+                communication = NpuFTCommunication(
+                    store=Mock(),
+                    original_rank=rank,
+                    timeout_sec=5,
+                    mlp_sync_group=object(),
+                    active_original_ranks=(0, 1, 3) if rank == 0 else (2,),
+                    generation=generation,
+                )
+                communication.rebuild_survivor_groups(
+                    [True, True, True, True], membership_epoch=2
+                )
+                self.assertEqual(communication.generation, 2)
+                self.assertEqual(communication.active_original_ranks, (0, 1, 2, 3))
+
+        self.assertEqual(prefixes, ["npu-ft/1111/2/mlp-sync"] * 2)
+
+    def test_rejects_stale_epoch_and_excluded_local_rank_before_building_group(self):
+        communication = NpuFTCommunication(
+            store=Mock(),
+            original_rank=0,
+            timeout_sec=5,
+            mlp_sync_group=object(),
+            active_original_ranks=(0, 1, 3),
+            generation=2,
+        )
+        with patch("sglang.srt.utils.init_custom_process_group") as init_group:
+            for epoch in (1, 2, True):
+                with self.subTest(epoch=epoch):
+                    with self.assertRaisesRegex(ValueError, "membership_epoch"):
+                        communication.rebuild_survivor_groups(
+                            [True, True, True, True], membership_epoch=epoch
+                        )
+            with self.assertRaisesRegex(ValueError, "local rank"):
+                communication.rebuild_survivor_groups(
+                    [False, True, True, True], membership_epoch=3
+                )
+            init_group.assert_not_called()
+        self.assertEqual(communication.generation, 2)
+        self.assertEqual(communication.active_original_ranks, (0, 1, 3))
+
+    def test_failed_candidate_barrier_does_not_install_new_control_group(self):
+        old_group = object()
+        communication = NpuFTCommunication(
+            store=Mock(),
+            original_rank=0,
+            timeout_sec=5,
+            mlp_sync_group=old_group,
+            active_original_ranks=(0, 1, 3),
+            generation=1,
+        )
+        with (
+            patch("sglang.srt.utils.init_custom_process_group", return_value=object()),
+            patch(
+                "sglang.srt.distributed.parallel_state.get_moe_ep_group",
+                return_value=Mock(device_group=object()),
+            ),
+            patch(
+                "sglang.srt.fault_tolerance.npu_communication.PrefixStore",
+                return_value=Mock(),
+            ),
+            patch(
+                "sglang.srt.fault_tolerance.npu_communication.dist.barrier",
+                side_effect=RuntimeError("timeout"),
+            ),
+            patch(
+                "sglang.srt.fault_tolerance.npu_communication.set_eplb_process_group_context"
+            ) as install,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "timeout"):
+                communication.rebuild_survivor_groups(
+                    [True, True, True, True], membership_epoch=2
+                )
+        install.assert_not_called()
+        self.assertIs(communication.mlp_sync_group, old_group)
+        self.assertEqual(communication.generation, 1)
+
     def test_mlp_sync_gather_has_bounded_wait(self):
         work = Mock()
         work.wait.return_value = True

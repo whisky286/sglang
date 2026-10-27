@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
+from sglang.srt.fault_tolerance.recovery import RankRecoveryPlan
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -97,6 +98,66 @@ class TestNpuFaultRecoveryLayout(CustomTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "insufficient survivor"):
             _recover(old_metadata, [True, True, True, False])
+
+    def test_rank_recovery_preserves_repaired_slots_and_restores_routes(self):
+        original = _make_metadata([[0, 0, 1, 1, 2, 2, 3, 3]])
+        shrunk = _recover(original, [True, True, True, False])
+        plan = RankRecoveryPlan(2, (True, True, True, False), (3,))
+
+        restored = ExpertLocationMetadata.init_for_rank_recovery(
+            SimpleNamespace(ep_dispatch_algorithm="dynamic"), shrunk, plan
+        )
+
+        self.assertTrue(
+            torch.equal(
+                restored.physical_to_logical_map_cpu, shrunk.physical_to_logical_map_cpu
+            )
+        )
+        self.assertEqual(restored.physical_to_logical_map_cpu[0, 0].item(), 3)
+        self.assertEqual(restored.ep_size, original.ep_size)
+        self.assertEqual(
+            restored.logical_to_all_physical_map.shape,
+            shrunk.logical_to_all_physical_map.shape,
+        )
+        self.assertEqual(restored.logical_to_all_physical_map_num_valid[0, 3].item(), 3)
+        # Building the candidate must not expose returning slots in live routing.
+        live = shrunk.logical_to_all_physical_map_cpu
+        self.assertFalse((live[live >= 0] >= 6).any().item())
+
+    def test_partial_rank_recovery_keeps_unrecovered_slots_unroutable(self):
+        original = _make_metadata([[0, 1, 2, 3, 0, 1, 2, 3]])
+        shrunk = _recover(original, [True, True, False, False])
+        plan = RankRecoveryPlan(3, (True, True, False, False), (3,))
+
+        restored = ExpertLocationMetadata.init_for_rank_recovery(
+            SimpleNamespace(ep_dispatch_algorithm="dynamic"), shrunk, plan
+        )
+
+        valid = restored.logical_to_all_physical_map_cpu
+        valid = valid[valid >= 0]
+        self.assertFalse(((valid >= 4) & (valid < 6)).any().item())
+        self.assertTrue((valid >= 6).any().item())
+        self.assertTrue(
+            torch.equal(
+                restored.physical_to_logical_map_cpu, shrunk.physical_to_logical_map_cpu
+            )
+        )
+
+    def test_rank_recovery_rejects_incomplete_survivor_coverage(self):
+        original = _make_metadata([[0, 0, 1, 1, 2, 2, 3, 3]])
+        plan = RankRecoveryPlan(2, (True, True, True, False), (3,))
+        with self.assertRaisesRegex(RuntimeError, "complete coverage"):
+            ExpertLocationMetadata.init_for_rank_recovery(
+                SimpleNamespace(ep_dispatch_algorithm="dynamic"), original, plan
+            )
+
+    def test_rank_recovery_rejects_different_launch_capacity(self):
+        original = _make_metadata([[0, 1, 2, 3, 0, 1, 2, 3]])
+        plan = RankRecoveryPlan(2, (True, True, False), (2,))
+        with self.assertRaisesRegex(ValueError, "metadata EP size"):
+            ExpertLocationMetadata.init_for_rank_recovery(
+                SimpleNamespace(ep_dispatch_algorithm="dynamic"), original, plan
+            )
 
 
 if __name__ == "__main__":

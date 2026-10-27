@@ -1941,7 +1941,9 @@ class ModelRunner:
     def synchronize_npu_fault_tolerance_health_gate(self) -> None:
         torch.get_device_module(self.device).synchronize()
 
-    def apply_fault_tolerance_scale_down(self, active_mask: list[bool]) -> None:
+    def apply_fault_tolerance_scale_down(
+        self, active_mask: list[bool], *, membership_epoch: Optional[int] = None
+    ) -> None:
         state = ElasticEPStateManager.instance()
         is_npu_ft_mc2 = _is_npu and self.server_args.elastic_ep_backend == "mc2"
         if is_npu_ft_mc2:
@@ -1949,7 +1951,9 @@ class ModelRunner:
                 get_npu_ft_communication,
             )
 
-            get_npu_ft_communication().rebuild_survivor_groups(active_mask)
+            get_npu_ft_communication().rebuild_survivor_groups(
+                active_mask, membership_epoch=membership_epoch
+            )
 
         mask = torch.as_tensor(
             active_mask,

@@ -60,6 +60,30 @@ class TestNpuMC2ElasticInfo(CustomTestCase):
             [1, 3, 0, 9, 0, -1, 1, 2, 0, 2, 3, -1],
         )
 
+    def test_recovery_restores_capacity_and_mapping_in_existing_storage(self):
+        elastic_info = NpuMC2ElasticInfo.create(
+            [True] * 4, original_ep_size=4, num_physical_experts=12, device="cpu"
+        )
+        address = elastic_info.tensor.data_ptr()
+        physical_ids = torch.tensor([[0, 4, 8, 11]])
+        for mask, expected_ids in (
+            ([True, False, True, True], [[0, -1, 5, 8]]),
+            ([True, True, True, True], [[0, 4, 8, 11]]),
+            ([True, False, True, False], [[0, -1, 5, -1]]),
+            ([True, True, True, False], [[0, 4, 8, -1]]),
+        ):
+            with self.subTest(mask=mask):
+                elastic_info.update(mask)
+                mapped = compact_mc2_physical_expert_ids(
+                    physical_ids,
+                    elastic_info=elastic_info.tensor,
+                    original_ep_size=4,
+                    num_local_physical_experts=3,
+                )
+                self.assertEqual(mapped.tolist(), expected_ids)
+                self.assertEqual(elastic_info.tensor.data_ptr(), address)
+                self.assertEqual(elastic_info.tensor[1].item(), sum(mask))
+
 
 if __name__ == "__main__":
     unittest.main()

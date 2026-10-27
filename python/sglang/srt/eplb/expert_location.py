@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.fault_tolerance.recovery import RankRecoveryPlan
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -354,6 +355,50 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map=logical_to_all_physical_map_cpu.to(
                 old_metadata.physical_to_logical_map.device
             ),
+            moe_ep_rank=moe_ep_rank,
+        )
+
+    @staticmethod
+    def init_for_rank_recovery(
+        server_args: ServerArgs,
+        old_metadata: "ExpertLocationMetadata",
+        recovery_plan: "RankRecoveryPlan",
+        moe_ep_rank: Optional[int] = None,
+    ) -> "ExpertLocationMetadata":
+        """Plan restored routing without moving any existing physical slot.
+
+        Joining ranks must load *all* of their target slots from the current
+        physical-to-logical map before this metadata is installed. Adding a
+        route does not make a restarted rank's checkpoint layout valid.
+        """
+        if len(recovery_plan.previous_active_mask) != old_metadata.ep_size:
+            raise ValueError("recovery plan must match expert metadata EP size")
+
+        num_local = old_metadata.num_local_physical_experts
+        survivor_slots = [
+            rank * num_local + offset
+            for rank, active in enumerate(recovery_plan.previous_active_mask)
+            if active
+            for offset in range(num_local)
+        ]
+        for layer_id, layer_map in enumerate(old_metadata.physical_to_logical_map_cpu):
+            counts = torch.bincount(
+                layer_map[survivor_slots].to(torch.int64),
+                minlength=old_metadata.num_logical_experts,
+            )
+            if bool((counts == 0).any()):
+                raise RuntimeError(
+                    f"surviving experts must have complete coverage before rank recovery "
+                    f"(layer {layer_id})"
+                )
+
+        # The old serving membership already covers every logical expert, so
+        # the minimal-layout builder only adds routes to the returning slots.
+        # Its padded routing tables retain their launch-time capacity.
+        return ExpertLocationMetadata.init_for_fault_recovery(
+            server_args,
+            old_metadata,
+            recovery_plan.target_active_mask,
             moe_ep_rank=moe_ep_rank,
         )
 

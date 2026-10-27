@@ -81,6 +81,8 @@ class FaultToleranceState:
         self.unhealthy_dp_ranks: set[int] = set()
         self.ft_operation_in_progress = False
         self.cluster_paused = False
+        # Assigned by the FT manager, never independently by joining workers.
+        self.membership_epoch = 0
 
     def global_ranks_for_dp(self, dp_rank: int) -> range:
         # FT keeps this mapping local until the upstream topology helper is stable.

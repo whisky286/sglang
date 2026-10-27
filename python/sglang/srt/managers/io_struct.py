@@ -1523,6 +1523,7 @@ class FaultToleranceCommandReqInput(BaseReq, kw_only=True):
     command: Literal["retry", "scale_down"]
     target_ranks: List[int]
     active_mask: Optional[List[bool]] = None
+    membership_epoch: Optional[int] = None
 
 
 class FaultToleranceCommandReqOutput(BaseReq, kw_only=True):
