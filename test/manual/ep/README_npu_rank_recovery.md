@@ -94,6 +94,34 @@ rank 按可见设备的本地编号选择 NPU。探针在父进程保留独立 T
 
 失败时会抛出错误；父进程按超时收集结果并清理自己启动的 worker。旧组保留到 worker 退出，探针没有验证旧故障组的单独销毁契约。
 
+### 目标 NPU 环境首次结果（2026-10-27）
+
+用户按上一轮 HCCL 验证流程运行 `e1cbd28f08` 的探针，报告末尾结果为：
+
+```json
+{"success": true, "scope": "candidate process groups only; MC2 and graph rebind remain unverified"}
+```
+
+这表示探针内的检查已通过：新建候选组的 `4→3→4`、Gloo 原 rank 同步、HCCL all-reduce/P2P，以及幸存进程不重启、同编号 rank 由新进程回归。该结论来自用户反馈，尚未提供完整阶段日志、硬件型号及精确软件版本。它不证明旧 MC2 buffer 或执行图可以复用。
+
+### 下一步：新建低延迟 buffer 的数值验证
+
+当前 `DeepEPBuffer.get_deepep_buffer()` 一旦有缓存就直接返回，不检查新传入的通信组。因此先验证“用新组创建新 buffer”这条路径；不能直接替换 dispatcher 的 group 后继续拿旧 buffer 运行。
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 PYTHONPATH=python \
+  python test/manual/ep/probe_npu_rank_recovery.py \
+  --backend hccl --world-size 4 --fault-rank 2 --mc2 --timeout 120
+```
+
+新增 `--mc2` 模式会在每个阶段创建新的 DeepEP 低延迟 buffer，执行 BF16 dispatch → 恒等专家计算 → combine，并要求输出与输入乘以 top-k 完全相等。每个 rank 的专家槽位数固定（默认 32），候选组内总物理槽位数随成员数变化（默认 128→96→128）；输入路由使用候选组内的连续编号。
+
+首次执行会输出 torch/torch-npu/已安装算子包版本、wrapper 路径、dispatch/combine 签名和 `DEEP_USE_MODE`，各 rank 报告数值误差、接收计数、策略类与可见的 HCCL 通信域名。环境变量沿用现有配置，探针不会擅自切换策略或通信算法。
+
+可按已验证模型调整 `--mc2-hidden`（默认 2048）、`--mc2-local-experts`（32）、`--mc2-tokens`（16）与 `--mc2-topk`（8）。这些参数是否被当前算子支持必须由目标环境验证；`--mc2` 不支持 Gloo 模式。
+
+**本模式仍不验证原 rank 的 `elastic_info`、旧 buffer 复用、执行图重放、专家权重加载或完整模型服务。** 成功只表明新建候选设备组上的全新低延迟 buffer 能完成数值正确的往返。旧 buffer 保留到进程退出，其安全退休方式仍需后续验证。
+
 ## 单元验证
 
 标准依赖环境中可运行：
@@ -101,6 +129,7 @@ rank 按可见设备的本地编号选择 NPU。探针在父进程保留独立 T
 ```bash
 PYTHONPATH=python python -m pytest \
   test/registered/unit/fault_tolerance/test_recovery.py \
+  test/registered/unit/fault_tolerance/test_mc2_recovery_probe.py \
   test/registered/unit/fault_tolerance/test_controller.py \
   test/registered/unit/fault_tolerance/test_manager.py \
   test/registered/unit/fault_tolerance/test_scheduler_control.py \
@@ -113,11 +142,13 @@ PYTHONPATH=python python -m pytest \
 
 本机缺少完整 CUDA/NPU 与 SGLang 依赖，逻辑测试使用隔离加载：实际执行恢复/控制器/manager/专家布局/MC2 模块，替代非相关服务框架导入，并按既有 AST 单元测试方式执行 Scheduler/MLP-sync 逻辑。这是 CPU 逻辑验证，不是完整服务启动或 NPU 集成测试。
 
-本轮该范围的隔离 CPU 验证结果为 **75 passed，20 subtests passed**；另通过真实 Gloo 多进程 `4→3→4` 探针。目标 NPU 软件栈上的 HCCL/MC2 测试尚未运行。
+初始提交的隔离 CPU 验证结果为 **75 passed，20 subtests passed**；另通过真实 Gloo 多进程 `4→3→4` 探针。用户已报告目标 NPU 环境的 HCCL 探针通过；新增 `--mc2` 模式的实机验证仍待执行。
+
+加入 MC2 数值门禁的 CPU mock 测试后，当前隔离验证范围为 **80 passed，24 subtests passed**，并再次通过原有真实 Gloo 多进程流程。新增测试检查每次创建新 buffer、候选组内路由有效且无重复、BF16 模式、数值/NaN/形状/dtype 错误拒绝、空通信域名拒绝，以及 `--mc2` 不得以 Gloo 代替 NPU 执行。
 
 ## 继续实现前的验收门槛
 
-1. 在目标 NPU 环境运行 HCCL 探针，记录精确软件版本和结果。
+1. HCCL 探针已由用户报告通过，后续补齐精确软件版本和完整阶段日志。
 2. 证明 MC2 buffer/handle 如何绑定恢复后的设备通信域；若需要重建或重捕图，明确顺序并实测。
 3. 实现回归进程启动路径，避免默认 WORLD 初始化、加载后 barrier 和图捕获提前等待缺失成员。
 4. 将当前专家布局发送到回归进程，完成全槽位权重加载、格式和覆盖校验。
