@@ -104,11 +104,16 @@ rank 按可见设备的本地编号选择 NPU。探针在父进程保留独立 T
 
 这表示探针内的检查已通过：新建候选组的 `4→3→4`、Gloo 原 rank 同步、HCCL all-reduce/P2P，以及幸存进程不重启、同编号 rank 由新进程回归。该结论来自用户反馈，尚未提供完整阶段日志、硬件型号及精确软件版本。它不证明旧 MC2 buffer 或执行图可以复用。
 
-### 下一步：新建低延迟 buffer 的数值验证
+### 新建低延迟 buffer 的数值验证
 
 当前 `DeepEPBuffer.get_deepep_buffer()` 一旦有缓存就直接返回，不检查新传入的通信组。因此先验证“用新组创建新 buffer”这条路径；不能直接替换 dispatcher 的 group 后继续拿旧 buffer 运行。
 
 ```bash
+DEEPEP_DIR=$(python -c 'import importlib.util,pathlib; print(pathlib.Path(importlib.util.find_spec("deep_ep").origin).parent)')
+DEEPEP_OPP="$DEEPEP_DIR/vendors/hwcomputing"
+export LD_LIBRARY_PATH="$DEEPEP_OPP/op_api/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export ASCEND_CUSTOM_OPP_PATH="$DEEPEP_OPP${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
+
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 PYTHONPATH=python \
   python test/manual/ep/probe_npu_rank_recovery.py \
   --backend hccl --world-size 4 --fault-rank 2 \
@@ -142,7 +147,37 @@ wrapper 的 dispatch/combine 签名包含可选 `elastic_info`。本次没有传
 
 已有提交 `0489321022` 的 `test/manual/ascend/README_fault_tolerance_mc2.md` 记录过同一栈的四卡限制，并要求 EP=4 使用 `DEEP_USE_MODE=default`。该提交中的 fullmesh 修正针对原 EP=16 且传入 `elastic_info` 的 ops 路径，不是本探针的无 `elastic_info` 四卡基线。因此本轮修正明确选择 `default` 并增加生效检查与调用前诊断，保留 `ops` 作为显式选项。
 
-**修正后的 `default` 路径仍待用户在目标 NPU 上重测。** 本次失败不推翻此前候选 HCCL 组验证通过的结果，也不证明 MC2 能够完成 `4→3→4`。
+当时修正后的 `default` 路径仍待实机重测；后续库加载排查和三阶段通过结果见下文。这次失败发生在初始基线，不能用于判断恢复阶段的能力。
+
+### 算子库加载排查与完整 MC2 通过结果（记录于 2026-10-29）
+
+切换 `default` 后，用户首次重测停在 epoch 0，报 `aclnnMoeLowLatencyDispatchV2 or aclnnMoeLowLatencyDispatchV2GetWorkspaceSize not in libopapi.so, or libopapi.so not found`。随后用户在同一 Python 环境检查 DeepEP 包内的 `vendors/hwcomputing/op_api/lib/libcust_opapi.so`：
+
+- 库文件存在，导出了 DispatchV2、CombineV2 及各自 GetWorkspaceSize 四个接口。
+- `ldd` 没有缺失依赖，所列 CANN 用户态依赖均来自 `cann-9.0.0`；驱动库来自 Ascend driver 目录。
+- 按上方命令在启动 Python 前导出自定义库和 OPP 路径后，用户提交了完整三阶段通过日志。这个结果支持优先修正启动环境，而非因报错文本中的 `libopapi.so` 就认定自定义库未安装或必须升级 CANN。
+
+日志中的策略检查和代码位置与 `43e7a02e48` 一致，实机 Git SHA 未单独回报；软件版本与上表一致。以下是对用户完整日志逐条解析核对的结果，不是本机执行的 NPU 测试：
+
+| 阶段 | 活跃原 rank | HCCL 求和 | MC2 组大小 / 总物理专家槽位 | 各 rank 最大绝对误差 |
+|---|---|---|---|---|
+| epoch 0：初始四卡 | `[0,1,2,3]` | `10.0` | `4 / 128` | 全部 `0.0` |
+| epoch 1：杀掉 rank 2 | `[0,1,3]` | `7.0` | `3 / 96` | 全部 `0.0` |
+| epoch 2：新进程补回 rank 2 | `[0,1,2,3]` | `10.0` | `4 / 128` | 全部 `0.0` |
+
+rank 0、1、3 的 PID 在三个阶段分别保持 `235695`、`235698`、`235700`；rank 2 从 `235699` 变为 `259629`。所有报告的成员列表、compact rank、求和、`success` 和 MC2 误差均符合预期。最终 scope 为：
+
+```json
+{"success": true, "scope": "candidate process groups and fresh DeepEP low-latency buffers; original-rank elastic_info, existing buffers, graph replay and model serving remain unverified"}
+```
+
+`environment.DEEP_USE_MODE=ops` 是继承环境值；每个 buffer 的 `effective_strategy=default` 已明确确认实际走自定义算子路径。探针在构造 buffer 后还原环境，所以这两项同时出现符合当前实现。
+
+epoch 1 出现 `indexFromRank 2 ... indexFromCurDevice 3` 警告：本次原 rank 3 继续使用设备 3，而三人候选组内的 compact rank 为 2，二者与探针设计一致；该 rank 的身份、HCCL 与 MC2 数值检查均已通过。此记录只解释本次警告，不将其他运行中的同类警告一概视为无害。
+
+**已证明的能力是：幸存进程不重启时，可以为 `4→3→4` 各阶段创建候选 HCCL 组和全新低延迟 buffer，并让回归新进程参加数值正确的 BF16 dispatch/combine。** 原始 rank 的 `elastic_info` 没有传入；专家槽位总数随候选人数从 128 变为 96 再恢复 128，没有验证固定 128 个逻辑专家的模型在缩容后仍被完整覆盖。
+
+接入服务时下一步先处理候选 buffer 的安装：`DeepEPBuffer.get_deepep_buffer()` 当前有缓存就直接返回，dispatcher 还保存本次 dispatch 的 handle 等状态。需要在暂停且无在途计算的边界准备新组和新 buffer，清理旧 dispatch 状态，绑定成员版本，经全员试跑后发布新成员。首轮优先 eager 路径；旧图不可在更换通信依赖后未经验证继续重放，图支持需独立验证重捕顺序。回归进程按当前专家布局加载全槽位权重、恢复事务和路由提交也仍需实现。旧故障组和 buffer 的安全退休方式尚未验证。
 
 ## 单元验证
 
@@ -164,16 +199,16 @@ PYTHONPATH=python python -m pytest \
 
 本机缺少完整 CUDA/NPU 与 SGLang 依赖，逻辑测试使用隔离加载：实际执行恢复/控制器/manager/专家布局/MC2 模块，替代非相关服务框架导入，并按既有 AST 单元测试方式执行 Scheduler/MLP-sync 逻辑。这是 CPU 逻辑验证，不是完整服务启动或 NPU 集成测试。
 
-初始提交的隔离 CPU 验证结果为 **75 passed，20 subtests passed**；另通过真实 Gloo 多进程 `4→3→4` 探针。用户已报告目标 NPU 环境的 HCCL 探针通过；MC2 首轮实机失败与待重测状态见上文。
+初始提交的隔离 CPU 验证结果为 **75 passed，20 subtests passed**；另通过真实 Gloo 多进程 `4→3→4` 探针。后续用户提交的目标 NPU HCCL/MC2 三阶段通过结果见上文。
 
 加入 MC2 数值门禁的 CPU mock 测试后，当时隔离验证范围为 **80 passed，24 subtests passed**，并再次通过原有真实 Gloo 多进程流程。新增测试检查每次创建新 buffer、候选组内路由有效且无重复、BF16 模式、数值/NaN/形状/dtype 错误拒绝、空通信域名拒绝，以及 `--mc2` 不得以 Gloo 代替 NPU 执行。
 
-本轮策略修正后，隔离 CPU 回归结果为 **84 passed，26 subtests passed**，Ruff 检查通过。新增覆盖默认策略覆盖继承的 `ops`、构造成功/失败后还原环境、显式 `ops` 不自动回退，以及 wrapper 未采用请求策略时在 dispatch 前拒绝执行。尚未执行本轮修正的 NPU 集成验证。
+策略修正后的隔离 CPU 回归结果为 **84 passed，26 subtests passed**，Ruff 检查通过。新增覆盖默认策略覆盖继承的 `ops`、构造成功/失败后还原环境、显式 `ops` 不自动回退，以及 wrapper 未采用请求策略时在 dispatch 前拒绝执行。本次只核对用户新日志和更新记录，没有重跑不变的 CPU 测试；NPU 通过范围以新增实机记录为准。
 
 ## 继续实现前的验收门槛
 
-1. HCCL 探针已由用户报告通过，后续补齐精确软件版本和完整阶段日志。
-2. 证明 MC2 buffer/handle 如何绑定恢复后的设备通信域；若需要重建或重捕图，明确顺序并实测。
+1. 候选 HCCL 与全新 MC2 buffer 的 `4→3→4` 已由用户完整日志确认通过，已记录软件版本、成员和进程身份；后续补齐硬件型号及实机 Git SHA。
+2. 将新 buffer 安装到实际 dispatcher，处理缓存、在途 handle、原 rank 的 `elastic_info` 和固定专家布局；若需要重捕图，明确顺序并实测。探针通过不等于服务已具备这些安装步骤。
 3. 实现回归进程启动路径，避免默认 WORLD 初始化、加载后 barrier 和图捕获提前等待缺失成员。
 4. 将当前专家布局发送到回归进程，完成全槽位权重加载、格式和覆盖校验。
 5. 接入显式恢复事务：准备、暂停、数据面安装、全员试跑、确认、路由提交。确认必须绑定请求与成员版本；新进程心跳不能提前打开路由。
