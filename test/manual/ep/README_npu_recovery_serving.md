@@ -2,7 +2,7 @@
 
 这轮验证单机 eager 服务的 `4→3→4`：原 rank 2 退出后，三卡先恢复生成，再由控制器拉起同编号新进程、重建通信和 DeepEP buffer、加载当前专家布局，最后重新开放四卡请求路由。需要重新启动带 `--enable-npu-ft-recovery` 的服务。
 
-**状态（2026-10-30）：代码和验收脚本已实现，本机检查通过；真实 NPU 模型服务尚未验证。** [上一阶段通信探针](README_npu_rank_recovery.md) 的 HCCL/新 buffer 通过结果来自用户回传，只覆盖其声明的范围。
+**状态（2026-10-30）：代码和验收脚本已实现，本机检查通过；用户实机验证了四卡生成，但两轮均在缩容后的三卡首请求失败，尚未执行 recover。** [上一阶段通信探针](README_npu_rank_recovery.md) 的 HCCL/新 buffer 通过结果来自用户回传，只覆盖其声明的范围。
 
 ## 1. 更新代码并保留已跑通的环境
 
@@ -151,7 +151,36 @@ curl --noproxy '*' --connect-timeout 2 --max-time 8 -sS -o /tmp/npu-server-info-
 
 后续代码使 NPU FT 的小量 MLP 同步元数据从构造、Gloo 汇总到活跃 mask/标量读取都留在 CPU，避免绕回 NPU 流；5 秒控制超时与 NPU 故障超时不变。Scheduler 的 NPU FT 异常新增完整 Python 调用栈；验收脚本在 HTTP 失败事件中保留 status_code、最多 4096 字符的响应正文及截断标记，不自动重试。
 
-本机回归覆盖 NPU device 调用参数下仍不分配 NPU 元数据、单个 prefill rank 与 idle 幸存 rank 混合时的原 rank 槽位、503 具体原因保留和长度限制。**这消除了一个已发现的控制面设备依赖，真实三卡问题是否解决仍待实机结果。** 下一轮先执行一轮验收，完整保留首次失败栈及 response_text。内部缩容健康门只跑 dummy decode，不能代替真实请求的 prefill/decode 验收。
+本机回归覆盖 NPU device 调用参数下仍不分配 NPU 元数据、单个 prefill rank 与 idle 幸存 rank 混合时的原 rank 槽位、503 具体原因保留和长度限制。这消除了一个已发现的控制面设备依赖；**后续实机复测仍失败，详见下节**。内部缩容健康门只跑 dummy decode，不能代替真实请求的 prefill/decode 验收。
+
+### 22:42 复测：前向后的成员检查触发设备超时
+
+用户确认本轮 Git SHA 为 `9c7c52cb8bddb84f991be7e957e3befb8d47f676`，包版本为 Torch 2.10.0、torch-npu 2.10.0.post2、sgl-kernel-npu 2026.6.1、DeepEP 1.0.0+7a396def.cann.9.0.0.b237。四卡生成成功，scale_down 在 4.159 秒返回 success；三卡首请求在 10.672 秒后返回 503，尚未调用 recover。
+
+完整服务端栈显示 rank 0/1/3 均在 `ModelRunner.forward → _maybe_rebalance_after_rank_fault` 中，将 NPU 成员 mask 归约结果转成 Python bool 时，触发 `AclrtSynchronizeStreamWithTimeout(copy_stream)` 超时。此处位于 `_forward_raw` 之后；NPU 工作异步下发，所以该栈确认的是**暴露设备等待的位置**，不能单凭此栈认定成员检查就是底层根因。不能仅跳过 bool 读取、延长超时或重试请求就宣称修复。
+
+用户另行读取实机已安装的 `DefaultLowLatencyCommStrategy` 源码，确认 dispatch 和 combine 都将可选 `elastic_info` 传给 `self.runtime`。因此排除 Python 策略层漏传；该输出没有展示 C++、ACLNN 或实际加载的自定义库，不能由此证明整个算子链正确。当前缩容仍保留原 MC2 数据域和旧 buffer，恢复探针的三卡阶段则使用全新候选组和 buffer，两者范围不同。
+
+下一轮先保持上述代码、模型、冗余专家数和通信参数不变，在**启动新服务的终端、Python 启动前**设置：
+
+```bash
+export ASCEND_LAUNCH_BLOCKING=1
+```
+
+这是 [TorchNPU 官方的同步定位开关](https://github.com/Ascend/pytorch/blob/master/docs/zh/api/environment_variable/op_execution/ASCEND_LAUNCH_BLOCKING.md)，用于尽量将异步错误定位到实际算子调用。它会改变执行时序并降低性能，只用于诊断；如果该模式通过，也不能据此宣布普通异步模式已修复。当前服务已经出现设备异常，先保存旧 server/test 日志和 JSON，再按原停止方式结束专用测试服务、重新启动；仅给客户端设置此变量不生效。
+
+新服务仍使用端口 31000 时，在另一终端运行一轮并使用新文件名：
+
+```bash
+python -u test/manual/ep/verify_npu_recovery_serving.py \
+  --server-pid "$(cat artifacts/npu_ft/server.pid)" \
+  --base-url http://127.0.0.1:31000 \
+  --fault-rank 2 --cycles 1 --timeout 600 \
+  --output artifacts/npu_ft/recovery-report-sync.json \
+  2>&1 | tee artifacts/npu_ft/recovery-test-sync.log
+```
+
+`server.pid` 必须记录这次重新启动的 Python 服务主进程；服务日志另存为 `artifacts/npu_ft/sglang-npu-ft-sync.log`。回传最早的完整 Python traceback、对应 rank/时间和客户端 JSON；若四卡基线也失败，保留该阶段，不能将新错误直接当作缩容根因。诊断后重新启动普通异步服务前执行 `unset ASCEND_LAUNCH_BLOCKING`。
 
 ## 4. 失败或完成后回传的材料
 
