@@ -2,7 +2,25 @@
 
 这轮验证单机 eager 服务的 `4→3→4`：原 rank 2 退出后，三卡先恢复生成，再由控制器拉起同编号新进程、重建通信和 DeepEP buffer、加载当前专家布局，最后重新开放四卡请求路由。需要重新启动带 `--enable-npu-ft-recovery` 的服务。
 
-**状态（2026-10-30）：代码和验收脚本已实现，本机检查通过；用户实机验证了四卡生成，但两轮均在缩容后的三卡首请求失败，尚未执行 recover。** [上一阶段通信探针](README_npu_rank_recovery.md) 的 HCCL/新 buffer 通过结果来自用户回传，只覆盖其声明的范围。
+**状态（2026-10-30）：用户确认当前代码沿用原 `ops + dynamic + 执行图` 命令时缩容后可继续处理请求；此前 `default + static + eager` 验收在三卡首请求失败。完整 recover 尚未实机验证。** 两次实验的故障时机和 victim rank 也不同，尚不能锁定单一差异。[上一阶段通信探针](README_npu_rank_recovery.md) 的 HCCL/新 buffer 结果只覆盖其声明的范围。
+
+## 当前优先实验：保留成功路径，只关闭执行图
+
+用户最新回传：在**当前代码**使用原命令，`DEEP_USE_MODE=ops`、dynamic 路由、128 冗余专家、decode 图 batch size 为 1/2/4/8。在长流式请求执行中杀 rank 1，等 rank 0/2/3 unhealthy、rank 1 dead 后调用 scale_down，随后服务可正常生成。该报告没有附精确 SHA、完整服务端日志和本轮软件元组，按用户回传结论记录，不补造这些字段。
+
+这说明不必再把“旧版原命令 vs 新版原命令”作为首要实验。当前应保留成功的 ops/dynamic/冗余专家、原环境和**长请求中杀 rank 1、等幸存者 unhealthy 后缩容**的步骤，独立重启四卡服务，在原启动命令中只新增：
+
+```bash
+--disable-cuda-graph
+```
+
+原 `--cuda-graph-bs-decode 1 2 4 8` 在全禁用模式下不再用于捕图。该轮不要同时新增 disable-overlap、recovery 开关或同步定位变量，不切换 default/static；服务日志另存，记录实际 SHA 和启动环境。若这一轮失败，差异定位到关闭图后的路径及其交互；若通过，再单独验证关闭 overlap，之后启用 recovery 开关及其要求的标准进程组配置。各阶段尚未实机执行。
+
+自动验收脚本此前在短请求结束后杀 rank 2，只等待 dead 即提交缩容，与用户手动实验不同。不能将两次输出当作只改了策略的严格对照；当前优先重复手动注入方式。若在这一步改变 fault-rank、是否有在途请求或等待条件，应作为独立实验记录。
+
+恢复配置已允许 DeepEP `ops/default` 和 `dynamic/static`，不再强制用户离开已跑通的 ops/dynamic 路径；eager、无 overlap 等恢复限制继续保留。该改动是解除无充分依据的配置限制，**不是已完成 ops 全流程实机恢复验证**。探针不传 elastic_info，服务会传；探针的无 elastic_info/EP=4 ops 失败不能推广为所有 EP=4 服务均不支持 ops。
+
+用户还报告原流式 curl 需 Ctrl+C。当前能确认服务恢复后可处理请求，不能称原长请求自动续上。Ctrl+C 关闭客户端连接，并不能单独证明服务端请求状态已清理。受故障影响的旧请求应明确以错误结束，当前长连接未及时收尾属于待定位问题；请求实际落在哪个 DP rank、本轮 AbortReq/连接日志尚未知，不假设它一定归故障 rank 所有。
 
 ## 1. 更新代码并保留已跑通的环境
 
@@ -23,14 +41,14 @@ DEEPEP_DIR=$(python -c 'import importlib.util,pathlib; print(pathlib.Path(import
 DEEPEP_OPP="$DEEPEP_DIR/vendors/hwcomputing"
 export LD_LIBRARY_PATH="$DEEPEP_OPP/op_api/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export ASCEND_CUSTOM_OPP_PATH="$DEEPEP_OPP${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
-export DEEP_USE_MODE=default
+export DEEP_USE_MODE=ops
 export SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=0
 export SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=0
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
 export PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
-`default` 是上一轮四卡探针跑通的 DeepEP 自定义算子策略。关闭消息队列广播，是为了让回归进程使用新建的 Gloo 控制组；旧广播队列没有重新入组协议。
+这里保留用户完整服务已跑通的 `ops` 策略；下面的独立探针仍通过 `--mc2-strategy default` 选择它已验证的新 buffer 路径，两者范围不同。关闭消息队列广播，是为了让回归进程使用新建的 Gloo 控制组；旧广播队列没有重新入组协议。当前顶部的单变量缩容实验先沿用原环境，不要提前混入本节恢复专用变量。
 
 可以先再次运行原通信探针，确认服务器环境仍正常；已经确认环境没有变化时可直接进入模型验收：
 
@@ -42,7 +60,7 @@ python test/manual/ep/probe_npu_rank_recovery.py \
 
 ## 2. 启动一套专用测试服务
 
-使用之前已能启动的**非量化** Qwen3-30B-A3B 模型目录，替换下面的 `MODEL_PATH`。首次验收先固定模型和软件栈；不要同时打开 PD、执行图或调度重叠。测试会自动结束这套服务下的 rank 2 进程，请使用专用空闲卡。
+以下是后续 eager **恢复候选**命令，先完成顶部的单变量缩容实验再使用。保留已跑通的 ops/dynamic 及 128 冗余专家；使用之前能启动的非量化模型目录。测试会自动结束指定 Scheduler 进程。
 
 ```bash
 MODEL_PATH=/absolute/path/to/Qwen3-30B-A3B
@@ -54,19 +72,20 @@ python -m sglang.launch_server \
   --enable-dp-attention --enable-dp-lm-head \
   --moe-a2a-backend deepep --deepep-mode low_latency \
   --enable-eplb --eplb-algorithm elasticity_aware \
-  --ep-num-redundant-experts 44 \
+  --ep-dispatch-algorithm dynamic --ep-num-redundant-experts 128 \
   --elastic-ep-backend mc2 --enable-fault-tolerance \
   --enable-npu-ft-recovery \
   --fault-tolerance-timeout 600 --fault-tolerance-pause-timeout 900 \
   --disable-cuda-graph --disable-overlap-schedule \
-  --mem-fraction-static 0.65 --max-total-tokens 8192 \
+  --mem-fraction-static 0.5 --max-total-tokens 4096 \
+  --max-running-requests 8 --context-length 2048 \
   --host 127.0.0.1 --port 30000 \
   > /tmp/npu-recovery-server.log 2>&1 &
 SERVER_PID=$!
 echo "$SERVER_PID" > /tmp/npu-recovery-server.pid
 ```
 
-Qwen3-30B-A3B 有 128 个逻辑专家；44 个冗余槽位使物理槽位总数为 172，每卡 43 个，三卡有 129 个槽位，可以覆盖 128 个逻辑专家。此配置只对应这个专家数，换模型时要重新计算。`--max-total-tokens 8192` 固定首轮 KV 容量；可沿用现有环境能启动的内存参数。
+Qwen3-30B-A3B 有 128 个逻辑专家；本轮保留用户验证的 128 个冗余槽位，总共 256 个物理槽位，每卡 64 个，三卡有 192 个，可以覆盖全部逻辑专家。此前 44 冗余槽位的示例是容量下限附近的另一配置，不用于替换本轮已通过参数。其他模型需按实际专家数核对容量。
 
 查看启动日志：
 
@@ -235,7 +254,7 @@ npu-smi info > /tmp/npu-recovery-devices.txt
 
 - 新增显式 `POST /fault_tolerance/apply` 请求：`{"instruction":"recover","params":{"ranks":[2],"timeout":600}}`。必须先完成缩容，且一次恢复全部已移除的原始 ranks；控制器自行启动新进程，不需要手动启动 joiner。
 - 幸存者暂停并清理在途请求；以成员版本隔离新 WORLD/TP/EP HCCL、Gloo 组；回归进程按当前专家布局加载 checkpoint。DeepEP 缓存和旧 dispatch handle 在暂停边界被替换；全员通信与模型 logits 检查通过后才开放路由。
-- 本机用隔离导入/AST 提取的实际模块运行 9 个相关测试文件：105 tests、64 subtests 通过。检查涵盖控制事务、失败门禁、陈旧事件、进程替换、buffer 清理、专家布局、既有缩容及旧版基线验收模式。语法编译通过，针对基线没有新增 F/I lint 问题。本机不是完整 SGLang/NPU 环境。
+- 本机用隔离导入/AST 提取的实际模块运行 9 个相关测试文件：105 tests、73 subtests 通过。新增覆盖 ops/default 与 dynamic/static 配置组合，并保留非法策略、执行图、overlap 等门禁。此前检查涵盖控制事务、失败门禁、进程替换、buffer 清理、专家布局与旧版验收模式。F/I lint 与空白检查通过；本机不是完整 SGLang/NPU 环境。
 - 本机另以真实多进程 Gloo 验证新的 `RecoveryGroups` 默认组替换和原 rank 映射：`4→3→4` 求和 `10→7→10`，由新进程补回 rank 2，由原 rank 2 发起的对象广播正确。它不能替代目标 torch-npu/HCCL 私有接口兼容性验证。
 - 尚未验证：本页真实模型流程、多轮 NPU 显存占用、设备真实硬故障后的重新分配、并发压力和完整输出精度。旧故障组和 buffer 保留到进程退出，避免未经验证的销毁操作；这会增加多轮恢复的内存占用，不保证无限次恢复。
-- 本轮只支持单机、`TP=DP=EP`、Attention TP=1、eager、无调度重叠、DeepEP low_latency/default、非量化模型。PD、多机、执行图和增加原始容量之外的 `4→6` 不在本轮验收范围。
+- 恢复候选允许单机、`TP=DP=EP`、Attention TP=1、eager、无调度重叠、DeepEP low_latency 的 default/ops、static/dynamic 路由、非量化模型；允许配置不等于实机通过。PD、多机、图恢复和超初始容量的 `4→6` 不在本轮验收范围。

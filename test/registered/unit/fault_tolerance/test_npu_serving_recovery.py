@@ -358,7 +358,25 @@ class TestNpuRecoveryRuntime(CustomTestCase):
                 "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER": "0",
             },
         ):
-            self.assertIsNone(recovery_config_error(args))
+            for strategy in ("default", "ops"):
+                for dispatch in (None, "static", "dynamic"):
+                    with (
+                        self.subTest(strategy=strategy, dispatch=dispatch),
+                        patch.dict(os.environ, {"DEEP_USE_MODE": strategy}),
+                        patch.object(
+                            args, "ep_dispatch_algorithm", dispatch, create=True
+                        ),
+                    ):
+                        self.assertIsNone(recovery_config_error(args))
+            for strategy in ("alltoall", "unknown", "ops "):
+                with (
+                    self.subTest(strategy=strategy),
+                    patch.dict(os.environ, {"DEEP_USE_MODE": strategy}),
+                ):
+                    self.assertEqual(
+                        recovery_config_error(args),
+                        "requires_supported_deepep_strategy",
+                    )
             for field, value in {
                 "nnodes": 2,
                 "ep_size": 2,

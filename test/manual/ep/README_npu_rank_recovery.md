@@ -130,6 +130,8 @@ ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 PYTHONPATH=python \
 
 可显式使用 `--mc2-strategy ops` 诊断 torch-npu 路径；不会在失败后自动回退。下面记录的 CANN 9.0 环境中，该路径的 EP=4 基线已经失败，不能据此假设 EP=3 或 `16→15→16` 可用，也不能把切换 fullmesh 当作已验证的卡数限制修复。
 
+**范围补充（2026-10-30）**：上述失败仅针对本探针的**无 elastic_info** 调用。用户后续确认当前完整服务在 ops/dynamic/图模式下，携带 MC2 elastic_info 可以完成四卡生成与缩容后三卡生成；精确本轮 SHA/软件元组未附。不能把探针限制推广为“EP=4 服务必须 default”，也不能反向把服务成功当作 ops 的新 buffer 回归探针已通过。当前恢复配置已允许 ops/dynamic，实机闭环仍待验证。
+
 可按已验证模型调整 `--mc2-hidden`（默认 2048）、`--mc2-local-experts`（32）、`--mc2-tokens`（16）与 `--mc2-topk`（8）。这些参数是否被当前算子支持必须由目标环境验证；`--mc2` 不支持 Gloo 模式。
 
 **本模式仍不验证原 rank 的 `elastic_info`、旧 buffer 复用、执行图重放、专家权重加载或完整模型服务。** 成功只表明新建候选设备组上的全新低延迟 buffer 能完成数值正确的往返。旧 buffer 保留到进程退出，其安全退休方式仍需后续验证。

@@ -318,9 +318,9 @@ def main():
         "--mc2-strategy",
         choices=("default", "ops"),
         default="default",
-        help="fresh-buffer strategy, independent of inherited DEEP_USE_MODE; "
-        "default uses custom C++ ops (the torch-npu ops path rejects EP=4 "
-        "on the tested CANN 9.0 stack)",
+        help="fresh-buffer strategy without elastic_info, independent of inherited "
+        "DEEP_USE_MODE; default uses custom C++ ops (ops rejected EP=4 in this "
+        "probe on the tested CANN 9.0 stack; serving with elastic_info differs)",
     )
     args = parser.parse_args()
     if (

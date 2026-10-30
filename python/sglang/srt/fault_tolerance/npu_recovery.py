@@ -16,7 +16,6 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.fault_tolerance.recovery import RankRecoveryPlan
 
 
@@ -60,18 +59,22 @@ def recovery_config_error(args) -> str | None:
             )
         ),
         "requires_single_tokenizer": getattr(args, "tokenizer_worker_num", 1) == 1,
-        "requires_static_dispatch": getattr(args, "ep_dispatch_algorithm", None)
-        in (None, "static"),
+        # Both routes read the metadata updated at the paused recovery boundary.
+        # Keep the working dynamic path available when validating recovery.
+        "requires_supported_dispatch": getattr(args, "ep_dispatch_algorithm", None)
+        in (None, "static", "dynamic"),
         "requires_standard_process_groups": os.getenv(
             "SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS", "0"
         ).lower()
         not in ("1", "true", "yes", "on")
         and os.getenv("SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "1").lower()
         not in ("1", "true", "yes", "on"),
-        "requires_default_deepep_strategy": os.getenv(
+        # The fresh-buffer probe omitted elastic_info. Its ops tiling failure
+        # does not establish a serving restriction: MC2 serving supplies it.
+        "requires_supported_deepep_strategy": os.getenv(
             "DEEP_USE_MODE", "default"
         ).lower()
-        == "default",
+        in ("default", "ops"),
     }
     return next((name for name, passed in requirements.items() if not passed), None)
 
@@ -86,9 +89,8 @@ class RecoveryGroups:
     retired: list = field(default_factory=list)
 
     def group(self, role: str, ranks, backend: str):
-        from torch.distributed.distributed_c10d import GroupMember, _world
-
         from sglang.srt.utils import init_custom_process_group
+        from torch.distributed.distributed_c10d import GroupMember, _world
 
         ranks = tuple(ranks)
         if self.rank not in ranks:
