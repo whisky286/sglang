@@ -20,6 +20,7 @@ def request_json(session, base_url, method, path, *, timeout_sec, event, **kwarg
     """Log before blocking; never retry a possibly accepted FT mutation."""
     event("http_request_started", method=method, path=path, timeout_sec=timeout_sec)
     started = time.monotonic()
+    response = None
     try:
         response = session.request(
             method, base_url.rstrip("/") + path, timeout=(5, timeout_sec), **kwargs
@@ -27,12 +28,23 @@ def request_json(session, base_url, method, path, *, timeout_sec, event, **kwarg
         response.raise_for_status()
         result = response.json()
     except Exception as exc:
+        details = {}
+        if response is not None and response.status_code >= 400:
+            # HTTPError.__str__ only contains the status and URL. Preserve the
+            # scheduler abort reason instead of losing it behind a generic 503.
+            body = response.text
+            details = {
+                "status_code": response.status_code,
+                "response_text": body[:4096],
+                "response_truncated": len(body) > 4096,
+            }
         event(
             "http_request_failed",
             method=method,
             path=path,
             elapsed_sec=round(time.monotonic() - started, 3),
             error=str(exc),
+            **details,
         )
         raise
     event(

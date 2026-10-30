@@ -625,6 +625,42 @@ class TestNpuRecoveryProbeDiagnostics(CustomTestCase):
         self.assertEqual(events[-1]["stage"], "http_request_failed")
         self.assertEqual(events[-1]["path"], "/server_info")
 
+    def test_http_failure_preserves_bounded_response_body_without_retry(self):
+        probe = self.load_probe()
+        reason = '{"detail":"Request discarded during fault-tolerance recovery: MLP sync failed"}'
+        for body in (reason, reason + "x" * 5000):
+            with self.subTest(length=len(body)):
+                response = SimpleNamespace(
+                    status_code=503,
+                    text=body,
+                    raise_for_status=Mock(
+                        side_effect=RuntimeError("503 Service Unavailable")
+                    ),
+                    json=Mock(),
+                )
+                session = SimpleNamespace(request=Mock(return_value=response))
+                events = []
+                with self.assertRaisesRegex(RuntimeError, "503"):
+                    probe.request_json(
+                        session,
+                        "http://localhost:31000",
+                        "POST",
+                        "/generate",
+                        timeout_sec=600,
+                        event=lambda stage, **details: events.append(
+                            {"stage": stage, **details}
+                        ),
+                        json={"text": "test"},
+                    )
+                failed = events[-1]
+                self.assertEqual(failed["stage"], "http_request_failed")
+                self.assertEqual(failed["status_code"], 503)
+                self.assertTrue(failed["response_text"].startswith(reason))
+                self.assertLessEqual(len(failed["response_text"]), 4096)
+                self.assertEqual(failed["response_truncated"], len(body) > 4096)
+                session.request.assert_called_once()
+                response.json.assert_not_called()
+
     def test_stalled_metadata_has_live_report_and_cannot_inject_a_fault(self):
         probe = self.load_probe()
         output = io.StringIO()

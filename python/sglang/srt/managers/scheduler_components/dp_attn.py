@@ -135,6 +135,12 @@ class MLPSyncBatchInfo:
         group: torch.distributed.ProcessGroup,
         use_all_reduce: bool = False,
     ):
+        npu_ft_comm = get_npu_ft_communication()
+        if npu_ft_comm is not None:
+            # NPU FT uses a CPU Gloo control plane. Do not enqueue NPU copies
+            # or scalar reads here: an unhealthy device stream can otherwise
+            # prevent one survivor from entering the next control collective.
+            device = "cpu"
         local_info_tensor = self._get_local_tensor(device=device)
         fallback_tensor = self._get_fallback_tensor(device=device)
         info_width = local_info_tensor.numel()
@@ -143,7 +149,6 @@ class MLPSyncBatchInfo:
             self.dp_size, self.tp_size * self.cp_size, info_width
         ).contiguous()
 
-        npu_ft_comm = get_npu_ft_communication()
         if npu_ft_comm is not None:
             local_info_cpu = local_info_tensor.detach().cpu().contiguous()
             active_original_ranks = npu_ft_comm.active_original_ranks

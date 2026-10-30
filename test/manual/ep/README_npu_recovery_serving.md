@@ -143,6 +143,16 @@ curl --noproxy '*' --connect-timeout 2 --max-time 8 -sS -o /tmp/npu-server-info-
 
 端口 31000、`artifacts/npu_ft` 对应这次用户实际启动命令；若采用本页最初的示例，应使用 30000 和对应 `/tmp` 日志路径。`status` 的 healthy 仅代表控制器当前记录，不代表所有 Scheduler 都响应控制请求。若验收已经出现 `scheduler_killed`，先检查服务/报告当前成员状态，再决定如何继续，避免重复故障注入。
 
+### 四卡生成成功、缩容返回成功，但三卡首次生成返回 503
+
+2026-10-30 19:35（Asia/Shanghai）的用户报告明确记录实机 SHA 为 `aa435b4ee06d31cdc370e994bb87f78a5039e487`：server_info 在 0.019 秒返回，rank 2 基线生成 16 tokens；结束 rank 2 后 scale_down 在 4.392 秒返回 success；随后的 rank 0 生成在 10.110 秒后返回 HTTP 503。这证明上一节控制消息分发的问题在本次运行中不再阻塞验收，**没有证明三卡服务或 recover 已通过**，报告尚未执行 recover 请求。
+
+用户服务日志显示：三卡 Gloo 组和 EPLB 完成；提交后约 5 秒 rank 1/3 再次 MLP-sync 失败；约 10 秒 rank 0 报 NPU LocalScalarDense 的 copy_stream 同步超时（507046、EE1002），随后状态为 unhealthy/unhealthy/dead/unhealthy。现有日志只保留异常字符串，没有完整 Python 栈，不能仅凭最终超时判定具体模型算子或宣布最终根因。
+
+后续代码使 NPU FT 的小量 MLP 同步元数据从构造、Gloo 汇总到活跃 mask/标量读取都留在 CPU，避免绕回 NPU 流；5 秒控制超时与 NPU 故障超时不变。Scheduler 的 NPU FT 异常新增完整 Python 调用栈；验收脚本在 HTTP 失败事件中保留 status_code、最多 4096 字符的响应正文及截断标记，不自动重试。
+
+本机回归覆盖 NPU device 调用参数下仍不分配 NPU 元数据、单个 prefill rank 与 idle 幸存 rank 混合时的原 rank 槽位、503 具体原因保留和长度限制。**这消除了一个已发现的控制面设备依赖，真实三卡问题是否解决仍待实机结果。** 下一轮先执行一轮验收，完整保留首次失败栈及 response_text。内部缩容健康门只跑 dummy decode，不能代替真实请求的 prefill/decode 验收。
+
 ## 4. 失败或完成后回传的材料
 
 ```bash
@@ -159,7 +169,7 @@ npu-smi info > /tmp/npu-recovery-devices.txt
 
 - 新增显式 `POST /fault_tolerance/apply` 请求：`{"instruction":"recover","params":{"ranks":[2],"timeout":600}}`。必须先完成缩容，且一次恢复全部已移除的原始 ranks；控制器自行启动新进程，不需要手动启动 joiner。
 - 幸存者暂停并清理在途请求；以成员版本隔离新 WORLD/TP/EP HCCL、Gloo 组；回归进程按当前专家布局加载 checkpoint。DeepEP 缓存和旧 dispatch handle 在暂停边界被替换；全员通信与模型 logits 检查通过后才开放路由。
-- 本机用隔离导入/AST 提取的实际模块运行 9 个相关测试文件：101 tests、57 subtests 通过。检查涵盖控制事务、失败门禁、陈旧事件、进程替换、buffer 清理、专家布局、既有缩容。语法编译通过，针对基线没有新增 F/I lint 问题。本机不是完整 SGLang/NPU 环境。
+- 本机用隔离导入/AST 提取的实际模块运行 9 个相关测试文件：103 tests、59 subtests 通过。检查涵盖控制事务、失败门禁、陈旧事件、进程替换、buffer 清理、专家布局、既有缩容。语法编译通过，针对基线没有新增 F/I lint 问题。本机不是完整 SGLang/NPU 环境。
 - 本机另以真实多进程 Gloo 验证新的 `RecoveryGroups` 默认组替换和原 rank 映射：`4→3→4` 求和 `10→7→10`，由新进程补回 rank 2，由原 rank 2 发起的对象广播正确。它不能替代目标 torch-npu/HCCL 私有接口兼容性验证。
 - 尚未验证：本页真实模型流程、多轮 NPU 显存占用、设备真实硬故障后的重新分配、并发压力和完整输出精度。旧故障组和 buffer 保留到进程退出，避免未经验证的销毁操作；这会增加多轮恢复的内存占用，不保证无限次恢复。
 - 本轮只支持单机、`TP=DP=EP`、Attention TP=1、eager、无调度重叠、DeepEP low_latency/default、非量化模型。PD、多机、执行图和增加原始容量之外的 `4→6` 不在本轮验收范围。

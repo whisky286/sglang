@@ -33,7 +33,7 @@ class TestNpuMLPSyncTimeout(CustomTestCase):
         )
 
     @staticmethod
-    def _run_physical_rank_gather(info, communication, gathered_rows):
+    def _run_physical_rank_gather(info, communication, gathered_rows, device="cpu"):
         gathered_rows = torch.tensor(gathered_rows, dtype=torch.int64)
 
         def fake_all_gather(output_tensor, input_tensor, *, group, timeout_sec):
@@ -56,7 +56,35 @@ class TestNpuMLPSyncTimeout(CustomTestCase):
                 ),
             ),
         ):
-            info.all_gather(device="cpu", group=communication.mlp_sync_group)
+            info.all_gather(device=device, group=communication.mlp_sync_group)
+
+    def test_npu_metadata_stays_on_cpu_for_prefill_and_idle_survivors(self):
+        info = self._make_mlp_sync_info(dp_size=4, attn_tp_size=1)
+        communication = NpuFTCommunication(
+            store=Mock(),
+            original_rank=0,
+            timeout_sec=5,
+            mlp_sync_group=Mock(),
+            active_original_ranks=(0, 1, 3),
+            generation=1,
+        )
+        self._run_physical_rank_gather(
+            info,
+            communication,
+            [
+                [6, 1, 0, 1, 1, ForwardMode.EXTEND.value, 0],
+                [0, 0, 1, 0, 1, ForwardMode.IDLE.value, 0],
+                [0, 0, 1, 0, 1, ForwardMode.IDLE.value, 0],
+            ],
+            # A real NPU caller passes its device even though the control PG is
+            # Gloo. This test must run on CPU without allocating any NPU tensor.
+            device="npu:0",
+        )
+        self.assertEqual(info.tp0_info.device.type, "cpu")
+        self.assertEqual(info.global_num_tokens, [6, 0, 0, 0])
+        self.assertEqual(info.global_num_tokens_for_logprob, [1, 0, 0, 0])
+        self.assertTrue(info.is_extend_in_batch)
+        self.assertFalse(info.can_cuda_graph)
 
     def test_mlp_sync_scatter_uses_physical_rank_layout_with_attention_tp(self):
         info = self._make_mlp_sync_info(dp_size=2, attn_tp_size=2)

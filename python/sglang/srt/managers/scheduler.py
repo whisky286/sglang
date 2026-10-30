@@ -1579,6 +1579,9 @@ class Scheduler(
                 # Releasing KV can enqueue NPU work, so report the fault and wait
                 # for device recovery before touching device-backed KV state.
                 if defer_npu_kv_release:
+                    logger.exception(
+                        "NPU FT scheduler iteration failed: dp_rank=%s", self.ps.dp_rank
+                    )
                     self._engine_paused = True
                     self._ft_pause_deadline = (
                         time.monotonic()
