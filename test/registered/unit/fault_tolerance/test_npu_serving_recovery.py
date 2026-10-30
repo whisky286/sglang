@@ -11,13 +11,12 @@ import os
 import sys
 import tempfile
 import unittest
-from contextlib import nullcontext, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import torch
-
 from sglang.srt.fault_tolerance.manager import FaultToleranceManager
 from sglang.srt.fault_tolerance.npu_recovery import (
     RecoveryGroups,
@@ -598,6 +597,159 @@ class TestNpuRecoveryProbeDiagnostics(CustomTestCase):
         probe = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(probe)
         return probe
+
+    def test_scale_down_only_supports_old_server_and_rejects_failed_generation(self):
+        for mode in (
+            "success",
+            "generation_failure",
+            "replacement",
+            "unhealthy",
+            "single_rank",
+        ):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                probe = self.load_probe()
+                alive = {
+                    rank: SimpleNamespace(
+                        pid=100 + rank,
+                        create_time=Mock(return_value=10 + rank),
+                        kill=Mock(),
+                    )
+                    for rank in range(4)
+                }
+                victim = alive[2]
+                victim.kill.side_effect = lambda: alive.pop(2)
+                commands = []
+                paths = []
+
+                def request(method, url, **kwargs):
+                    path = probe.urlsplit(url).path
+                    paths.append(path)
+                    if path == "/fault_tolerance/status":
+                        result = {
+                            "ranks": [
+                                {
+                                    "rank": rank,
+                                    "state": (
+                                        "unhealthy"
+                                        if mode == "unhealthy" and rank == 0
+                                        else "healthy"
+                                        if rank in alive
+                                        else "dead"
+                                    ),
+                                }
+                                for rank in range(1 if mode == "single_rank" else 4)
+                            ]
+                        }
+                    elif path == "/fault_tolerance/apply":
+                        commands.append(kwargs["json"]["instruction"])
+                        self.assertEqual(commands[-1], "scale_down")
+                        result = {"success": True}
+                    elif path == "/generate":
+                        if commands:
+                            self.assertEqual(kwargs["json"]["routed_dp_rank"], 0)
+                            if mode == "generation_failure":
+                                raise TimeoutError("survivor forward timed out")
+                            if mode == "replacement":
+                                alive[0] = SimpleNamespace(
+                                    pid=999, create_time=Mock(return_value=99)
+                                )
+                        result = {
+                            "text": "Paris",
+                            "meta_info": {"completion_tokens": 1},
+                        }
+                    else:
+                        raise AssertionError(f"unexpected old-server endpoint: {path}")
+                    return SimpleNamespace(
+                        status_code=200,
+                        raise_for_status=Mock(),
+                        json=lambda: result,
+                    )
+
+                session = SimpleNamespace(
+                    headers={},
+                    get=Mock(return_value=SimpleNamespace(status_code=200)),
+                    request=Mock(side_effect=request),
+                )
+                report_path = Path(directory) / "report.json"
+                with (
+                    patch.dict(
+                        sys.modules,
+                        {
+                            "psutil": SimpleNamespace(pid_exists=lambda _: True),
+                            "requests": SimpleNamespace(
+                                Session=lambda: session, RequestException=TimeoutError
+                            ),
+                        },
+                    ),
+                    patch.object(
+                        probe, "schedulers", side_effect=lambda _: dict(alive)
+                    ),
+                    patch.object(
+                        probe.importlib.metadata, "version", return_value="test"
+                    ),
+                    patch.object(
+                        probe.subprocess, "check_output", return_value="46147ef9bc"
+                    ),
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "probe",
+                            "--server-pid",
+                            "123",
+                            "--scale-down-only",
+                            "--cycles",
+                            "1",
+                            "--output",
+                            str(report_path),
+                        ],
+                    ),
+                    redirect_stdout(io.StringIO()),
+                ):
+                    if mode == "success":
+                        probe.main()
+                    else:
+                        error = {
+                            "generation_failure": "survivor forward timed out",
+                            "replacement": "survivor scheduler identities changed",
+                            "unhealthy": "requires all ranks healthy",
+                            "single_rank": "requires at least two ranks",
+                        }[mode]
+                        with self.assertRaisesRegex(
+                            (RuntimeError, TimeoutError, ValueError), error
+                        ):
+                            probe.main()
+                report = json.loads(report_path.read_text())
+                self.assertEqual(report["mode"], "scale_down_only")
+                self.assertEqual(report["success"], mode == "success")
+                self.assertEqual(report["git_commit"], "46147ef9bc")
+                self.assertNotIn("/server_info", paths)
+                self.assertEqual(
+                    commands,
+                    [] if mode in ("unhealthy", "single_rank") else ["scale_down"],
+                )
+                if mode == "success":
+                    self.assertIn("rank recovery not exercised", report["scope"])
+                    self.assertEqual(
+                        report["events"][-1]["stage"], "scale_down_verified"
+                    )
+                    victim.kill.assert_called_once()
+                if mode in ("unhealthy", "single_rank"):
+                    victim.kill.assert_not_called()
+
+    def test_scale_down_only_rejects_multiple_cycles_before_injection(self):
+        probe = self.load_probe()
+        with (
+            patch.object(
+                sys, "argv", ["probe", "--server-pid", "123", "--scale-down-only"]
+            ),
+            patch.object(probe, "schedulers") as schedulers,
+            redirect_stderr(io.StringIO()),
+        ):
+            with self.assertRaises(SystemExit) as result:
+                probe.main()
+        self.assertEqual(result.exception.code, 2)
+        schedulers.assert_not_called()
 
     def test_logs_request_before_blocking_and_propagates_failure_without_retry(self):
         probe = self.load_probe()

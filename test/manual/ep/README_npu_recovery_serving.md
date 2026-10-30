@@ -182,6 +182,43 @@ python -u test/manual/ep/verify_npu_recovery_serving.py \
 
 `server.pid` 必须记录这次重新启动的 Python 服务主进程；服务日志另存为 `artifacts/npu_ft/sglang-npu-ft-sync.log`。回传最早的完整 Python traceback、对应 rank/时间和客户端 JSON；若四卡基线也失败，保留该阶段，不能将新错误直接当作缩容根因。诊断后重新启动普通异步服务前执行 `unset ASCEND_LAUNCH_BLOCKING`。
 
+### 对照实习结束时已验证的缩容基线
+
+用户随后明确确认：实习于 2026-09-11 结束前，`npu-ft-0908` 的 **`46147ef9bc`** 已验证缩容后继续推理正常。该信息是用户提供的历史实机结果，应作为已知成功基线；不能将 10 月的新配置失败解释成原来没有实现或验证过缩容续推。
+
+本机对比 `46147ef9bc..9c7c52cb8b`：没有合并上游；报错处的前向后成员 bool 检查、设备 stop/restart/reinit 顺序、MC2 elastic_info 格式、缩容最小专家布局及更新、eager/dummy runner 主体均原已存在。新四卡通信域安装与 buffer 退休方法只在 recover 阶段触发，本轮尚未执行；但共享控制逻辑、成员版本和启动配置有变化，不能据“尚未 recover”排除整个新增分支的影响。9c7c52cb8b 的 CPU MLP 修改发生在第一轮三卡失败之后，也不能解释第一轮失败的起因。
+
+本次恢复验收要求关闭执行图、关闭 overlap、从 dynamic 改为 static 路由，并固定 DeepEP default；这些是本次提出的配置变化，不能未经核对认定为 9 月成功实验的配置。应先建立下列对照，再决定是否需要上节同步算子定位：
+
+| 对照 | 代码 | 参数与环境 | 目的 |
+|---|---|---|---|
+| A | 46147ef9bc | 用户 9 月验证通过的命令；固定当前软件栈 | 确认历史成功条件在当前环境仍成立 |
+| B | 新分支 | 与 A 相同，不启用新 recovery 开关 | 检查新增代码是否破坏原缩容功能 |
+| C | 新分支 | 本次恢复要求的 eager/static 等参数 | A/B 都通过后，再逐项定位新配置或 recovery 开关差异 |
+
+A 失败时先核对软件栈和旧命令差异；A 通过、B 失败时追查新增提交；A/B 通过而 C 失败时逐项切换配置。每次独立启动四卡服务、保存独立日志和报告，不在已缩容/异常的进程上重复注入。新恢复开关要求 eager，因此 B 必须去掉 `--enable-npu-ft-recovery` 才能保留原图配置。
+
+验收脚本新增 `--scale-down-only --cycles 1`：只执行四卡生成、杀指定 rank、scale_down、幸存 rank 真实生成，检查幸存 PID/创建时间保持不变后结束。它直接用 FT status 识别初始成员，不要求恢复开关，也不调用旧版可能卡住的 server_info；不会发送 recover。成功 scope 明确只覆盖缩容。
+
+测试旧版时，先在新分支把脚本复制到独立路径，再切换服务器源码（先保留本地修改，勿强制覆盖）：
+
+```bash
+cp test/manual/ep/verify_npu_recovery_serving.py /tmp/verify_npu_scale_down_baseline.py
+```
+
+用 A 或 B 对应命令启动服务后，在**运行该服务的源码仓库根目录**执行（主进程 PID、端口和输出标签按该轮替换）：
+
+```bash
+python -u /tmp/verify_npu_scale_down_baseline.py \
+  --server-pid "$(cat artifacts/npu_ft/server.pid)" \
+  --base-url http://127.0.0.1:31000 \
+  --fault-rank 2 --scale-down-only --cycles 1 --timeout 600 \
+  --output artifacts/npu_ft/scale-down-baseline-A.json \
+  2>&1 | tee artifacts/npu_ft/scale-down-baseline-A.log
+```
+
+报告的 git_commit 是运行脚本时当前仓库的 HEAD，需与实际服务源码一致；脚本在 /tmp 并不决定服务代码版本。本机隔离回归累计 105 tests、64 subtests 通过，新增模拟旧服务端点、首请求失败、幸存 PID 改变和不健康初始状态的门禁。A/B/C 尚未在本轮 NPU 执行。
+
 ## 4. 失败或完成后回传的材料
 
 ```bash
@@ -198,7 +235,7 @@ npu-smi info > /tmp/npu-recovery-devices.txt
 
 - 新增显式 `POST /fault_tolerance/apply` 请求：`{"instruction":"recover","params":{"ranks":[2],"timeout":600}}`。必须先完成缩容，且一次恢复全部已移除的原始 ranks；控制器自行启动新进程，不需要手动启动 joiner。
 - 幸存者暂停并清理在途请求；以成员版本隔离新 WORLD/TP/EP HCCL、Gloo 组；回归进程按当前专家布局加载 checkpoint。DeepEP 缓存和旧 dispatch handle 在暂停边界被替换；全员通信与模型 logits 检查通过后才开放路由。
-- 本机用隔离导入/AST 提取的实际模块运行 9 个相关测试文件：103 tests、59 subtests 通过。检查涵盖控制事务、失败门禁、陈旧事件、进程替换、buffer 清理、专家布局、既有缩容。语法编译通过，针对基线没有新增 F/I lint 问题。本机不是完整 SGLang/NPU 环境。
+- 本机用隔离导入/AST 提取的实际模块运行 9 个相关测试文件：105 tests、64 subtests 通过。检查涵盖控制事务、失败门禁、陈旧事件、进程替换、buffer 清理、专家布局、既有缩容及旧版基线验收模式。语法编译通过，针对基线没有新增 F/I lint 问题。本机不是完整 SGLang/NPU 环境。
 - 本机另以真实多进程 Gloo 验证新的 `RecoveryGroups` 默认组替换和原 rank 映射：`4→3→4` 求和 `10→7→10`，由新进程补回 rank 2，由原 rank 2 发起的对象广播正确。它不能替代目标 torch-npu/HCCL 私有接口兼容性验证。
 - 尚未验证：本页真实模型流程、多轮 NPU 显存占用、设备真实硬故障后的重新分配、并发压力和完整输出精度。旧故障组和 buffer 保留到进程退出，避免未经验证的销毁操作；这会增加多轮恢复的内存占用，不保证无限次恢复。
 - 本轮只支持单机、`TP=DP=EP`、Attention TP=1、eager、无调度重叠、DeepEP low_latency/default、非量化模型。PD、多机、执行图和增加原始容量之外的 `4→6` 不在本轮验收范围。

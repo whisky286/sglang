@@ -1,7 +1,8 @@
-"""Fault-inject and verify a disposable local, eager NPU recovery server.
+"""Fault-inject and verify a disposable local NPU FT server.
 
 Only scheduler descendants of the explicitly supplied server PID are killed.
 The HTTP server remains running on failure so its logs can be inspected.
+--scale-down-only also works with the pre-recovery serving implementation.
 """
 
 import argparse
@@ -85,6 +86,11 @@ def main():
     parser.add_argument("--base-url", default="http://127.0.0.1:30000")
     parser.add_argument("--fault-rank", type=int, default=2)
     parser.add_argument("--cycles", type=int, default=2)
+    parser.add_argument(
+        "--scale-down-only",
+        action="store_true",
+        help="verify one shrink and survivor generation without requiring rank recovery",
+    )
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--prompt", default="The capital of France is")
     parser.add_argument(
@@ -99,8 +105,11 @@ def main():
         parser.error("the fault injection server must be local")
     if args.cycles <= 0 or args.timeout <= 0:
         parser.error("cycles and timeout must be positive")
+    if args.scale_down_only and args.cycles != 1:
+        parser.error("--scale-down-only requires --cycles 1")
     report = {
         "success": False,
+        "mode": "scale_down_only" if args.scale_down_only else "shrink_recover",
         "started_at": datetime.now(timezone.utc).isoformat(),
         "events": [],
     }
@@ -206,10 +215,24 @@ def main():
             report["versions"][name] = importlib.metadata.version(name)
         event("waiting_for_health", timeout_sec=args.timeout)
         wait_ready()
-        info = request("GET", "/server_info")
-        if not info.get("enable_npu_ft_recovery"):
-            raise RuntimeError("server was not started with --enable-npu-ft-recovery")
-        expected_ranks = set(range(info["dp_size"]))
+        if args.scale_down_only:
+            # The September baseline has no recovery flag and its server_info
+            # fan-out predates the fix. Use the FT status endpoint to discover
+            # its cohort without changing that baseline's launch configuration.
+            status = request("GET", "/fault_tolerance/status")
+            rows = status["ranks"]
+            if not rows or any(row["state"] != "healthy" for row in rows):
+                raise RuntimeError("scale-down baseline requires all ranks healthy")
+            expected_ranks = {row["rank"] for row in rows}
+        else:
+            info = request("GET", "/server_info")
+            if not info.get("enable_npu_ft_recovery"):
+                raise RuntimeError(
+                    "server was not started with --enable-npu-ft-recovery"
+                )
+            expected_ranks = set(range(info["dp_size"]))
+        if len(expected_ranks) < 2:
+            raise ValueError("scale-down verification requires at least two ranks")
         if args.fault_rank not in expected_ranks:
             raise ValueError("fault-rank is outside the serving cohort")
         for cycle in range(args.cycles):
@@ -260,6 +283,18 @@ def main():
                 raise RuntimeError(f"scale-down failed: {reduced}")
             event("scale_down_committed", cycle=cycle, response=reduced)
             generate("survivor_generation", min(expected_ranks - {args.fault_rank}))
+            if args.scale_down_only:
+                after = schedulers(args.server_pid)
+                if set(after) != expected_ranks - {args.fault_rank} or any(
+                    (process.pid, process.create_time()) != identities[rank]
+                    for rank, process in after.items()
+                ):
+                    raise RuntimeError("survivor scheduler identities changed")
+                event(
+                    "scale_down_verified",
+                    pids={rank: process.pid for rank, process in after.items()},
+                )
+                break
             restored = request(
                 "POST",
                 "/fault_tolerance/apply",
@@ -290,7 +325,9 @@ def main():
             generate("recovered_rank_generation", args.fault_rank)
         report["success"] = True
         report["scope"] = (
-            "local eager model serving; scheduler replacement, shrink/recover and forced routing to the restored rank"
+            "local model serving; shrink and survivor generation only; rank recovery not exercised"
+            if args.scale_down_only
+            else "local eager model serving; scheduler replacement, shrink/recover and forced routing to the restored rank"
         )
     except Exception as exc:
         report["error"] = str(exc)
