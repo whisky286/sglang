@@ -1,5 +1,7 @@
 # NPU 原 rank 恢复：第一阶段实现与通信探针
 
+> 2026-10-30 更新：后续已增加显式 eager 服务恢复流程和自动验收脚本，见[真实模型服务验收](README_npu_recovery_serving.md)。该流程尚待 NPU 实机验证；本文第一阶段的功能边界和历史探针结果保留如下。
+
 ## 基线选择
 
 本阶段从 `46147ef9bc`（`fix(npu): use minimal EPLB recovery layout`）开始，开发分支为 `codex/npu-ft-recover`。
@@ -22,7 +24,7 @@ PR 链接：[NPU EPLB #17](https://github.com/gaidandawang-afk/sglang/pull/17)�
 3. **回归专家布局**：`ExpertLocationMetadata.init_for_rank_recovery()` 检查旧幸存者已经完整覆盖逻辑专家，保持物理槽位不变，仅构造恢复后的候选路由。回归进程必须按当前布局加载全部本地槽位，不能把 checkpoint 初始布局当成已验证的 serving 布局。
 4. **通信探针**：真实启动多个进程，杀掉一个中间 rank，在幸存进程中创建候选通信组，再拉起同编号新进程并创建恢复后的通信组，检查 all-gather、all-reduce、P2P 和进程身份。
 
-## 当前明确没有开放的能力
+## 第一阶段没有开放的能力（后续进展见页首）
 
 - 没有新增可接受 NPU `recover` 的 HTTP 操作，也没有移除运行时扩容或 PD 的配置门禁。
 - 没有让新进程直接走 Mooncake `join_group`，也没有将 `reinit_process_group(..., False)` 当作新进程入组接口。

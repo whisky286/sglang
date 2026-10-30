@@ -1531,7 +1531,8 @@ class KVCacheConfigurator:
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
+            distributed=get_world_group().world_size > 1
+            and getattr(self.server_args, "_npu_ft_recovery", None) is None,
             cpu_group=get_world_group().cpu_group,
         )
 

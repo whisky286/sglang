@@ -307,6 +307,42 @@ class DeepEPBuffer:
         )
 
     @classmethod
+    def retire_for_npu_recovery(cls, model, retired):
+        """Called only after the scheduler pauses and synchronizes the device.
+
+        Replacing the process-wide cache is essential: get_deepep_buffer does
+        not compare a new group's identity with the cached buffer's group.
+        Keep old communication objects alive rather than destroying dead PGs.
+        """
+        if not _is_npu:
+            raise RuntimeError("NPU recovery cannot retire a non-NPU DeepEP buffer")
+        state = cls._state()
+        if state.buffer is not None:
+            retired.append(state.buffer)
+        state.buffer = None
+        state.dispatch_mode = None
+        # Handles and split-dispatch callbacks are bound to the old buffer.
+        for module in model.modules():
+            outer = getattr(module, "dispatcher", None)
+            # Fused MoE wraps DeepEP even when two-batch overlap is disabled.
+            for dispatcher in getattr(outer, "_inners", [outer]):
+                if not isinstance(dispatcher, DeepEPDispatcher):
+                    continue
+                from sglang.srt.distributed.parallel_state import get_moe_ep_group
+
+                dispatcher._stage = _Stage.INITIAL
+                for name in ("_dispatch_intermediate_state", "_combine_intermediate_state"):
+                    if hasattr(dispatcher, name):
+                        delattr(dispatcher, name)
+                for name in ("_normal_dispatcher", "_low_latency_dispatcher"):
+                    impl = getattr(dispatcher, name, None)
+                    if impl is not None:
+                        impl.group = get_moe_ep_group().device_group
+                        impl.handle = None
+                        if hasattr(impl, "packed_recv_count"):
+                            impl.packed_recv_count = None
+
+    @classmethod
     def set_dispatch_mode_as_normal(cls):
         cls._state().dispatch_mode = DeepEPDispatchMode.NORMAL
 

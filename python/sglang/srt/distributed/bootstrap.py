@@ -108,7 +108,8 @@ def init_torch_distributed(
     pre_model_load_memory = get_available_gpu_memory(
         device,
         ps.gpu_id,
-        distributed=get_world_group().world_size > 1,
+        distributed=get_world_group().world_size > 1
+        and getattr(server_args, "_npu_ft_recovery", None) is None,
         cpu_group=get_world_group().cpu_group,
     )
     tp_group = get_tp_group()
@@ -207,6 +208,11 @@ def _init_parallel_groups(
         rank_offset + tp_size * pp_size if is_scale_joiner else tp_size * pp_size
     )
     rank = rank_offset + tp_size * pp_rank + tp_rank
+
+    if getattr(server_args, "_npu_ft_recovery", None) is not None:
+        from sglang.srt.fault_tolerance.npu_recovery import begin_joiner_bootstrap
+
+        begin_joiner_bootstrap(server_args, gpu_id=gpu_id, rank=rank)
 
     init_distributed_environment(
         backend=backend,

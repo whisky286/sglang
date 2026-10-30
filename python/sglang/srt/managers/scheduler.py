@@ -592,6 +592,11 @@ class Scheduler(
 
         self.init_batch_result_processor()
 
+        if getattr(server_args, "_npu_ft_recovery", None) is not None:
+            from sglang.srt.fault_tolerance.npu_recovery import mark_joiner_loaded
+
+            mark_joiner_loaded(self)
+
         self.is_initializing = False
 
     def init_zbal_on_npu(self):
@@ -4603,6 +4608,9 @@ class Scheduler(
         if rank not in recv_req.target_ranks:
             return None
 
+        if recv_req.command.startswith("recover_"):
+            return self._handle_npu_recovery_command(recv_req)
+
         if recv_req.command == "retry":
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
@@ -4649,6 +4657,70 @@ class Scheduler(
             success=True,
             message=message,
         )
+
+    def _handle_npu_recovery_command(self, request):
+        from sglang.srt.fault_tolerance.npu_communication import (
+            get_npu_ft_communication,
+        )
+        from sglang.srt.fault_tolerance.npu_recovery import (
+            prepare_survivor,
+            validate_cohort,
+        )
+
+        try:
+            if not self.server_args.enable_npu_ft_recovery:
+                raise ValueError("NPU recovery was not enabled at launch")
+            if request.command == "recover_pause":
+                if request.membership_epoch <= get_npu_ft_communication().generation:
+                    raise ValueError("stale NPU recovery pause")
+                self._engine_paused = True
+                self._ft_pause_deadline = (
+                    time.monotonic() + self.server_args.fault_tolerance_timeout
+                )
+                self.device_module.synchronize()
+                if not self._ft_discard_inflight_window("explicit NPU rank recovery"):
+                    raise RuntimeError("could not discard the in-flight request window")
+                self.device_module.synchronize()
+            elif request.command == "recover_prepare":
+                if not self._engine_paused:
+                    raise ValueError("NPU recovery requires a paused scheduler")
+                prepare_survivor(self, request)
+                self._ft_recovery_epoch = request.membership_epoch
+                self._ft_recovery_validated = False
+            elif request.command == "recover_validate":
+                if not self._engine_paused or request.membership_epoch != getattr(
+                    self, "_ft_recovery_epoch", None
+                ):
+                    raise ValueError("NPU validation must match the prepared epoch")
+                validate_cohort(self, request)
+                self._ft_recovery_validated = True
+            elif request.command == "recover_commit":
+                if (
+                    not getattr(self, "_ft_recovery_validated", False)
+                    or request.membership_epoch != self._ft_recovery_epoch
+                ):
+                    raise ValueError("NPU commit requires a successful cohort health check")
+                self.server_args.override("npu_ft.recover_committed", _npu_ft_recovery=None)
+                self._engine_paused = False
+                self._ft_pause_deadline = None
+                self._ft_recovery_validated = False
+            else:
+                raise ValueError("unknown NPU recovery command")
+            return FaultToleranceCommandReqOutput(
+                request_id=request.request_id,
+                rank=self.ps.dp_rank,
+                success=True,
+                message=request.command,
+            )
+        except Exception as exc:
+            self._engine_paused = True
+            logger.exception("NPU recovery command failed")
+            return FaultToleranceCommandReqOutput(
+                request_id=request.request_id,
+                rank=self.ps.dp_rank,
+                success=False,
+                message=str(exc),
+            )
 
     def _check_ft_pause_deadline(self) -> None:
         deadline = self._ft_pause_deadline

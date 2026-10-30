@@ -302,7 +302,12 @@ def dist_barrier_after_load(
     elastic_ep_backend: Optional[str],
     tp_rank: int,
     is_ep_joiner: bool = False,
+    is_npu_ft_joiner: bool = False,
 ) -> None:
+    if is_npu_ft_joiner:
+        # Survivors already own weights. Explicit cohort validation replaces
+        # the startup load barrier; the replacement remains admission-paused.
+        return
     if elastic_ep_backend == "mooncake":
         # Mooncake does not support `monitored_barrier`
         if not is_ep_joiner:

@@ -169,7 +169,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.state.pending_recovery_global_ranks, set())
         self.assertEqual(manager.status()[1]["ranks"][1]["state"], "healthy")
 
-    async def test_recover_instruction_is_not_an_ft_api(self):
+    async def test_recover_requires_explicit_npu_opt_in(self):
         manager = make_manager()
 
         status, response = await manager.apply(
@@ -177,7 +177,7 @@ class TestFaultToleranceManager(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(status, 400)
-        self.assertIn("unsupported instruction: recover", response["message"])
+        self.assertEqual(response["message"], "recover_requires_enable_npu_ft_recovery")
 
     async def test_native_ready_before_process_up_still_auto_recovers(self):
         manager = make_manager()

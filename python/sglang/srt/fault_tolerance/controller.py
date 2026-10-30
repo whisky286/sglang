@@ -197,6 +197,22 @@ class FaultToleranceState:
         body["removed_ranks"] = removed
         return body
 
+    def finish_recover(self, ranks: Iterable[int]) -> Dict[str, Any]:
+        restored = sorted(set(ranks))
+        for rank in restored:
+            self.expected_dp_mask[rank] = True
+            self.native_active_dp_mask[rank] = True
+            for member in self.global_ranks_for_dp(rank):
+                self.process_alive_global_rank_mask[member] = True
+                self.pending_recovery_global_ranks.discard(member)
+        self.unhealthy_dp_ranks.clear()
+        self.ft_operation_in_progress = False
+        self.cluster_paused = False
+        body = self._success("fault_tolerance_recover_committed")
+        body["recovered_ranks"] = restored
+        body["membership_epoch"] = self.membership_epoch
+        return body
+
     def _success(self, message: str) -> Dict[str, Any]:
         body = self.status_response()
         body.update({"success": True, "message": message})

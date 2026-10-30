@@ -361,17 +361,29 @@ class GroupCoordinator:
                 )
                 active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
                 pg_options = get_torch_distributed_pg_options(group_name)
-                device_group = torch.distributed.new_group(
-                    ranks,
-                    backend=torch_distributed_backend,
-                    pg_options=pg_options,
-                    timeout=subgroup_timeout,
-                )
-                # a group with `gloo` backend, to allow direct coordination
-                # between processes through the CPU.
-                cpu_group = torch.distributed.new_group(
-                    ranks, backend="gloo", timeout=gloo_timeout
-                )
+                recovery = None
+                if _is_npu:
+                    from sglang.srt.fault_tolerance.npu_recovery import (
+                        current_recovery_groups,
+                    )
+
+                    recovery = current_recovery_groups()
+                if recovery is not None:
+                    device_group = recovery.group(
+                        group_name, ranks, torch_distributed_backend
+                    )
+                    cpu_group = recovery.group(group_name, ranks, "gloo")
+                else:
+                    device_group = torch.distributed.new_group(
+                        ranks,
+                        backend=torch_distributed_backend,
+                        pg_options=pg_options,
+                        timeout=subgroup_timeout,
+                    )
+                    # CPU metadata/control communication.
+                    cpu_group = torch.distributed.new_group(
+                        ranks, backend="gloo", timeout=gloo_timeout
+                    )
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import math
 import os
 import time
 import uuid
@@ -14,6 +15,7 @@ from sglang.srt.managers.io_struct import (
     ActiveRanksUpdateReqOutput,
     FaultToleranceCommandReqInput,
     FaultToleranceCommandReqOutput,
+    FaultToleranceDPCRecoverReqInput,
     FaultToleranceDPCShutdownReqInput,
     FaultToleranceRankFaultOutput,
     ProcessActiveRanksOutput,
@@ -61,6 +63,9 @@ class FaultToleranceManager:
         self._watchdog_leases: Dict[int, Tuple[float, Tuple[int, ...]]] = {}
         self._watchdog_lease_task: Optional[asyncio.Task] = None
         self._route_dp_mask = [True] * server_args.dp_size
+        self._process_event_floor_epoch = 0
+        self._recovering_epoch = None
+        self._recovery_exited_ranks: set[int] = set()
 
     def bind_event_loop(self, loop) -> None:
         if self.event_loop is loop:
@@ -77,15 +82,25 @@ class FaultToleranceManager:
 
     def _parse_apply_args(self, obj: Dict[str, Any]) -> Tuple[str, List[int], int]:
         instruction = obj["instruction"]
-        if instruction not in ("retry", "scale_down"):
+        if instruction not in ("retry", "scale_down", "recover"):
             raise ValueError(f"unsupported instruction: {instruction}")
         params = obj["params"]
         timeout = params.get("timeout", self.server_args.fault_tolerance_timeout)
         ranks = params.get("ranks", [])
-        if timeout <= 0:
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
             raise ValueError("timeout must be positive")
-        if any(rank < 0 or rank >= self.state.dp_size for rank in ranks):
+        if not isinstance(ranks, list) or any(
+            type(rank) is not int or rank < 0 or rank >= self.state.dp_size
+            for rank in ranks
+        ):
             raise ValueError("rank out of range")
+        if len(set(ranks)) != len(ranks):
+            raise ValueError("ranks must be unique")
         return instruction, ranks, timeout
 
     async def apply(self, obj: Dict[str, Any]) -> tuple[int, dict]:
@@ -99,6 +114,8 @@ class FaultToleranceManager:
         try:
             if instruction == "retry":
                 return await self._apply_retry(timeout)
+            if instruction == "recover":
+                return await self._apply_recover(ranks, timeout)
             return await self._apply_scale_down(ranks, timeout)
         except Exception as exc:
             self._failstop(f"fault tolerance apply {instruction} failed: {exc}")
@@ -161,6 +178,77 @@ class FaultToleranceManager:
         if not 0 <= rank < len(self._route_dp_mask) or not self._route_dp_mask[rank]:
             raise ValueError(f"routed_dp_rank={rank} is not active")
 
+    async def _apply_recover(self, ranks: List[int], timeout: int) -> tuple[int, dict]:
+        st = self.state
+        if not getattr(self.server_args, "enable_npu_ft_recovery", False):
+            return 400, ft_failure("recover_requires_enable_npu_ft_recovery")
+        removed = {rank for rank, active in enumerate(st.expected_dp_mask) if not active}
+        if not ranks or set(ranks) != removed:
+            return 400, ft_failure("recover_requires_all_removed_original_ranks")
+        if st.has_incident():
+            return 400, ft_failure("recover_requires_healthy_survivors")
+        if not any(0 in owned for _, owned in self._watchdog_leases.values()):
+            return 409, ft_failure("recover_requires_live_local_watchdog")
+        st.ft_operation_in_progress = True
+        st.membership_epoch += 1
+        self._recovering_epoch = st.membership_epoch
+        self._recovery_exited_ranks.clear()
+        previous = st.expand_dp_mask_to_global_rank_mask(st.expected_dp_mask)
+        target = [True] * st.dp_size
+        survivors = st.expected_dp_ranks()
+        await self._send_command_collect(
+            command="recover_pause",
+            target_ranks=survivors,
+            timeout_sec=timeout,
+            membership_epoch=st.membership_epoch,
+        )
+        # Start PG construction on survivors before the DPC starts replacements.
+        prepare = asyncio.create_task(
+            self._send_command_collect(
+                command="recover_prepare",
+                target_ranks=survivors,
+                timeout_sec=timeout,
+                active_global_rank_mask=[True] * st.global_rank_count,
+                previous_active_mask=previous,
+                membership_epoch=st.membership_epoch,
+            )
+        )
+        try:
+            await self.send_to_dpc(
+                [0],
+                FaultToleranceDPCRecoverReqInput(
+                    target_dp_ranks=sorted(removed),
+                    membership_epoch=st.membership_epoch,
+                    previous_active_mask=previous,
+                ),
+            )
+            await prepare
+        finally:
+            if not prepare.done():
+                prepare.cancel()
+                await asyncio.gather(prepare, return_exceptions=True)
+        await self._send_command_collect(
+            command="recover_validate",
+            target_ranks=list(range(st.dp_size)),
+            timeout_sec=timeout,
+            active_global_rank_mask=[True] * st.global_rank_count,
+            membership_epoch=st.membership_epoch,
+        )
+        if self._recovery_exited_ranks:
+            raise RuntimeError("scheduler exited during NPU recovery validation")
+        await self._publish_route_dp_mask(target, timeout)
+        await self._send_command_collect(
+            command="recover_commit",
+            target_ranks=list(range(st.dp_size)),
+            timeout_sec=timeout,
+            membership_epoch=st.membership_epoch,
+        )
+        if self._recovery_exited_ranks:
+            raise RuntimeError("scheduler exited during NPU recovery commit")
+        self._process_event_floor_epoch = st.membership_epoch
+        self._recovering_epoch = None
+        return 200, st.finish_recover(ranks)
+
     def should_reject_admission(self) -> bool:
         return self.state.should_reject_admission(self._route_dp_mask)
 
@@ -174,7 +262,10 @@ class FaultToleranceManager:
 
     def _auto_recover_ready_dps(self) -> List[int]:
         st = self.state
-        if st.ft_operation_in_progress:
+        if st.ft_operation_in_progress or (
+            getattr(self.server_args, "device", None) == "npu"
+            and getattr(self.server_args, "elastic_ep_backend", None) == "mc2"
+        ):
             return []
 
         process_alive_dp_mask = st.process_alive_dp_mask()
@@ -226,6 +317,11 @@ class FaultToleranceManager:
     def observe_process_active_ranks(
         self, ranks: ProcessActiveRanksOutput
     ) -> Optional[ActiveRanksOutput]:
+        epoch = ranks.membership_epoch
+        if epoch is not None and epoch < self._process_event_floor_epoch:
+            return None
+        if not ranks.active and epoch is not None and epoch == self._recovering_epoch:
+            self._recovery_exited_ranks.update(ranks.ranks)
         self.state.observe_process_active_ranks(ranks.ranks, active=ranks.active)
         self._finish_shutdown_if_ready()
         return self._route_after_observation(self._auto_recover_ready_dps())
@@ -275,6 +371,11 @@ class FaultToleranceManager:
         pending = self._pending_commands.get(output.request_id)
         if pending is None:
             logger.warning("Unknown fault tolerance command ack: rank=%s", output.rank)
+            return
+        if (
+            output.rank not in pending.target_ranks
+            or output.rank in pending.acked.union(pending.failed)
+        ):
             return
         if output.success:
             pending.acked.add(output.rank)
@@ -339,6 +440,7 @@ class FaultToleranceManager:
         timeout_sec: int,
         active_global_rank_mask: Optional[List[bool]] = None,
         membership_epoch: Optional[int] = None,
+        previous_active_mask: Optional[List[bool]] = None,
     ) -> set[int]:
         targets = set(target_ranks)
         if not targets:
@@ -356,6 +458,7 @@ class FaultToleranceManager:
             # its active_mask remains a physical scheduler/global-rank mask.
             active_mask=active_global_rank_mask,
             membership_epoch=membership_epoch,
+            previous_active_mask=previous_active_mask,
         )
         await self.send_to_scheduler(req)
         try:

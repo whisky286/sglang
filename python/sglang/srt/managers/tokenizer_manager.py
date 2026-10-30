@@ -34,7 +34,17 @@ from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 from http import HTTPStatus
-from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import fastapi
 import pybase64
@@ -71,6 +81,7 @@ from sglang.srt.managers.io_struct import (
     ElasticScaleUpdateReq,
     EmbeddingReqInput,
     FaultToleranceCommandReqOutput,
+    FaultToleranceDPCRecoverReqInput,
     FaultToleranceDPCShutdownReqInput,
     FaultToleranceRankFaultOutput,
     FreezeGCReq,
@@ -486,7 +497,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
 
     async def _async_send_to_dpc(
-        self, nodes: List[int], obj: FaultToleranceDPCShutdownReqInput
+        self,
+        nodes: List[int],
+        obj: Union[FaultToleranceDPCShutdownReqInput, FaultToleranceDPCRecoverReqInput],
     ) -> None:
         for node in nodes:
             await async_sock_send(self._dpc_control_sockets[node], obj)

@@ -267,6 +267,11 @@ class ModelRunner:
         self.dcp_rank = ps.tp_rank % self.dcp_size
         self.ps = ps
         self.model_config = model_config
+        if (
+            getattr(server_args, "enable_npu_ft_recovery", False)
+            and model_config.quantization is not None
+        ):
+            raise ValueError("NPU FT recovery currently requires a non-quantized model")
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
@@ -629,8 +634,15 @@ class ModelRunner:
             if self.server_args.is_ep_scale_joiner
             else 0
         )
+        from sglang.srt.fault_tolerance.npu_recovery import joiner_metadata
+
+        recovery_metadata = joiner_metadata(
+            self.server_args, self.model_config, expert_rank
+        )
         set_global_expert_location_metadata(
-            compute_initial_expert_location_metadata(
+            recovery_metadata
+            if recovery_metadata is not None
+            else compute_initial_expert_location_metadata(
                 server_args=self.server_args,
                 model_config=self.model_config,
                 moe_ep_rank=expert_rank,
@@ -1111,6 +1123,8 @@ class ModelRunner:
             elastic_ep_backend=self.server_args.elastic_ep_backend,
             tp_rank=self.ps.tp_rank,
             is_ep_joiner=self.server_args.is_ep_joiner,
+            is_npu_ft_joiner=getattr(self.server_args, "_npu_ft_recovery", None)
+            is not None,
         )
 
     def maybe_init_dwdp(self):
@@ -1932,8 +1946,10 @@ class ModelRunner:
         torch_npu.distributed.reinit_process_group(None, False)
         torch.npu.synchronize()
 
-    def run_npu_fault_tolerance_dummy_batch(self, active_mask: list[bool]) -> None:
-        self.eager_runner.run_dummy_via_model_runner(
+    def run_npu_fault_tolerance_dummy_batch(
+        self, active_mask: list[bool]
+    ) -> "ModelRunnerOutput":
+        return self.eager_runner.run_dummy_via_model_runner(
             batch_size=1,
             active_mask=active_mask,
         )

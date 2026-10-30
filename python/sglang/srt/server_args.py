@@ -1033,6 +1033,13 @@ class ServerArgs:
         "Enable the DP-only fault-tolerance control plane.",
         NS("parallel"),
     ] = False
+    enable_npu_ft_recovery: A[
+        bool,
+        Arg(
+            help="Enable explicit original-rank recovery on a single-node eager NPU MC2 server."
+        ),
+        NS("parallel"),
+    ] = False
     fault_tolerance_on_error_strategy: A[
         Literal["pause", "continue"],
         "Fault-tolerance strategy for scheduler exceptions.",
@@ -3801,6 +3808,12 @@ class ServerArgs:
             return
 
     def _handle_fault_tolerance(self):
+        if getattr(self, "enable_npu_ft_recovery", False):
+            from sglang.srt.fault_tolerance.npu_recovery import recovery_config_error
+
+            error = recovery_config_error(self)
+            if error is not None:
+                raise ValueError(f"NPU FT recovery unsupported config: {error}")
         if not self.enable_fault_tolerance:
             return
 

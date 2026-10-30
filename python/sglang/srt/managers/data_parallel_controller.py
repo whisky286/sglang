@@ -13,6 +13,7 @@
 # ==============================================================================
 """A controller that dispatches requests to multiple data parallel workers."""
 
+import copy
 import faulthandler
 import logging
 import multiprocessing as mp
@@ -37,6 +38,7 @@ from sglang.srt.managers.io_struct import (
     BlockReqInput,
     ElasticScaleUpdateReq,
     FaultToleranceCommandReqInput,
+    FaultToleranceDPCRecoverReqInput,
     FaultToleranceDPCShutdownReqInput,
     ProcessActiveRanksOutput,
     ProfileReq,
@@ -223,6 +225,9 @@ class DataParallelController:
         self.scheduler_procs = []
         self.scheduler_process_dp_ranks: List[int] = []
         self.scheduler_process_global_ranks: List[int] = []
+        self._scheduler_launch_specs = {}
+        self._npu_recovery_readers = {}
+        self._watchdog_event_epoch = 0
         self.workers: List[Optional[zmq.Socket]] = [None] * self.max_dp_size
         self.status: List[bool] = list(self.dp_active)
         self._active_workers: List[int] = list(range(self.launch_dp_size))
@@ -304,6 +309,86 @@ class DataParallelController:
             if dp_rank in targets and proc.is_alive():
                 proc.kill()
 
+    def recover_dp(self, obj: FaultToleranceDPCRecoverReqInput):
+        if not self.server_args.enable_npu_ft_recovery:
+            raise ValueError("NPU recovery was not enabled at launch")
+        targets = set(obj.target_dp_ranks)
+        indices = [
+            i for i, rank in enumerate(self.scheduler_process_dp_ranks) if rank in targets
+        ]
+        if {self.scheduler_process_dp_ranks[i] for i in indices} != targets:
+            raise ValueError("recovery contains a rank not owned by this DPC")
+        if any(self.scheduler_procs[i].is_alive() for i in indices):
+            raise ValueError("cannot replace a live scheduler")
+        # The watchdog keeps per-index exit markers. Restart it after replacing
+        # handles, so a second failure of the same original rank is observable.
+        self._scheduler_watchdog.stop()
+        self._watchdog_event_epoch = obj.membership_epoch
+        for index in indices:
+            rank = self.scheduler_process_global_ranks[index]
+            self.scheduler_procs[index].join(timeout=1)
+            args = list(self._scheduler_launch_specs[rank])
+            replacement_args = copy.deepcopy(self.server_args)
+            replacement_args.override(
+                "npu_ft.recover_startup",
+                _npu_ft_recovery={
+                    "endpoint": self.port_args.fault_tolerance_metadata_ipc_name,
+                    "plan": {
+                        "membership_epoch": obj.membership_epoch,
+                        "previous_active_mask": obj.previous_active_mask,
+                        "recovering_ranks": sorted(targets),
+                    },
+                },
+            )
+            reader, writer = mp.Pipe(duplex=False)
+            args[0], args[9] = replacement_args, writer
+            process = mp.Process(target=self.run_scheduler_process_func, args=tuple(args))
+            with numa_utils.configure_subprocess(replacement_args, args[2]):
+                process.start()
+            writer.close()
+            self.scheduler_procs[index] = process
+            self._npu_recovery_readers[rank] = (
+                reader,
+                time.monotonic() + self.server_args.fault_tolerance_timeout,
+            )
+        # Never wait for model startup here: survivors' prepare commands must
+        # still be forwarded by this event loop while joiners construct PGs.
+        self._scheduler_watchdog = SubprocessWatchdog(
+            processes=self.scheduler_procs,
+            process_names=[
+                f"scheduler_rank_{rank}" for rank in self.scheduler_process_global_ranks
+            ],
+            on_exit=self._handle_scheduler_process_exit,
+            on_poll=self._report_watchdog_heartbeat,
+            on_thread_stop=self._close_watchdog_sender,
+            interval=FT_WATCHDOG_POLL_INTERVAL,
+            fail_stop_on_exit=False,
+            report_clean_exit=True,
+        )
+        self._report_initial_watchdog_heartbeat()
+        self._scheduler_watchdog.start()
+
+    def poll_npu_recovery_startup(self):
+        for rank, (reader, deadline) in list(self._npu_recovery_readers.items()):
+            if reader.poll():
+                try:
+                    info = reader.recv()
+                finally:
+                    reader.close()
+                    del self._npu_recovery_readers[rank]
+                if info.get("status") != "ready":
+                    raise RuntimeError(f"NPU replacement failed to initialize: {info}")
+                sock_send(
+                    self.send_to_tokenizer,
+                    ProcessActiveRanksOutput(
+                        ranks=[rank],
+                        active=True,
+                        membership_epoch=self._watchdog_event_epoch,
+                    ),
+                )
+            elif time.monotonic() >= deadline:
+                raise TimeoutError(f"NPU replacement scheduler {rank} startup timed out")
+
     def _handle_scheduler_process_exit(self, index, proc, name):
         dp_rank = self.scheduler_process_dp_ranks[index]
         global_rank = self.scheduler_process_global_ranks[index]
@@ -315,7 +400,11 @@ class DataParallelController:
         )
         sock_send(
             self._get_watchdog_sender(),
-            ProcessActiveRanksOutput(ranks=[global_rank], active=False),
+            ProcessActiveRanksOutput(
+                ranks=[global_rank],
+                active=False,
+                membership_epoch=getattr(self, "_watchdog_event_epoch", 0),
+            ),
         )
 
     def _get_watchdog_sender(self):
@@ -511,6 +600,7 @@ class DataParallelController:
                 ),
                 (FaultToleranceCommandReqInput, self.send_fault_tolerance_command),
                 (FaultToleranceDPCShutdownReqInput, self.shutdown_dp),
+                (FaultToleranceDPCRecoverReqInput, self.recover_dp),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
@@ -697,9 +787,7 @@ class DataParallelController:
     def _joiner_slot_offset(self, server_args: ServerArgs) -> int:
         return server_args.ep_join_rank_offset
 
-    def launch_dp_attention_schedulers(
-        self, server_args: ServerArgs, port_args: PortArgs
-    ):
+    def launch_dp_attention_schedulers(self, server_args: ServerArgs, port_args: PortArgs):
         if server_args.dist_init_addr is None:
             bind_host = "127.0.0.1"
         else:
@@ -853,24 +941,27 @@ class DataParallelController:
                 display_dp_rank = dp_rank + offset if dp_rank is not None else None
 
                 with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
+                    scheduler_args = (
+                        server_args,
+                        rank_port_args,
+                        gpu_id,
+                        tp_rank,
+                        attn_cp_rank,
+                        moe_dp_rank,
+                        moe_ep_rank,
+                        pp_rank,
+                        dp_rank,
+                        writer,
+                        display_tp_rank,
+                        display_dp_rank,
+                        display_moe_ep_rank,
+                    )
                     proc = mp.Process(
                         target=self.run_scheduler_process_func,
-                        args=(
-                            server_args,
-                            rank_port_args,
-                            gpu_id,
-                            tp_rank,
-                            attn_cp_rank,
-                            moe_dp_rank,
-                            moe_ep_rank,
-                            pp_rank,
-                            dp_rank,
-                            writer,
-                            display_tp_rank,
-                            display_dp_rank,
-                            display_moe_ep_rank,
-                        ),
+                        args=scheduler_args,
                     )
+                    if server_args.enable_npu_ft_recovery:
+                        self._scheduler_launch_specs[tp_rank] = scheduler_args
                     with (
                         memory_saver_adapter.configure_subprocess(),
                         numa_utils.configure_subprocess(server_args, gpu_id),
@@ -981,6 +1072,7 @@ class DataParallelController:
             poller.register(socket, zmq.POLLIN)
         while True:
             self.soft_watchdog.feed()
+            self.poll_npu_recovery_startup()
             ready = dict(poller.poll(timeout=100))
             for socket in sockets:
                 if socket in ready:

@@ -1520,10 +1520,18 @@ class ContinueGenerationReqInput(BaseReq, kw_only=True):
 
 class FaultToleranceCommandReqInput(BaseReq, kw_only=True):
     request_id: str
-    command: Literal["retry", "scale_down"]
+    command: Literal[
+        "retry",
+        "scale_down",
+        "recover_pause",
+        "recover_prepare",
+        "recover_validate",
+        "recover_commit",
+    ]
     target_ranks: List[int]
     active_mask: Optional[List[bool]] = None
     membership_epoch: Optional[int] = None
+    previous_active_mask: Optional[List[bool]] = None
 
 
 class FaultToleranceCommandReqOutput(BaseReq, kw_only=True):
@@ -1833,6 +1841,7 @@ class ActiveRanksOutput(BaseReq, kw_only=True):
 class ProcessActiveRanksOutput(BaseReq, kw_only=True):
     ranks: List[int]
     active: bool
+    membership_epoch: Optional[int] = None
 
 
 class WatchdogHeartbeatOutput(BaseReq, kw_only=True):
@@ -1843,6 +1852,12 @@ class WatchdogHeartbeatOutput(BaseReq, kw_only=True):
 
 class FaultToleranceDPCShutdownReqInput(BaseReq, kw_only=True):
     target_dp_ranks: List[int]
+
+
+class FaultToleranceDPCRecoverReqInput(BaseReq, kw_only=True):
+    target_dp_ranks: List[int]
+    membership_epoch: int
+    previous_active_mask: List[bool]
 
 
 class ActiveRanksUpdateReqOutput(BaseReq, kw_only=True):
