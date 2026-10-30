@@ -3,10 +3,15 @@
 import ast
 import asyncio
 import copy
+import importlib.util
+import io
+import json
 import logging
 import os
+import sys
+import tempfile
 import unittest
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -248,6 +253,68 @@ class TestNpuRecoveryControl(unittest.IsolatedAsyncioTestCase, CustomTestCase):
 
 
 class TestNpuRecoveryRuntime(CustomTestCase):
+    def test_dpc_control_requests_reach_each_local_broadcast_leader(self):
+        path = "python/sglang/srt/managers/data_parallel_controller.py"
+        tree = ast.parse((ROOT / path).read_text())
+        cls = next(
+            node
+            for node in tree.body
+            if getattr(node, "name", None) == "DataParallelController"
+        )
+        init = next(
+            node for node in cls.body if getattr(node, "name", None) == "__init__"
+        )
+        # Execute the actual launch/control setup branch without starting workers.
+        setup = next(
+            node
+            for node in init.body
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Attribute)
+            and node.test.attr == "enable_dp_attention"
+        )
+        send = Mock()
+        forward = load_method(
+            path, "DataParallelController", "send_control_message", {"sock_send": send}
+        )
+        for dp_attention, local, joiner, ft in (
+            (True, False, False, False),
+            (True, True, False, False),
+            (True, False, True, False),
+            (True, False, False, True),
+            (False, False, False, False),
+        ):
+            with self.subTest(
+                dp_attention=dp_attention, local=local, joiner=joiner, ft=ft
+            ):
+                args = SimpleNamespace(
+                    enable_dp_attention=dp_attention,
+                    enable_dp_attention_local_control_broadcast=local,
+                    is_ep_scale_joiner=joiner,
+                    enable_fault_tolerance=ft,
+                    tp_size=4,
+                )
+                controller = SimpleNamespace(
+                    launch_dp_attention_schedulers=Mock(),
+                    launch_dp_schedulers=Mock(),
+                    workers=[Mock() for _ in range(4)],
+                )
+                exec(
+                    compile(ast.Module(body=[setup], type_ignores=[]), path, "exec"),
+                    {"self": controller, "server_args": args, "port_args": Mock()},
+                )
+                for active in ([0, 1, 2, 3], [0, 1, 3]):
+                    send.reset_mock()
+                    controller._active_workers = active
+                    request = Mock()
+                    forward(controller, request)
+                    expected = (
+                        active if not dp_attention or local or joiner or ft else [0]
+                    )
+                    self.assertEqual(
+                        [call.args[0] for call in send.call_args_list],
+                        [controller.workers[rank] for rank in expected],
+                    )
+
     def test_health_gate_rejects_missing_nan_or_infinite_logits(self):
         for logits in (
             None,
@@ -520,6 +587,92 @@ class TestNpuRecoveryRuntime(CustomTestCase):
         self.assertIsNone(impl.handle)
         self.assertFalse(hasattr(dispatcher, "_dispatch_intermediate_state"))
         self.assertEqual(dispatcher._stage, "initial")
+
+
+class TestNpuRecoveryProbeDiagnostics(CustomTestCase):
+    def load_probe(self):
+        path = ROOT / "test/manual/ep/verify_npu_recovery_serving.py"
+        spec = importlib.util.spec_from_file_location(
+            "npu_recovery_serving_probe", path
+        )
+        probe = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(probe)
+        return probe
+
+    def test_logs_request_before_blocking_and_propagates_failure_without_retry(self):
+        probe = self.load_probe()
+        events = []
+
+        def event(stage, **details):
+            events.append({"stage": stage, **details})
+
+        def blocked(*args, **kwargs):
+            self.assertEqual(events[-1]["stage"], "http_request_started")
+            self.assertEqual(kwargs["timeout"], (5, 30))
+            raise TimeoutError("server_info stalled")
+
+        session = SimpleNamespace(request=Mock(side_effect=blocked))
+        with self.assertRaisesRegex(TimeoutError, "server_info stalled"):
+            probe.request_json(
+                session,
+                "http://localhost:31000",
+                "GET",
+                "/server_info",
+                timeout_sec=30,
+                event=event,
+            )
+        session.request.assert_called_once()
+        self.assertEqual(events[-1]["stage"], "http_request_failed")
+        self.assertEqual(events[-1]["path"], "/server_info")
+
+    def test_stalled_metadata_has_live_report_and_cannot_inject_a_fault(self):
+        probe = self.load_probe()
+        output = io.StringIO()
+        session = Mock()
+        session.get.return_value.status_code = 200
+        psutil = SimpleNamespace(Process=Mock(), pid_exists=Mock(return_value=True))
+
+        def create_session():
+            self.assertIn('"stage": "test_started"', output.getvalue())
+            return session
+
+        requests = SimpleNamespace(
+            Session=Mock(side_effect=create_session), RequestException=TimeoutError
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = Path(directory) / "report.json"
+
+            def blocked(*args, **kwargs):
+                self.assertEqual(args[1], "http://127.0.0.1:30000/server_info")
+                self.assertEqual(kwargs["timeout"], (5, 30))
+                live = json.loads(report_path.read_text())
+                self.assertEqual(live["events"][-1]["stage"], "http_request_started")
+                self.assertFalse(live["success"])
+                raise TimeoutError("metadata stalled")
+
+            session.request.side_effect = blocked
+            with (
+                patch.dict(sys.modules, {"requests": requests, "psutil": psutil}),
+                patch.object(probe.importlib.metadata, "version", return_value="test"),
+                patch.object(
+                    probe.subprocess, "check_output", return_value="test-commit"
+                ),
+                patch.object(probe, "schedulers") as schedulers,
+                patch.object(
+                    sys,
+                    "argv",
+                    ["probe", "--server-pid", "123", "--output", str(report_path)],
+                ),
+                redirect_stdout(output),
+            ):
+                with self.assertRaisesRegex(TimeoutError, "metadata stalled"):
+                    probe.main()
+            final = json.loads(report_path.read_text())
+            self.assertEqual(final["error"], "metadata stalled")
+            self.assertFalse(final["success"])
+            self.assertIn("finished_at", final)
+            schedulers.assert_not_called()
+            psutil.Process.assert_not_called()
 
 
 if __name__ == "__main__":

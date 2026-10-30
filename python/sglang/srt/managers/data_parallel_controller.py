@@ -242,7 +242,13 @@ class DataParallelController:
             # within its own attn_tp_group instead of the full tp_group.
             # Otherwise fall back to the original behaviour: send to only the
             # first leader, which then broadcasts over the full tp_group.
-            local_ctrl = server_args.enable_dp_attention_local_control_broadcast
+            # Match SchedulerRequestReceiver: FT and scale joiners no longer
+            # relay control requests through the full TP group.
+            local_ctrl = (
+                server_args.enable_dp_attention_local_control_broadcast
+                or server_args.is_ep_scale_joiner
+                or server_args.enable_fault_tolerance
+            )
             self.control_message_step = 1 if local_ctrl else server_args.tp_size
         else:
             self.launch_dp_schedulers(server_args, port_args)

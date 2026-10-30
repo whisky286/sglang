@@ -115,6 +115,34 @@ echo "test exit code: $TEST_EXIT"
 
 报告记录实际 Git SHA、软件包版本、每阶段的响应及 PID。测试进程退出码必须为 0；异常时 `success` 为 false，并保存已完成阶段和错误信息。失败后脚本保留服务现场；恢复事务一旦进入通信切换阶段失败，服务会按现有 FT 策略整体退出，不尝试伪回滚。
 
+### 启动验收后没有输出，或状态接口正常但 `/server_info` 超时
+
+2026-10-30 用户在 `12b479feb8` 对应流程报告验收没有输出：`/fault_tolerance/status` 返回 HTTP 200、四个 rank healthy，但单独请求 `/server_info` 在 8 秒内收到 0 字节并超时。精确实机 SHA 未另行回报。
+
+本机代码核对发现：Scheduler 在开启 FT 后已改用各 DP 内的控制消息广播，而 DPC 仍只给第一个 DP leader 发送普通控制消息；`/server_info` 等待所有 Scheduler 的内部状态回复，因而可能一直等不到其余 rank。修正使 DPC 对 FT、scale joiner 与显式 local-control 配置都给每个活跃 DP leader 发送控制消息。修复后的 NPU 结果仍待重测。
+
+旧验收脚本的第一条日志在 `/health` 和 `/server_info` 之后，且状态查询错误继承了完整恢复事务的等待预算（`--timeout 600` 时为 2430 秒）。新版在加载测试依赖前打印 `test_started`，为每次请求打印 `http_request_started/finished/failed`；只读状态查询使用 30 秒读取超时，生成使用 `--timeout`，FT apply 保留多阶段预算。JSON 报告随事件原子更新，异常或中断也保留阶段；不会自动重试可能已经接受的恢复操作。
+
+遇到此类现象时，保留现场并在另一终端逐条执行下面命令。每个代码块是一条独立命令，末尾不要加续行反斜杠，也不要直接打印完整 `/server_info` 配置：
+
+```bash
+tail -n 30 artifacts/npu_ft/recovery-test.log
+```
+
+```bash
+tail -n 100 artifacts/npu_ft/sglang-npu-ft.log
+```
+
+```bash
+curl --noproxy '*' --connect-timeout 2 --max-time 5 -i http://127.0.0.1:31000/fault_tolerance/status
+```
+
+```bash
+curl --noproxy '*' --connect-timeout 2 --max-time 8 -sS -o /tmp/npu-server-info-check.json -w 'server_info HTTP=%{http_code} elapsed=%{time_total}s\n' http://127.0.0.1:31000/server_info
+```
+
+端口 31000、`artifacts/npu_ft` 对应这次用户实际启动命令；若采用本页最初的示例，应使用 30000 和对应 `/tmp` 日志路径。`status` 的 healthy 仅代表控制器当前记录，不代表所有 Scheduler 都响应控制请求。若验收已经出现 `scheduler_killed`，先检查服务/报告当前成员状态，再决定如何继续，避免重复故障注入。
+
 ## 4. 失败或完成后回传的材料
 
 ```bash
@@ -131,7 +159,7 @@ npu-smi info > /tmp/npu-recovery-devices.txt
 
 - 新增显式 `POST /fault_tolerance/apply` 请求：`{"instruction":"recover","params":{"ranks":[2],"timeout":600}}`。必须先完成缩容，且一次恢复全部已移除的原始 ranks；控制器自行启动新进程，不需要手动启动 joiner。
 - 幸存者暂停并清理在途请求；以成员版本隔离新 WORLD/TP/EP HCCL、Gloo 组；回归进程按当前专家布局加载 checkpoint。DeepEP 缓存和旧 dispatch handle 在暂停边界被替换；全员通信与模型 logits 检查通过后才开放路由。
-- 本机用隔离导入/AST 提取的实际模块运行 9 个相关测试文件：98 tests、52 subtests 通过。检查涵盖控制事务、失败门禁、陈旧事件、进程替换、buffer 清理、专家布局、既有缩容。语法编译通过，针对基线没有新增 F/I lint 问题。本机不是完整 SGLang/NPU 环境。
+- 本机用隔离导入/AST 提取的实际模块运行 9 个相关测试文件：101 tests、57 subtests 通过。检查涵盖控制事务、失败门禁、陈旧事件、进程替换、buffer 清理、专家布局、既有缩容。语法编译通过，针对基线没有新增 F/I lint 问题。本机不是完整 SGLang/NPU 环境。
 - 本机另以真实多进程 Gloo 验证新的 `RecoveryGroups` 默认组替换和原 rank 映射：`4→3→4` 求和 `10→7→10`，由新进程补回 rank 2，由原 rank 2 发起的对象广播正确。它不能替代目标 torch-npu/HCCL 私有接口兼容性验证。
 - 尚未验证：本页真实模型流程、多轮 NPU 显存占用、设备真实硬故障后的重新分配、并发压力和完整输出精度。旧故障组和 buffer 保留到进程退出，避免未经验证的销毁操作；这会增加多轮恢复的内存占用，不保证无限次恢复。
 - 本轮只支持单机、`TP=DP=EP`、Attention TP=1、eager、无调度重叠、DeepEP low_latency/default、非量化模型。PD、多机、执行图和增加原始容量之外的 `4→6` 不在本轮验收范围。

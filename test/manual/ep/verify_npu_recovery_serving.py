@@ -16,6 +16,34 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 
+def request_json(session, base_url, method, path, *, timeout_sec, event, **kwargs):
+    """Log before blocking; never retry a possibly accepted FT mutation."""
+    event("http_request_started", method=method, path=path, timeout_sec=timeout_sec)
+    started = time.monotonic()
+    try:
+        response = session.request(
+            method, base_url.rstrip("/") + path, timeout=(5, timeout_sec), **kwargs
+        )
+        response.raise_for_status()
+        result = response.json()
+    except Exception as exc:
+        event(
+            "http_request_failed",
+            method=method,
+            path=path,
+            elapsed_sec=round(time.monotonic() - started, 3),
+            error=str(exc),
+        )
+        raise
+    event(
+        "http_request_finished",
+        method=method,
+        path=path,
+        elapsed_sec=round(time.monotonic() - started, 3),
+    )
+    return result
+
+
 def schedulers(server_pid):
     import psutil
 
@@ -59,45 +87,66 @@ def main():
         parser.error("the fault injection server must be local")
     if args.cycles <= 0 or args.timeout <= 0:
         parser.error("cycles and timeout must be positive")
-    import psutil
-    import requests
-
-    session = requests.Session()
-    session.trust_env = False
-    if os.getenv(args.api_key_env):
-        session.headers["Authorization"] = f"Bearer {os.environ[args.api_key_env]}"
     report = {
         "success": False,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "events": [],
     }
 
+    def save_report():
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = args.output.with_name(f".{args.output.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2))
+        temporary.replace(args.output)
+
     def event(stage, **details):
-        entry = {"stage": stage, **details}
+        entry = {
+            "stage": stage,
+            "at": datetime.now(timezone.utc).isoformat(),
+            **details,
+        }
         report["events"].append(entry)
         print(json.dumps(entry, ensure_ascii=False), flush=True)
+        save_report()
 
     def request(method, path, **kwargs):
-        response = session.request(
+        # A whole FT transaction may contain several timeout-bounded phases.
+        # Read-only queries must not inherit that forty-minute wait budget.
+        timeout = (
+            4 * args.timeout + 30
+            if path == "/fault_tolerance/apply"
+            else args.timeout
+            if path == "/generate"
+            else 30
+        )
+        return request_json(
+            session,
+            args.base_url,
             method,
-            args.base_url.rstrip("/") + path,
-            timeout=4 * args.timeout + 30,
+            path,
+            timeout_sec=timeout,
+            event=event,
             **kwargs,
         )
-        response.raise_for_status()
-        return response.json()
 
     def wait_ready():
         deadline = time.monotonic() + args.timeout
+        next_progress = time.monotonic() + 10
+        status = None
         while time.monotonic() < deadline:
             try:
                 response = session.get(args.base_url.rstrip("/") + "/health", timeout=5)
                 if response.status_code == 200:
+                    event("health_ready")
                     return
-            except requests.RequestException:
-                pass
+                status = response.status_code
+            except requests.RequestException as exc:
+                status = str(exc)
             if not psutil.pid_exists(args.server_pid):
                 raise RuntimeError("server process exited during startup")
+            if time.monotonic() >= next_progress:
+                event("waiting_for_health", last_status=status)
+                next_progress = time.monotonic() + 10
             time.sleep(1)
         raise TimeoutError("server health readiness timed out")
 
@@ -127,12 +176,23 @@ def main():
         event(stage, routed_rank=rank, response=result)
 
     try:
+        event("test_started", server_pid=args.server_pid, base_url=args.base_url)
+        event("loading_test_dependencies")
+        import psutil
+        import requests
+
+        session = requests.Session()
+        session.trust_env = False
+        if os.getenv(args.api_key_env):
+            session.headers["Authorization"] = f"Bearer {os.environ[args.api_key_env]}"
+        event("collecting_environment")
         report["git_commit"] = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True
         ).strip()
         report["versions"] = {}
         for name in ("torch", "torch-npu", "sgl-kernel-npu", "deep-ep"):
             report["versions"][name] = importlib.metadata.version(name)
+        event("waiting_for_health", timeout_sec=args.timeout)
         wait_ready()
         info = request("GET", "/server_info")
         if not info.get("enable_npu_ft_recovery"):
@@ -223,10 +283,12 @@ def main():
     except Exception as exc:
         report["error"] = str(exc)
         raise
+    except KeyboardInterrupt:
+        report["error"] = "test interrupted; inspect the last stage before retrying"
+        raise
     finally:
         report["finished_at"] = datetime.now(timezone.utc).isoformat()
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2))
+        save_report()
         print(
             json.dumps({"success": report["success"], "report": str(args.output)}),
             flush=True,
