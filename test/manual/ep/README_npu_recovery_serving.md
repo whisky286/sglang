@@ -2,9 +2,63 @@
 
 这轮验证单机 eager 服务的 `4→3→4`：原 rank 2 退出后，三卡先恢复生成，再由控制器拉起同编号新进程、重建通信和 DeepEP buffer、加载当前专家布局，最后重新开放四卡请求路由。需要重新启动带 `--enable-npu-ft-recovery` 的服务。
 
-**状态（2026-10-30）：用户确认当前代码沿用原 `ops + dynamic + 执行图` 命令时缩容后可继续处理请求；此前 `default + static + eager` 验收在三卡首请求失败。完整 recover 尚未实机验证。** 两次实验的故障时机和 victim rank 也不同，尚不能锁定单一差异。[上一阶段通信探针](README_npu_rank_recovery.md) 的 HCCL/新 buffer 结果只覆盖其声明的范围。
+**状态（2026-11-02）：用户确认按上一轮 `ops + dynamic + --disable-cuda-graph` 命令，原缩容流程可以正常完成。** 原图模式也已由用户确认通过；此前 default/static/eager 验收失败的单一根因尚未锁定，完整 recover 仍未实机验证。[上一阶段通信探针](README_npu_rank_recovery.md) 的结果只覆盖其声明的范围。
 
-## 当前优先实验：保留成功路径，只关闭执行图
+## 当前优先实验：关闭图基础上，单独关闭调度重叠
+
+2026-11-02 用户回复“可以正常进行原来的缩容流程”，根据紧邻的完整启动命令，记录为 ops/dynamic、128 冗余、关闭图、不新增关闭 overlap 或 recovery 开关的缩容通过。未附精确 SHA、完整日志/输出和当前软件元组；本机没有执行 NPU。该结果说明单独关闭图在这套组合下未复现失败，不能外推到 default/static、其他故障时机或完整恢复。
+
+下一轮保留相同环境、模型和长请求中杀 rank 1、等幸存者 unhealthy 再缩容的操作，只再关闭调度重叠（让调度与前向不再重叠执行）。停止上轮专用服务后，在 NPU 仓库根目录、原 sglang-ft 环境执行以下完整命令；MODEL_PATH 使用已经设置的模型目录。无需更新生产代码，不启用 recovery 或同步定位变量。
+
+```bash
+mkdir -p artifacts/npu_ft
+git rev-parse HEAD | tee artifacts/npu_ft/eager-no-overlap-commit.txt
+
+DEEP_USE_MODE=ops \
+python -m sglang.launch_server \
+  --model-path "${MODEL_PATH}" \
+  --device npu \
+  --attention-backend ascend \
+  --dtype bfloat16 \
+  --tp-size 4 \
+  --dp-size 4 \
+  --ep-size 4 \
+  --attn-cp-size 1 \
+  --enable-dp-attention \
+  --enable-dp-lm-head \
+  --moe-dense-tp-size 1 \
+  --moe-dp-size 1 \
+  --moe-a2a-backend deepep \
+  --deepep-mode low_latency \
+  --enable-eplb \
+  --eplb-algorithm elasticity_aware \
+  --ep-dispatch-algorithm dynamic \
+  --ep-num-redundant-experts 128 \
+  --elastic-ep-backend mc2 \
+  --enable-fault-tolerance \
+  --fault-tolerance-on-error-strategy pause \
+  --fault-tolerance-timeout 600 \
+  --fault-tolerance-pause-timeout 600 \
+  --cuda-graph-bs-decode 1 2 4 8 \
+  --disable-cuda-graph \
+  --disable-overlap-schedule \
+  --disable-radix-cache \
+  --mem-fraction-static 0.5 \
+  --max-running-requests 8 \
+  --max-total-tokens 4096 \
+  --context-length 2048 \
+  --watchdog-timeout 300 \
+  --nnodes 1 \
+  --node-rank 0 \
+  --trust-remote-code \
+  --host 127.0.0.1 \
+  --port 31000 \
+  2>&1 | tee artifacts/npu_ft/sglang-npu-ft-eager-no-overlap.log
+```
+
+该轮若缩容后新请求成功，才继续启用恢复开关与其标准组配置；若失败，保存最早完整服务端 traceback 和当前状态。关闭 overlap 这轮尚未执行；原流式请求是否能自动错误结束也未有新结果。此次只更新实机证据与下一轮命令，未修改运行代码或重跑不变的 CPU 单测。
+
+## 历史实验：保留成功路径，只关闭执行图（11 月 2 日用户回传通过）
 
 用户最新回传：在**当前代码**使用原命令，`DEEP_USE_MODE=ops`、dynamic 路由、128 冗余专家、decode 图 batch size 为 1/2/4/8。在长流式请求执行中杀 rank 1，等 rank 0/2/3 unhealthy、rank 1 dead 后调用 scale_down，随后服务可正常生成。该报告没有附精确 SHA、完整服务端日志和本轮软件元组，按用户回传结论记录，不补造这些字段。
 
