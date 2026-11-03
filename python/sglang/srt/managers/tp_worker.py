@@ -20,7 +20,6 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.io_struct import (
@@ -341,22 +340,34 @@ class TpModelWorker(BaseTpWorker):
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
 
-        # Sync random seed across TP workers.
-        # Elastic joiners cannot enter the launch-time WORLD broadcast.
-        if server_args.is_ep_joiner:
-            self.random_seed = server_args.random_seed
+        self._init_random_seed()
+
+        self.enable_overlap = not server_args.disable_overlap_schedule
+        self.enable_spec = server_args.speculative_algorithm is not None
+        self.hicache_layer_transfer_counter = None
+
+    def _init_random_seed(self):
+        # Only the replacement executes startup during NPU FT recovery. The
+        # survivors wait for its loaded ACK, so they cannot join this broadcast.
+        # The launcher already resolved the seed before spawning any workers.
+        is_npu_ft_joiner = (
+            getattr(self.server_args, "_npu_ft_recovery", None) is not None
+        )
+        if self.server_args.is_ep_joiner or is_npu_ft_joiner:
+            self.random_seed = self.server_args.random_seed
+            if is_npu_ft_joiner:
+                logger.info(
+                    "NPU FT joiner reused launcher random seed; "
+                    "skipping startup WORLD broadcast"
+                )
         else:
             self.random_seed = broadcast_pyobj(
-                [server_args.random_seed],
+                [self.server_args.random_seed],
                 self.ps.tp_size * self.ps.pp_rank + self.ps.tp_rank,
                 self.world_group.cpu_group,
                 src=self.world_group.ranks[0],
             )[0]
         set_random_seed(self.random_seed)
-
-        self.enable_overlap = not server_args.disable_overlap_schedule
-        self.enable_spec = server_args.speculative_algorithm is not None
-        self.hicache_layer_transfer_counter = None
 
     def alloc_memory_pool(
         self,

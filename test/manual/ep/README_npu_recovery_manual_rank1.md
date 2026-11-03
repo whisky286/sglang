@@ -1,8 +1,28 @@
 # NPU ops/dynamic 手动长请求故障与原 rank 1 恢复验收
 
-用户已回传 ops/dynamic、128 冗余、关闭执行图与关闭调度重叠下原缩容正常；完整 4→3→4 尚未实机通过。此轮在这个组合上启用恢复开关，并满足恢复所需的标准通信组设置。保持长请求中杀 rank 1、等待幸存者 unhealthy 后再缩容的步骤，不使用默认脚本的空闲杀 rank 2 流程。
+用户回传的 2026-11-04 01:58 日志已显示三卡真实 `/generate` 返回 200；recover 拉起 rank 1，完成新通信组初始化与权重加载后停止推进。本机找到并修复替代进程仍进入启动 WORLD 随机种子广播、与幸存者等待 loaded ACK 相互阻塞的问题；修复仍待 NPU 复测，完整 4→3→4 尚未实机通过。保留 ops/dynamic、128 冗余、关闭执行图/调度重叠，以及长请求中杀 rank 1、等待幸存者 unhealthy 再缩容的步骤。
 
-在 NPU 服务器原 sglang-ft 环境、仓库根目录执行。先在旧服务终端按 Ctrl+C 停止旧服务；下面的终端 1、2、3 都使用同一仓库和环境。沿用已设置的 MODEL_PATH、CANN 与自定义算子库路径，不升级包。
+在 NPU 服务器原 sglang-ft 环境、仓库根目录执行。下面的终端 1、2、3 都使用同一仓库和环境。沿用已设置的 MODEL_PATH、CANN 与自定义算子库路径，不升级包。旧服务由后台启动时，Ctrl+C 只会停止 tail；更新后必须终止本轮旧服务并重新启动，运行中的进程不会自动加载代码修复。
+
+先保存旧日志末尾、进程与提交，再向本轮保存的主进程发 TERM；不使用旧聊天中的 PID。若主进程已退出，跳过 TERM：
+
+```bash
+OLD_RUN_DIR=$(cat artifacts/npu_ft/current-recovery-dir.txt)
+tail -n 250 "$OLD_RUN_DIR/server.log" > "$OLD_RUN_DIR/server-tail-before-restart.txt"
+ps -eo pid,ppid,lstart,args | grep '[s]glang::scheduler_' | tee "$OLD_RUN_DIR/pids-at-failure.txt"
+cat "$OLD_RUN_DIR/commit.txt"
+OLD_SERVER_PID=$(cat "$OLD_RUN_DIR/server.pid")
+if ps -p "$OLD_SERVER_PID" -o args= | grep -q '[s]glang.launch_server'; then
+  kill -TERM "$OLD_SERVER_PID"
+fi
+```
+
+单独检查旧服务退出、31000 端口释放后，再执行第 1 步。若还在监听，先处理旧服务，不并行启动第二份：
+
+```bash
+ss -ltnp 'sport = :31000'
+ps -eo pid,ppid,lstart,args | grep '[s]glang::scheduler_'
+```
 
 ## 1. 更新代码并启动带恢复开关的新四卡服务（终端 1）
 
@@ -181,6 +201,20 @@ curl --noproxy '*' --connect-timeout 5 --max-time 600 -sS \
 成功只覆盖一轮手动故障与补回原 rank，非完整精度评测，也未覆盖第二次故障、图恢复或旧请求自动收尾。失败后保留本轮目录，不重发 recover；回传 server.log 最早完整 traceback、scale-down.json、survivor-generation.json、recover.json 与 commit.txt。若无法读取恢复响应，应先检查状态和服务日志，不把客户端超时当作恢复未执行。
 
 本机只对以上 Shell 与 JSON 请求体做语法检查，未执行这些故障或恢复命令。当前文档不是 NPU 通过结果。此前嵌入 Python 的辅助校验已按用户偏好改为手动命令；这不会改变服务端的恢复实现。
+
+## 本次修复的检查点：权重加载后启动广播（2026-11-03 本机分析）
+
+用户日志时间为 2026-11-04 01:59:43–44。新 rank 1 完成 DeepseekV2ForCausalLM 权重加载、再次初始化 tokenizer 后，没有后续进度。源码显示 NPU FT 替代进程带 `_npu_ft_recovery`，但 `is_ep_joiner=False`，因此旧代码仍进入 `TpModelWorker` 的 WORLD 随机种子广播；幸存者此时已经在 `prepare_survivor` 等新进程的 loaded ACK，不会参与这个启动广播。
+
+修复让 NPU FT 替代进程直接使用启动器已经确定、DPC 重启时复制的随机种子，保留普通启动的广播以及已有 ElasticEP joiner 行为。更新重启后，recover 的新 rank 1 应在 tokenizer 信息之后出现：
+
+```text
+NPU FT joiner reused launcher random seed; skipping startup WORLD broadcast
+```
+
+这条日志只证明跨过此前的互等点；仍须完成第 6 步的四卡 healthy、进程身份与指定 rank 1 真实生成，才能记录整轮通过。日志未提供最终 timeout/退出栈或实机 SHA，不能将 curl 52 的最终退出原因视为已实测确认。
+
+本机隔离 CPU 回归 109 tests、79 subtests passed，包含原构造函数会调用广播、修复后不调用的对照；NPU 服务未在本机执行。临时测试环境只有 asyncio_mode 未识别配置警告。
 
 ## recover 返回 curl (52) Empty reply from server
 

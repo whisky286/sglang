@@ -94,6 +94,125 @@ def make_manager():
     return manager
 
 
+class TestNpuRecoverySeed(CustomTestCase):
+    def load_seed_initializer(self, broadcast, apply_seed):
+        return load_method(
+            "python/sglang/srt/managers/tp_worker.py",
+            "TpModelWorker",
+            "_init_random_seed",
+            {
+                "broadcast_pyobj": broadcast,
+                "set_random_seed": apply_seed,
+                "logger": logging.getLogger(__name__),
+            },
+        )
+
+    def test_replacement_initializes_without_any_survivor_collective(self):
+        for recovery in (
+            {"plan": {"membership_epoch": 2}},
+            {"plan": {"membership_epoch": 4}},
+        ):
+            with self.subTest(recovery=recovery):
+                broadcast = Mock(
+                    side_effect=AssertionError("survivors cannot broadcast")
+                )
+                apply_seed = Mock()
+                initialize = self.load_seed_initializer(broadcast, apply_seed)
+                worker = SimpleNamespace(
+                    server_args=SimpleNamespace(
+                        is_ep_joiner=False,
+                        _npu_ft_recovery=recovery,
+                        random_seed=12345,
+                    ),
+                )
+                initialize(worker)
+                self.assertEqual(worker.random_seed, 12345)
+                broadcast.assert_not_called()
+                apply_seed.assert_called_once_with(12345)
+
+    def test_normal_startup_still_broadcasts_world_root_seed(self):
+        for explicit_none in (False, True):
+            for rank in (0, 1):
+                with self.subTest(rank=rank, explicit_none=explicit_none):
+                    broadcast = Mock(return_value=[6789])
+                    apply_seed = Mock()
+                    initialize = self.load_seed_initializer(broadcast, apply_seed)
+                    group = object()
+                    worker = SimpleNamespace(
+                        server_args=SimpleNamespace(
+                            is_ep_joiner=False,
+                            enable_npu_ft_recovery=True,
+                            random_seed=12345,
+                        ),
+                        ps=SimpleNamespace(tp_size=4, pp_rank=0, tp_rank=rank),
+                        world_group=SimpleNamespace(
+                            cpu_group=group, ranks=[0, 1, 2, 3]
+                        ),
+                    )
+                    if explicit_none:
+                        worker.server_args._npu_ft_recovery = None
+                    initialize(worker)
+                    broadcast.assert_called_once_with([12345], rank, group, src=0)
+                    self.assertEqual(worker.random_seed, 6789)
+                    apply_seed.assert_called_once_with(6789)
+
+    def test_existing_elastic_joiner_keeps_noncollective_startup(self):
+        broadcast = Mock(side_effect=AssertionError("joiner must not broadcast"))
+        apply_seed = Mock()
+        initialize = self.load_seed_initializer(broadcast, apply_seed)
+        worker = SimpleNamespace(
+            server_args=SimpleNamespace(is_ep_joiner=True, random_seed=5678)
+        )
+        initialize(worker)
+        broadcast.assert_not_called()
+        apply_seed.assert_called_once_with(5678)
+
+    def test_worker_constructor_applies_replacement_seed_before_pool_init(self):
+        broadcast = Mock(side_effect=AssertionError("survivors cannot broadcast"))
+        apply_seed = Mock()
+        initialize = self.load_seed_initializer(broadcast, apply_seed)
+        constructor = load_method(
+            "python/sglang/srt/managers/tp_worker.py",
+            "TpModelWorker",
+            "__init__",
+            {
+                "get_pp_group": Mock(),
+                "get_world_group": Mock(
+                    return_value=SimpleNamespace(
+                        cpu_group=object(), ranks=[0, 1, 2, 3]
+                    )
+                ),
+                "broadcast_pyobj": broadcast,
+                "set_random_seed": apply_seed,
+            },
+        )
+        worker = SimpleNamespace(
+            model_runner=SimpleNamespace(device="npu"),
+            _init_model_config=Mock(),
+            _init_model_runner=Mock(),
+            _init_dllm_algorithm=Mock(),
+        )
+        worker._init_random_seed = lambda: initialize(worker)
+        args = SimpleNamespace(
+            skip_tokenizer_init=True,
+            is_ep_joiner=False,
+            _npu_ft_recovery={"plan": {"membership_epoch": 2}},
+            random_seed=12345,
+            disable_overlap_schedule=True,
+            speculative_algorithm=None,
+        )
+        constructor(
+            worker,
+            args,
+            gpu_id=1,
+            ps=SimpleNamespace(tp_size=4, pp_rank=0, tp_rank=1),
+            nccl_port=1234,
+        )
+        self.assertEqual(worker.random_seed, 12345)
+        broadcast.assert_not_called()
+        apply_seed.assert_called_once_with(12345)
+
+
 class TestNpuRecoveryControl(unittest.IsolatedAsyncioTestCase, CustomTestCase):
     async def test_routes_commit_only_after_all_member_validation(self):
         manager = make_manager()

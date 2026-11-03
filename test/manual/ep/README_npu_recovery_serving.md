@@ -2,7 +2,7 @@
 
 这轮验证单机 eager 服务的 `4→3→4`：原 rank 2 退出后，三卡先恢复生成，再由控制器拉起同编号新进程、重建通信和 DeepEP buffer、加载当前专家布局，最后重新开放四卡请求路由。需要重新启动带 `--enable-npu-ft-recovery` 的服务。
 
-**状态（2026-11-02）：用户进一步确认 ops/dynamic、关闭图且关闭调度重叠时仍“正常能缩”。** 原图模式及单独关图此前也已回传成功。完整 recover 仍未实机验证，此前 default/static 验收失败的单一根因尚未锁定。
+**最新状态（2026-11-03 分析，用户日志时间为 11 月 4 日）：三卡 `/generate` 已返回 200；recover 新 rank 1 完成组初始化和权重加载后不再推进。** 已修复 NPU FT 替代进程误入启动 WORLD 随机种子广播、与幸存者等待 loaded ACK 相互阻塞的代码路径。本机隔离 CPU 回归 109 tests、79 subtests passed；修复后完整 recover 尚待 NPU 实机复测，此前 default/static 失败的单一根因仍未锁定。
 
 当前下一步是启用恢复开关与其标准组配置，保留长请求中杀 rank 1、等幸存者 unhealthy 后缩容的手动流程。完整启动、查找本轮 PID、缩容、三卡生成、recover、进程身份与回归 rank 生成命令已单独整理到 [ops/dynamic 手动 rank 1 恢复验收](README_npu_recovery_manual_rank1.md)。不以默认自动脚本的空闲杀 rank 2 代替本轮。
 
