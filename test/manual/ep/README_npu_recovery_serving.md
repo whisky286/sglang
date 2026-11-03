@@ -1,10 +1,12 @@
 # NPU 原 rank 回归：真实模型服务验收
 
-这轮验证单机 eager 服务的 `4→3→4`：原 rank 2 退出后，三卡先恢复生成，再由控制器拉起同编号新进程、重建通信和 DeepEP buffer、加载当前专家布局，最后重新开放四卡请求路由。需要重新启动带 `--enable-npu-ft-recovery` 的服务。
+这里验证单机 eager 服务的 `4→3→4`：原 rank 退出后，三卡先恢复生成，再由控制器拉起同编号新进程、重建通信和 DeepEP buffer、加载当前专家布局，最后重新开放四卡请求路由。服务启动时需要 `--enable-npu-ft-recovery`。当前实机通过的是手动原 rank 1 流程；下方旧自动化材料使用 rank 2，不能视作同一实验已通过。
 
-**最新状态（2026-11-03 分析，用户日志时间为 11 月 4 日）：三卡 `/generate` 已返回 200；recover 新 rank 1 完成组初始化和权重加载后不再推进。** 已修复 NPU FT 替代进程误入启动 WORLD 随机种子广播、与幸存者等待 loaded ACK 相互阻塞的代码路径。本机隔离 CPU 回归 109 tests、79 subtests passed；修复后完整 recover 尚待 NPU 实机复测，此前 default/static 失败的单一根因仍未锁定。
+**最新状态（2026-11-03 用户回传，服务器 ps 日期为 11 月 4 日）：单轮手动原 rank 1 恢复 4→3→4 已实机通过。** 三卡 dp_rank=0 生成 16 tokens；recover success=true、membership_epoch=2，四卡 healthy；只有 rank 1 的 PID 从 3109763 变为 3237419，0/2/3 保持原进程；指定新 rank 1 的请求返回 dp_rank=1、16 tokens、finish_reason=length。两次短输入的 output_ids 一致，不代表完整精度通过。
 
-当前下一步是启用恢复开关与其标准组配置，保留长请求中杀 rank 1、等幸存者 unhealthy 后缩容的手动流程。完整启动、查找本轮 PID、缩容、三卡生成、recover、进程身份与回归 rank 生成命令已单独整理到 [ops/dynamic 手动 rank 1 恢复验收](README_npu_recovery_manual_rank1.md)。不以默认自动脚本的空闲杀 rank 2 代替本轮。
+该结果在紧邻 `3060ee7955` 种子广播互等修复后的复测上下文中回传，附件尚未包含实际 commit.txt；精确 SHA 与本轮完整包元组待补，不自动拿本机版本或十月环境填充。此次只更新证据和文档，没有生产代码改动，也没有重跑不变的 CPU 单测。
+
+完整可复制命令与结果边界在 [ops/dynamic 手动 rank 1 恢复验收](README_npu_recovery_manual_rank1.md)。成功服务可保留运行；下一步优先验证同一服务第二轮故障恢复。重复恢复、不同故障 rank、图/overlap 恢复、长时内存、完整精度、旧流式请求自动收尾、PD 和超初始容量扩容均未验证。下方按日期保留历史失败和方案，不代表最新结果仍未跑通。
 
 ## 历史实验：关闭图后单独关闭调度重叠（用户已回传正常能缩）
 

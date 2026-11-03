@@ -1,6 +1,12 @@
 # NPU ops/dynamic 手动长请求故障与原 rank 1 恢复验收
 
-用户回传的 2026-11-04 01:58 日志已显示三卡真实 `/generate` 返回 200；recover 拉起 rank 1，完成新通信组初始化与权重加载后停止推进。本机找到并修复替代进程仍进入启动 WORLD 随机种子广播、与幸存者等待 loaded ACK 相互阻塞的问题；修复仍待 NPU 复测，完整 4→3→4 尚未实机通过。保留 ops/dynamic、128 冗余、关闭执行图/调度重叠，以及长请求中杀 rank 1、等待幸存者 unhealthy 再缩容的步骤。
+**最新结果（2026-11-03 用户回传；服务器 ps 显示 11 月 4 日）：手动单轮原 rank 1 恢复 4→3→4 已实机通过。** 缩容后三卡真实生成 16 tokens，recover 返回 `fault_tolerance_recover_committed`、membership_epoch=2，独立 status 查询四卡 healthy，指定回归 rank 1 的请求也生成 16 tokens、finish_reason=length。
+
+恢复前后 rank 0/2/3 的 PID 与创建时间均不变，只有 rank 1 从 3109763 更换为 3237419；共同 PPID 为 3103414。两个相同短输入的 output_ids 一致，仅覆盖本输入，不作为完整精度验收。这里的 PID 仅用于记录，后续实验必须重新查询。
+
+本轮沿紧邻的 `3060ee7955` 修复复测步骤回传成功；附件没有 commit.txt，精确实机 SHA 待补。已知模型为 `/mnt/share/weights/DeepSeek-V2-Lite-Chat`。完整生效参数、包版本和恢复墙钟耗时未随本轮记录打印，不自动复用历史实验数据。此前加载后种子广播互等的修复经过保留在本文末尾。
+
+当前成功服务可保留运行。以下是从头复现流程，只在准备重新开始独立实验时执行停止/启动段；保留 ops/dynamic、128 冗余、关闭图/调度重叠，以及长请求中杀 rank 1、等 unhealthy 再缩容的步骤。重复恢复、执行图、旧请求自动收尾、PD 和超初始容量扩容仍待验证。
 
 在 NPU 服务器原 sglang-ft 环境、仓库根目录执行。下面的终端 1、2、3 都使用同一仓库和环境。沿用已设置的 MODEL_PATH、CANN 与自定义算子库路径，不升级包。旧服务由后台启动时，Ctrl+C 只会停止 tail；更新后必须终止本轮旧服务并重新启动，运行中的进程不会自动加载代码修复。
 
@@ -200,9 +206,9 @@ curl --noproxy '*' --connect-timeout 5 --max-time 600 -sS \
 
 成功只覆盖一轮手动故障与补回原 rank，非完整精度评测，也未覆盖第二次故障、图恢复或旧请求自动收尾。失败后保留本轮目录，不重发 recover；回传 server.log 最早完整 traceback、scale-down.json、survivor-generation.json、recover.json 与 commit.txt。若无法读取恢复响应，应先检查状态和服务日志，不把客户端超时当作恢复未执行。
 
-本机只对以上 Shell 与 JSON 请求体做语法检查，未执行这些故障或恢复命令。当前文档不是 NPU 通过结果。此前嵌入 Python 的辅助校验已按用户偏好改为手动命令；这不会改变服务端的恢复实现。
+本机只对以上 Shell 与 JSON 请求体做语法检查，没有在本机执行 NPU 故障或恢复；文档顶部的单轮成功来自用户回传的实机记录。此前嵌入 Python 的辅助校验已按用户偏好改为手动命令；这不会改变服务端的恢复实现。
 
-## 本次修复的检查点：权重加载后启动广播（2026-11-03 本机分析）
+## 历史修复检查点：权重加载后启动广播（2026-11-03 本机分析）
 
 用户日志时间为 2026-11-04 01:59:43–44。新 rank 1 完成 DeepseekV2ForCausalLM 权重加载、再次初始化 tokenizer 后，没有后续进度。源码显示 NPU FT 替代进程带 `_npu_ft_recovery`，但 `is_ep_joiner=False`，因此旧代码仍进入 `TpModelWorker` 的 WORLD 随机种子广播；幸存者此时已经在 `prepare_survivor` 等新进程的 loaded ACK，不会参与这个启动广播。
 
@@ -214,7 +220,7 @@ NPU FT joiner reused launcher random seed; skipping startup WORLD broadcast
 
 这条日志只证明跨过此前的互等点；仍须完成第 6 步的四卡 healthy、进程身份与指定 rank 1 真实生成，才能记录整轮通过。日志未提供最终 timeout/退出栈或实机 SHA，不能将 curl 52 的最终退出原因视为已实测确认。
 
-本机隔离 CPU 回归 109 tests、79 subtests passed，包含原构造函数会调用广播、修复后不调用的对照；NPU 服务未在本机执行。临时测试环境只有 asyncio_mode 未识别配置警告。
+修复时本机隔离 CPU 回归 109 tests、79 subtests passed，包含原构造函数会调用广播、修复后不调用的对照；NPU 服务未在本机执行。临时测试环境只有 asyncio_mode 未识别配置警告。后续用户单轮 NPU 恢复通过结果见本文顶部；此次记录更新未修改生产代码或重跑不变的单测。
 
 ## recover 返回 curl (52) Empty reply from server
 
