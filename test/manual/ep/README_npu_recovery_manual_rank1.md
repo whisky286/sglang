@@ -86,27 +86,22 @@ curl --noproxy '*' -N http://127.0.0.1:31000/v1/chat/completions \
   }'
 ```
 
-## 3. 保存四卡进程身份并结束本次服务的 rank 1（终端 3）
+## 3. 手动核对四卡 PID，再结束本次服务的 rank 1（终端 3）
 
-此命令复用仓库已有的 Scheduler 子进程识别方法，只搜索本次主进程的子树。四卡不齐时直接停止，不复用历史 PID。
+先看本轮主进程和 Scheduler 列表，保存用于恢复后人工对照。根据本轮启动日志与父进程关系确认 rank 1 的 PID，不复用旧实验的数字；同机其他服务不属于本轮。
 
 ```bash
-python - <<'PY'
-import json
-import runpy
-from pathlib import Path
+RUN_DIR=$(cat artifacts/npu_ft/current-recovery-dir.txt)
+ps -p "$(cat "$RUN_DIR/server.pid")" -o pid,ppid,stat,args
+ps -eo pid,ppid,lstart,args | grep '[s]glang::scheduler_' | tee "$RUN_DIR/pids-before.txt"
+```
 
-run_dir = Path(Path("artifacts/npu_ft/current-recovery-dir.txt").read_text().strip())
-server_pid = int((run_dir / "server.pid").read_text())
-find = runpy.run_path("test/manual/ep/verify_npu_recovery_serving.py")["schedulers"]
-workers = find(server_pid)
-if set(workers) != {0, 1, 2, 3}:
-    raise RuntimeError(f"Expected four schedulers before injection: {sorted(workers)}")
-before = {str(rank): [proc.pid, proc.create_time()] for rank, proc in workers.items()}
-(run_dir / "pids-before.json").write_text(json.dumps(before, indent=2))
-print(f"Killing this server's rank 1: pid={workers[1].pid}", flush=True)
-workers[1].kill()
-PY
+看到长请求持续输出时，输入刚确认的本轮 rank 1 PID 后按回车：
+
+```bash
+printf '输入本轮 rank 1 的 PID：'
+read -r RANK1_PID
+kill -9 "$RANK1_PID"
 ```
 
 查询状态；等 rank 1 dead 且 0/2/3 unhealthy 后，再执行缩容块。状态未达到时可重复这条只读查询，不重复杀进程。
@@ -161,44 +156,48 @@ fi
 
 ## 6. 核对只有 rank 1 换进程，并指定它生成（终端 3）
 
-```bash
-python - <<'PY'
-import json
-import runpy
-from pathlib import Path
-import requests
+先确认恢复返回 success=true、四 rank 均 healthy，再人工对照两个 PID 列表：本轮 rank 0/2/3 不变，只有 rank 1 换进程。此处不运行 Python 自动校验。
 
-run_dir = Path(Path("artifacts/npu_ft/current-recovery-dir.txt").read_text().strip())
-recovered = json.loads((run_dir / "recover.json").read_text())
-if not recovered.get("success") or any(r["state"] != "healthy" for r in recovered["ranks"]):
-    raise RuntimeError(f"Recovery did not pass: {recovered}")
-find = runpy.run_path("test/manual/ep/verify_npu_recovery_serving.py")["schedulers"]
-workers = find(int((run_dir / "server.pid").read_text()))
-before = json.loads((run_dir / "pids-before.json").read_text())
-after = {str(rank): [proc.pid, proc.create_time()] for rank, proc in workers.items()}
-if set(after) != set(before) or [rank for rank in before if after.get(rank) != before[rank]] != ["1"]:
-    raise RuntimeError(f"Unexpected process replacement: before={before}, after={after}")
-(run_dir / "pids-after.json").write_text(json.dumps(after, indent=2))
-print("PID check passed: only rank 1 was replaced", flush=True)
-with requests.Session() as session:
-    session.trust_env = False
-    result = session.post("http://127.0.0.1:31000/generate", json={
-        "text": "The capital of France is", "routed_dp_rank": 1,
-        "sampling_params": {"temperature": 0, "max_new_tokens": 16},
-    }, timeout=(5, 600))
-    (run_dir / "recovered-rank-generation.json").write_text(result.text)
-    result.raise_for_status()
-    output = result.json()
-print(json.dumps(output, ensure_ascii=False, indent=2))
-if not output.get("text") or output.get("meta_info", {}).get("completion_tokens", 0) <= 0:
-    raise RuntimeError("Recovered rank returned no completion")
-reason = output.get("meta_info", {}).get("finish_reason", {})
-if isinstance(reason, dict) and reason.get("type") == "abort":
-    raise RuntimeError(f"Recovered rank generation aborted: {output}")
-print(f"PASS: one manual 4 -> 3 -> 4 cycle; artifacts: {run_dir}")
-PY
+```bash
+RUN_DIR=$(cat artifacts/npu_ft/current-recovery-dir.txt)
+cat "$RUN_DIR/recover.json" | jq .
+cat "$RUN_DIR/pids-before.txt"
+ps -eo pid,ppid,lstart,args | grep '[s]glang::scheduler_' | tee "$RUN_DIR/pids-after.txt"
 ```
+
+然后明确把新请求交给 rank 1：
+
+```bash
+RUN_DIR=$(cat artifacts/npu_ft/current-recovery-dir.txt)
+curl --noproxy '*' --connect-timeout 5 --max-time 600 -sS \
+  http://127.0.0.1:31000/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"The capital of France is","routed_dp_rank":1,"sampling_params":{"temperature":0,"max_new_tokens":16}}' \
+  | tee "$RUN_DIR/recovered-rank-generation.json" | jq .
+```
+
+人工确认 text 非空、completion_tokens 大于 0、finish_reason 不是 abort，才将这轮标为通过。若未保存 pids-before.txt，不补造进程未重启的证据。
 
 成功只覆盖一轮手动故障与补回原 rank，非完整精度评测，也未覆盖第二次故障、图恢复或旧请求自动收尾。失败后保留本轮目录，不重发 recover；回传 server.log 最早完整 traceback、scale-down.json、survivor-generation.json、recover.json 与 commit.txt。若无法读取恢复响应，应先检查状态和服务日志，不把客户端超时当作恢复未执行。
 
-本机只对以上 Bash/Python 片段做语法检查，未执行这些故障或恢复命令。当前文档不是 NPU 通过结果。
+本机只对以上 Shell 与 JSON 请求体做语法检查，未执行这些故障或恢复命令。当前文档不是 NPU 通过结果。此前嵌入 Python 的辅助校验已按用户偏好改为手动命令；这不会改变服务端的恢复实现。
+
+## recover 返回 curl (52) Empty reply from server
+
+2026-11-03 用户在第 5 步回传 curl (52)，未收到恢复 HTTP 正文。恢复进度、主进程是否仍存活、实际提交与底层原因等待日志确认。当前 FT manager 在 apply 异常时会记录错误并结束服务进程树，这是候选解释，不是本轮已证实根因。不要重发 recover 或重启后覆盖现场；先逐组执行只读检查：
+
+```bash
+RUN_DIR=$(cat artifacts/npu_ft/current-recovery-dir.txt)
+tail -n 250 "$RUN_DIR/server.log"
+```
+
+```bash
+curl --noproxy '*' --connect-timeout 2 --max-time 5 -i \
+  http://127.0.0.1:31000/fault_tolerance/status
+```
+
+```bash
+RUN_DIR=$(cat artifacts/npu_ft/current-recovery-dir.txt)
+ps -p "$(cat "$RUN_DIR/server.pid")" -o pid,ppid,stat,args
+cat "$RUN_DIR/commit.txt"
+```
