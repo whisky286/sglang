@@ -2,6 +2,16 @@
 
 原方案日期：2026-11-04；后续实现进展更新至 2026-11-05。原设计与后续实现/验证范围分别记录。
 
+## 2026-11-05｜第二批实现与验收
+
+代码 `976f7f8afb0b73712170ac1ac13995ea42160499` 已推送。通过 `--enable-npu-ft-request-journal` 启用，默认关闭。TokenizerManager 在派发单条普通文本请求前保存分词后的输入、生成参数和当前成员版本，记录接收的输出 token 增量。正常结束、取消或故障结束时释放记录。批量预热、健康探测和超出记录范围的请求继续走原路径。
+
+每次受记录的执行使用独立的内部编号，复用现有进程间通信的 rid 字段。客户端响应保留公开编号。Detokenizer 自然按不同内部编号维护各次解码状态。Tokenizer 丢弃已经退役的内部编号对应的输出和 Abort，也检查旧连接的延迟清理是否仍属于原请求。已分配的请求记录最多 128 条，输入与输出上限合计预留最多 262144 token，超出配额的记录请求返回 503。状态接口可查看活跃数、预留 token 数和丢弃的迟到消息数。
+
+本机隔离 CPU 回归 134 tests、103 subtests 通过，实际请求与采样结构的复制和 msgpack 往返通过。待用户实机验证普通生成、主动取消、故障收尾、缩容及补卡后复用编号。自动重试和流式前缀恢复是后续批次。下一批先做非流式自动重试，由成员提交触发重新派发。
+
+完整手动命令见 [Gist 第 2 步](https://gist.github.com/whisky286/792bb31bb68f88ad9e6edf67c4f0f080#file-readme_npu_request_stage2-md) 和 [仓库副本](README_npu_request_stage2.md)。本轮需要启动一次新服务来加载新版本和开关。
+
 ## 2026-11-05：第一批实现与验证入口
 
 代码 `63f9fbb35de68ea126338369573788ebfd8d1705` 已实现可靠故障收尾与主动恢复排空。只有启用 NPU FT recovery 的服务接入新控制回调；故障后前端结束挂起请求，Scheduler 在设备恢复后取消排队工作。recover 在关闭新接入后等待已有前端请求和全部幸存 Scheduler 空闲；排空超时返回 HTTP 408，释放接入门禁，尚不切组、不增加成员版本、不整体退出。排空期间出现新故障返回 409，继续保持故障暂停；检查失败返回 503。
@@ -10,7 +20,7 @@
 
 实现交付时本机隔离 CPU 回归 121 tests、101 subtests passed，实机结果见下段后续回传。请求日志、attempt 隔离、故障后的自动重试和流式续推尚未实现，本批“故障时明确结束”不等于自动续推。
 
-后续用户实机回传（2026-11-05 19:15 日志）：有在途请求时 1 秒排空按预期超时；第二次 recover 在 pending_requests=True 时开始，19:18:40 drain complete，最终 recover_committed、membership_epoch=8，独立 status 四卡 healthy。原长请求以 length=1536 正常结束、curl exit=0，确认“旧请求完成后再补卡”的核心目标符合预期。缺失 drain-client-end.txt 只影响完整计时，不回填历史时间。整批的 PID 对照、新 rank 生成、故障旧连接收尾和入口拒绝等输出仍待补齐；不把核心路径通过扩大为整套 stage1 全通过。
+后续用户实机回传（2026-11-05 19:15 日志）：有在途请求时 1 秒排空按预期超时；第二次 recover 在 pending_requests=True 时开始，19:18:40 drain complete，最终 recover_committed、membership_epoch=8，独立 status 四卡 healthy。原长请求以 length=1536 正常结束、curl exit=0。用户随后确认只有 rank 1 更换进程，新 rank 1 可生成。缺失 drain-client-end.txt，完整计时未知。启动 SHA、PID 和新 rank 生成原始输出、故障旧连接收尾及入口拒绝等明细未随回传提供。
 
 完整手动命令已发布到 [Gist：第 0 步双轮基线 / 第 1 步收尾与排空](https://gist.github.com/whisky286/792bb31bb68f88ad9e6edf67c4f0f080)。仓库副本：[第 0 步](README_npu_request_stage0.md)、[第 1 步](README_npu_request_stage1.md)。先完成第 0 步，第 1 步根据当前服务是否已加载新实现选择沿用或更新启动；保存独立验证目录，不复用旧 PID。收到本批实机结果后再进入请求日志/隔离与自动重试，避免将未验证的协议改动一次性叠加。
 
@@ -78,16 +88,16 @@ HTTP/Tokenizer/Detokenizer 控制进程与原连接持续存活是首版前提�
 
 ## 4. 协议隔离：旧结果不能污染新尝试
 
-保留公开 rid，新增内部 attempt_id；不要把“重试次数”混成集群 membership_epoch。一个 epoch 内也可能重新派发请求。
+第 2 步保留公开 rid，使用唯一的内部执行编号作为进程间通信的 rid，并独立记录 membership_epoch。一个 epoch 内也可能重新派发请求。下文描述后续重试与输出提交边界需要满足的约束。
 
-TokenizedGenerateReqInput、Scheduler 内部 Req、BatchTokenIDOutput、BatchStrOutput、AbortReq 和取消/排空消息传递相同身份；批输出按每条请求对齐。成员版本、attempt_id 与每次输出的序号/token 区间共同校验。普通未开启恢复的请求保留兼容默认值；已开启恢复的尝试不能在缺少必要身份时误接收旧消息。
+TokenizedGenerateReqInput、Scheduler 内部 Req、BatchTokenIDOutput、BatchStrOutput 和 AbortReq 沿既有 rid 字段传递相同的内部身份，批输出按每条请求对齐。后续重试要核对当前执行与提交边界。普通未开启恢复的请求保留现有路径。
 
 必须在两个位置拦截：
 
-1. Detokenizer 修改 decode_status 之前，避免迟到 token 先改变解码状态。
+1. Detokenizer 按内部执行编号隔离 decode_status，使迟到 token 只能影响旧解码状态。
 2. Tokenizer 修改 RequestJournal、ReqState、out_list 或 finished 之前，避免旧 Abort 结束新尝试。
 
-故障冻结当前 attempt 后，不再提交该 attempt 的新结果。完成若在冻结前已经提交，就保持完成；冻结后到达的旧终态按旧尝试处理。已取消请求记录有限期 tombstone，收到旧完成也不能恢复。身份与序号还要覆盖延迟的取消、重复结果和重复控制 ACK。
+故障冻结当前执行后，后续阶段须从活跃映射移除旧内部编号。完成若在冻结前已经提交，就保持完成。旧编号收到结果时由其保留前缀与活跃映射判断是否丢弃，映射无需保留每条历史请求。身份与序号还要覆盖延迟的取消、重复结果和重复控制 ACK。
 
 ## 5. 主动扩容：先排空，再切换
 
