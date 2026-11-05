@@ -10,7 +10,7 @@
 
 本机隔离 CPU 回归 121 tests、101 subtests passed；尚无本批 NPU 实机结果。请求日志、attempt 隔离、故障后的自动重试和流式续推尚未实现，本批“故障时明确结束”不等于自动续推。
 
-完整手动命令已发布到 [Gist：第 0 步双轮基线 / 第 1 步收尾与排空](https://gist.github.com/whisky286/792bb31bb68f88ad9e6edf67c4f0f080)。仓库副本：[第 0 步](README_npu_request_stage0.md)、[第 1 步](README_npu_request_stage1.md)。先完成第 0 步，再独立启动第 1 步；每页固定提交、保存独立目录，不复用 PID。收到本批实机结果后再进入请求日志/隔离与自动重试，避免将未验证的协议改动一次性叠加。
+完整手动命令已发布到 [Gist：第 0 步双轮基线 / 第 1 步收尾与排空](https://gist.github.com/whisky286/792bb31bb68f88ad9e6edf67c4f0f080)。仓库副本：[第 0 步](README_npu_request_stage0.md)、[第 1 步](README_npu_request_stage1.md)。先完成第 0 步，第 1 步根据当前服务是否已加载新实现选择沿用或更新启动；保存独立验证目录，不复用旧 PID。收到本批实机结果后再进入请求日志/隔离与自动重试，避免将未验证的协议改动一次性叠加。
 
 实机成功基线为 `3060ee795527680b98752fb2cb719ab59dcf2fe5`：用户验证单轮原 rank 1 的 4→3→4、新 rank 接单以及幸存进程不重启。方案核对起点 `2603cfaf50` 在其后只有文档修改。该结果没有覆盖旧请求自动续推。
 

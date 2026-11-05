@@ -1,8 +1,48 @@
 # 第 1 步：请求可靠收尾与主动补卡排空（手动）
 
-固定代码 63f9fbb35de68ea126338369573788ebfd8d1705。先完成第 0 步，再独立重启到本版本。本机检查通过，NPU 尚未验证。本批不实现故障请求自动续推：故障请求明确结束；健康三卡主动补卡时已有请求正常完成。
+新增实现提交为 63f9fbb35de68ea126338369573788ebfd8d1705。如果 stage0 已在 pull 后启动的新代码上完成两轮，当前服务包含本提交且四卡健康，可以沿用，无需重启；从 A 入口继续。只有旧服务尚未加载新实现时，才走 B 入口更新、重启。本机检查通过，NPU 尚未验证。本批不实现故障请求自动续推：故障请求明确结束；健康三卡主动补卡时已有请求正常完成。
 
 在 NPU 仓库根目录、原 sglang-ft 环境执行。保留已有 CANN/自定义算子设置，不升级包。下面全部是手动 Shell/curl/ps/jq 操作。
+
+## A. 沿用已经运行新实现的四卡服务
+
+适用于 pull 后启动服务，并在该服务上完成 stage0 两轮的情况。只 pull 不会更新旧 Python 进程；不要用当前 git HEAD 代替启动身份。以下检查当前主进程、四卡状态和本轮日志里的新增排空路径。检查失败只停在这里，不会停止服务，也不会自动重启；缺少日志或身份不清时先回传信息。
+
+终端 3：整块执行。成功后创建独立 stage1 目录，原服务继续运行、日志仍写到原文件；stage0 的 cycle-1/cycle-2 完整保留。
+
+```bash
+ACTIVE_RUN_DIR=$(cat artifacts/npu_ft/current-recovery-dir.txt)
+STATUS_FILE="$ACTIVE_RUN_DIR/stage1-reuse-check-$(date +%Y%m%d-%H%M%S).json"
+cat "$ACTIVE_RUN_DIR/commit.txt"
+ps -p "$(cat "$ACTIVE_RUN_DIR/server.pid")" -o pid,ppid,stat,args
+grep 'NPU FT recovery drain' "$ACTIVE_RUN_DIR/server.log" | tail -n 12
+if curl --noproxy '*' --connect-timeout 2 --max-time 5 -sS \
+     http://127.0.0.1:31000/fault_tolerance/status -o "$STATUS_FILE" &&
+   jq -e '(.ranks | length) == 4 and all(.ranks[]; .state == "healthy")' "$STATUS_FILE" >/dev/null &&
+   ps -p "$(cat "$ACTIVE_RUN_DIR/server.pid")" -o args= | grep -q '[s]glang.launch_server' &&
+   grep -q 'NPU FT recovery drain complete' "$ACTIVE_RUN_DIR/server.log" &&
+   test -f "$ACTIVE_RUN_DIR/commit.txt" &&
+   git merge-base --is-ancestor 63f9fbb35de68ea126338369573788ebfd8d1705 "$(cat "$ACTIVE_RUN_DIR/commit.txt")"; then
+  RUN_DIR="artifacts/npu_ft/request-drain-reuse-$(date +%Y%m%d-%H%M%S)"
+  REAL_SERVER_LOG=$(readlink -f "$ACTIVE_RUN_DIR/server.log")
+  if mkdir "$RUN_DIR" &&
+     cp "$ACTIVE_RUN_DIR/server.pid" "$RUN_DIR/server.pid" &&
+     cp "$ACTIVE_RUN_DIR/commit.txt" "$RUN_DIR/commit.txt" &&
+     ln -s "$REAL_SERVER_LOG" "$RUN_DIR/server.log"; then
+    printf '%s\n' "$ACTIVE_RUN_DIR" > "$RUN_DIR/service-source-dir.txt"
+    printf '%s\n' "$RUN_DIR" > artifacts/npu_ft/current-recovery-dir.txt
+    printf '%s\n' 'READY：沿用当前服务；跳过 B，从“故障请求自动结束与缩容”开始。'
+  else
+    printf '%s\n' 'STOP：目录准备失败，未切换本轮目录；服务未停止。'
+  fi
+else
+  printf '%s\n' 'STOP：未确认可沿用，请回传本块输出；服务未停止，不继续故障注入。'
+fi
+```
+
+仅看到 READY 时继续本文“故障请求自动结束与缩容”部分。不要执行下面 B 的停止/启动块；后续终端都会从 current-recovery-dir.txt 读取新验证目录。
+
+## B. 从头更新并启动服务（已有服务包含新实现时跳过）
 
 终端 1：先停止本轮旧后台服务，保存文件保留。若没有 current-recovery-dir.txt，跳过停止块。Ctrl+C 退出 tail 不会停止后台服务。
 
