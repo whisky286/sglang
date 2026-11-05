@@ -490,11 +490,35 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.fault_tolerance: Optional[FaultToleranceManager] = None
         if not self.server_args.enable_fault_tolerance:
             return
+        npu_recovery_enabled = getattr(self.server_args, "enable_npu_ft_recovery", False)
         self.fault_tolerance = FaultToleranceManager(
             server_args=self.server_args,
             send_to_scheduler=self._async_dispatch_to_scheduler,
             send_to_dpc=self._async_send_to_dpc,
+            pending_requests=(lambda: bool(self.rid_to_state))
+            if npu_recovery_enabled
+            else None,
+            on_incident=(
+                self._finish_npu_faulted_requests
+                if npu_recovery_enabled
+                else None
+            ),
         )
+
+    def _finish_npu_faulted_requests(self, reason):
+        # A killed scheduler cannot send AbortReq for its requests. The CPU
+        # frontend owns the complete set, including requests before first token.
+        for rid in list(self.rid_to_state):
+            self._handle_abort_req(
+                AbortReq(
+                    rid=rid,
+                    finished_reason={
+                        "type": "abort", "message": reason,
+                        "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                        "err_type": "SchedulerFault",
+                    },
+                )
+            )
 
     async def _async_send_to_dpc(
         self,
@@ -757,6 +781,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Tokenize the request and send it to the scheduler
                 if obj.is_single:
                     tokenized_obj = await self._tokenize_one_request(obj)
+                    if obj.rid not in self.rid_to_state:
+                        raise fastapi.HTTPException(
+                            status_code=503, detail="Request ended during fault tolerance"
+                        )
                     state = self.rid_to_state[obj.rid]
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
@@ -1346,8 +1374,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
             )
 
-        tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
-        self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
+        state = self.rid_to_state.get(obj.rid)
+        if state is None:
+            raise fastapi.HTTPException(
+                status_code=503, detail="Request ended during fault tolerance"
+            )
+        tokenized_obj.time_stats = state.time_stats
+        state.time_stats.set_tokenize_finish_time()
 
         return tokenized_obj
 
@@ -2930,9 +2963,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         meta_info["completion_tokens"] = len(output_ids)
         if is_stream:
             output_ids = [output_ids[-1]] if len(output_ids) > 0 else []
+        incremental_abort = is_stream and self.incremental_streaming_output
         out = {
-            "text": state.get_text(),
-            "output_ids": output_ids,
+            "text": "" if incremental_abort else state.get_text(),
+            "output_ids": [] if incremental_abort else output_ids,
             "meta_info": meta_info,
         }
         del self.rid_to_state[recv_obj.rid]

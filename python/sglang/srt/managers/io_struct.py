@@ -1523,6 +1523,7 @@ class FaultToleranceCommandReqInput(BaseReq, kw_only=True):
     command: Literal[
         "retry",
         "scale_down",
+        "recover_check_idle",
         "recover_pause",
         "recover_prepare",
         "recover_validate",

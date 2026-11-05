@@ -10,6 +10,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.fault_tolerance.controller import FaultToleranceState, ft_failure
+from sglang.srt.fault_tolerance.request_drain import RequestDrainError, drain_requests
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     ActiveRanksUpdateReqOutput,
@@ -36,6 +37,7 @@ class PendingFTCommand:
     future: asyncio.Future
     acked: set[int] = dataclasses.field(default_factory=set)
     failed: Dict[int, str] = dataclasses.field(default_factory=dict)
+    messages: Dict[int, str] = dataclasses.field(default_factory=dict)
 
     def finish_if_ready(self) -> None:
         if (
@@ -46,10 +48,20 @@ class PendingFTCommand:
 
 
 class FaultToleranceManager:
-    def __init__(self, *, server_args, send_to_scheduler, send_to_dpc):
+    def __init__(
+        self,
+        *,
+        server_args,
+        send_to_scheduler,
+        send_to_dpc,
+        pending_requests=None,
+        on_incident=None,
+    ):
         self.server_args = server_args
         self.send_to_scheduler = send_to_scheduler
         self.send_to_dpc = send_to_dpc
+        self.pending_requests = pending_requests
+        self.on_incident = on_incident
         self.state = FaultToleranceState(
             dp_size=server_args.dp_size,
             strategy=server_args.fault_tolerance_on_error_strategy,
@@ -101,6 +113,15 @@ class FaultToleranceManager:
             raise ValueError("rank out of range")
         if len(set(ranks)) != len(ranks):
             raise ValueError("ranks must be unique")
+        if instruction == "recover":
+            drain_timeout = params.get("drain_timeout", timeout)
+            if (
+                isinstance(drain_timeout, bool)
+                or not isinstance(drain_timeout, (int, float))
+                or not math.isfinite(drain_timeout)
+                or drain_timeout <= 0
+            ):
+                raise ValueError("drain_timeout must be positive")
         return instruction, ranks, timeout
 
     async def apply(self, obj: Dict[str, Any]) -> tuple[int, dict]:
@@ -115,7 +136,11 @@ class FaultToleranceManager:
             if instruction == "retry":
                 return await self._apply_retry(timeout)
             if instruction == "recover":
-                return await self._apply_recover(ranks, timeout)
+                return await self._apply_recover(
+                    ranks,
+                    timeout,
+                    drain_timeout=obj["params"].get("drain_timeout", timeout),
+                )
             return await self._apply_scale_down(ranks, timeout)
         except Exception as exc:
             self._failstop(f"fault tolerance apply {instruction} failed: {exc}")
@@ -178,11 +203,15 @@ class FaultToleranceManager:
         if not 0 <= rank < len(self._route_dp_mask) or not self._route_dp_mask[rank]:
             raise ValueError(f"routed_dp_rank={rank} is not active")
 
-    async def _apply_recover(self, ranks: List[int], timeout: int) -> tuple[int, dict]:
+    async def _apply_recover(
+        self, ranks: List[int], timeout: int, *, drain_timeout=None
+    ) -> tuple[int, dict]:
         st = self.state
         if not getattr(self.server_args, "enable_npu_ft_recovery", False):
             return 400, ft_failure("recover_requires_enable_npu_ft_recovery")
-        removed = {rank for rank, active in enumerate(st.expected_dp_mask) if not active}
+        removed = {
+            rank for rank, active in enumerate(st.expected_dp_mask) if not active
+        }
         if not ranks or set(ranks) != removed:
             return 400, ft_failure("recover_requires_all_removed_original_ranks")
         if st.has_incident():
@@ -190,6 +219,37 @@ class FaultToleranceManager:
         if not any(0 in owned for _, owned in self._watchdog_leases.values()):
             return 409, ft_failure("recover_requires_live_local_watchdog")
         st.ft_operation_in_progress = True
+        if self.pending_requests is not None:
+
+            async def check_idle(remaining):
+                idle = await self._send_command_collect(
+                    command="recover_check_idle",
+                    target_ranks=st.expected_dp_ranks(),
+                    timeout_sec=remaining,
+                    membership_epoch=st.membership_epoch,
+                )
+                return idle == set(st.expected_dp_ranks())
+
+            try:
+                logger.info(
+                    "NPU FT recovery drain started; admission closed; pending_requests=%s",
+                    bool(self.pending_requests()),
+                )
+                await drain_requests(
+                    pending=self.pending_requests,
+                    check_idle=check_idle,
+                    has_incident=st.has_incident,
+                    timeout=timeout if drain_timeout is None else drain_timeout,
+                )
+            except RequestDrainError as exc:
+                st.ft_operation_in_progress = False
+                logger.warning("NPU FT recovery drain stopped: %s", exc)
+                return exc.status, ft_failure(str(exc))
+            except BaseException:
+                # No groups have changed; cancellation must not wedge admission.
+                st.ft_operation_in_progress = False
+                raise
+            logger.info("NPU FT recovery drain complete; starting membership recovery")
         st.membership_epoch += 1
         self._recovering_epoch = st.membership_epoch
         self._recovery_exited_ranks.clear()
@@ -323,6 +383,8 @@ class FaultToleranceManager:
         if not ranks.active and epoch is not None and epoch == self._recovering_epoch:
             self._recovery_exited_ranks.update(ranks.ranks)
         self.state.observe_process_active_ranks(ranks.ranks, active=ranks.active)
+        if not ranks.active and self.state.has_incident() and self.on_incident:
+            self.on_incident("NPU scheduler process exited")
         self._finish_shutdown_if_ready()
         return self._route_after_observation(self._auto_recover_ready_dps())
 
@@ -379,6 +441,7 @@ class FaultToleranceManager:
             return
         if output.success:
             pending.acked.add(output.rank)
+            pending.messages[output.rank] = output.message
         else:
             pending.failed[output.rank] = output.message
         pending.finish_if_ready()
@@ -396,6 +459,8 @@ class FaultToleranceManager:
 
     def handle_rank_fault(self, event: FaultToleranceRankFaultOutput) -> None:
         self.state.observe_rank_fault(event.rank)
+        if self.state.has_incident() and self.on_incident:
+            self.on_incident("NPU scheduler reported a fault")
         logger.warning(
             "FT observed scheduler exception on rank %s: %s", event.rank, event.message
         )
@@ -469,6 +534,10 @@ class FaultToleranceManager:
             raise RuntimeError(
                 f"fault tolerance command {command} failed: {pending.failed}"
             )
+        if command == "recover_check_idle":
+            return {
+                rank for rank, message in pending.messages.items() if message == "idle"
+            }
         return pending.acked
 
     def _finish_shutdown_if_ready(self) -> None:

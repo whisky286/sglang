@@ -4584,8 +4584,19 @@ class Scheduler(
     def _recover_npu_fault_tolerance_scale_down(
         self, active_mask: list[bool], *, membership_epoch: Optional[int] = None
     ) -> None:
+        close_requests = getattr(
+            getattr(self, "server_args", None), "enable_npu_ft_recovery", False
+        )
+        if close_requests and not self._ft_discard_inflight_window(
+            "NPU scale-down request cleanup", defer_kv_release=True
+        ):
+            raise RuntimeError("could not close the in-flight request window")
         model_runner = self.tp_worker.model_runner
         model_runner.recover_npu_device_for_fault_tolerance_scale_down()
+        if close_requests:
+            # Frontend failures also cover queued requests owned by the dead
+            # worker. Cancel survivors' queued work only after device recovery.
+            self.abort_request(AbortReq(abort_all=True))
 
         with self.device_module.StreamContext(self.schedule_stream):
             model_runner.apply_fault_tolerance_scale_down(
@@ -4662,6 +4673,24 @@ class Scheduler(
         )
 
     def _handle_npu_recovery_command(self, request):
+        if request.command == "recover_check_idle":
+            from sglang.srt.fault_tolerance.request_drain import (
+                scheduler_has_pending_requests,
+            )
+
+            enabled = self.server_args.enable_npu_ft_recovery
+            busy = scheduler_has_pending_requests(
+                queues=(self.waiting_queue, self.grammar_manager.grammar_queue),
+                batches=(self.running_batch, self.last_batch, self.cur_batch_for_debug),
+                result_queue=getattr(self, "result_queue", ()),
+                chunked_req=self.chunked_req,
+            )
+            return FaultToleranceCommandReqOutput(
+                request_id=request.request_id,
+                rank=self.ps.dp_rank,
+                success=enabled,
+                message=("busy" if busy else "idle") if enabled else "recovery disabled",
+            )
         from sglang.srt.fault_tolerance.npu_communication import (
             get_npu_ft_communication,
         )
