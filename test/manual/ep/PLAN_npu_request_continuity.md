@@ -8,7 +8,9 @@
 
 请求字段 params.drain_timeout 已实现，正数、默认等于 timeout，只限制切组前排空等待；后续原恢复阶段仍使用 timeout。正常补卡时须先让旧请求完成再进入原 pause/prepare/validate/commit。排空探测不暂停 Scheduler、不读取 NPU 张量。关闭恢复开关时不接入新回调。
 
-本机隔离 CPU 回归 121 tests、101 subtests passed；尚无本批 NPU 实机结果。请求日志、attempt 隔离、故障后的自动重试和流式续推尚未实现，本批“故障时明确结束”不等于自动续推。
+实现交付时本机隔离 CPU 回归 121 tests、101 subtests passed，实机结果见下段后续回传。请求日志、attempt 隔离、故障后的自动重试和流式续推尚未实现，本批“故障时明确结束”不等于自动续推。
+
+后续用户实机回传（2026-11-05 19:15 日志）：有在途请求时 1 秒排空按预期超时；第二次 recover 在 pending_requests=True 时开始，19:18:40 drain complete，最终 recover_committed、membership_epoch=8，独立 status 四卡 healthy。原长请求以 length=1536 正常结束、curl exit=0，确认“旧请求完成后再补卡”的核心目标符合预期。缺失 drain-client-end.txt 只影响完整计时，不回填历史时间。整批的 PID 对照、新 rank 生成、故障旧连接收尾和入口拒绝等输出仍待补齐；不把核心路径通过扩大为整套 stage1 全通过。
 
 完整手动命令已发布到 [Gist：第 0 步双轮基线 / 第 1 步收尾与排空](https://gist.github.com/whisky286/792bb31bb68f88ad9e6edf67c4f0f080)。仓库副本：[第 0 步](README_npu_request_stage0.md)、[第 1 步](README_npu_request_stage1.md)。先完成第 0 步，第 1 步根据当前服务是否已加载新实现选择沿用或更新启动；保存独立验证目录，不复用旧 PID。收到本批实机结果后再进入请求日志/隔离与自动重试，避免将未验证的协议改动一次性叠加。
 

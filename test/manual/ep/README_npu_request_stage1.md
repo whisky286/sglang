@@ -1,6 +1,6 @@
 # 第 1 步：请求可靠收尾与主动补卡排空（手动）
 
-新增实现提交为 63f9fbb35de68ea126338369573788ebfd8d1705。如果 stage0 已在 pull 后启动的新代码上完成两轮，当前服务包含本提交且四卡健康，可以沿用，无需重启；从 A 入口继续。只有旧服务尚未加载新实现时，才走 B 入口更新、重启。本机检查通过，NPU 尚未验证。本批不实现故障请求自动续推：故障请求明确结束；健康三卡主动补卡时已有请求正常完成。
+新增实现提交为 63f9fbb35de68ea126338369573788ebfd8d1705。如果 stage0 已在 pull 后启动的新代码上完成两轮，当前服务包含本提交且四卡健康，可以沿用，无需重启；从 A 入口继续。只有旧服务尚未加载新实现时，才走 B 入口更新、重启。本机检查通过；用户已回传长请求正常完成、排空完成、recover 提交成功和四卡 healthy，核心排空路径符合预期，其他终验项仍按本文检查。本批不实现故障请求自动续推：故障请求明确结束；健康三卡主动补卡时已有请求正常完成。
 
 在 NPU 仓库根目录、原 sglang-ft 环境执行。保留已有 CANN/自定义算子设置，不升级包。下面全部是手动 Shell/curl/ps/jq 操作。
 
@@ -199,17 +199,22 @@ curl --noproxy '*' --connect-timeout 5 --max-time 600 -sS \
 
 此时停在健康三卡，先不 recover。终端 2：启动新的三卡长请求；结束后终端自动记录时间与 curl 退出码。ignore_eos 用于避免请求过早自然结束，不作为输出质量评测。
 
+从左花括号到右花括号整块复制执行，让完成时间与退出码随请求结束一起记录。分组粘贴时 Shell 显示 > 是在等末尾右花括号，完整粘贴后才开始执行。如果旧轮缺少 drain-client-end.txt，保留缺失事实，不用当前时间补写，也不需要为补计时重跑已完成请求。
+
 ```bash
 RUN_DIR=$(cat artifacts/npu_ft/current-recovery-dir.txt)
 ROUND_DIR=$(cat "$RUN_DIR/current-round.txt")
-date -Ins > "$ROUND_DIR/drain-client-start.txt"
-curl --noproxy '*' --connect-timeout 5 --max-time 900 -N -sS \
-  http://127.0.0.1:31000/generate \
-  -H 'Content-Type: application/json' \
-  -d '{"text":"Explain distributed inference in detail.","routed_dp_rank":0,"stream":true,"sampling_params":{"temperature":0,"max_new_tokens":1536,"ignore_eos":true}}' \
-  | tee "$ROUND_DIR/drain-stream.sse"
-printf 'curl exit=%s\n' "${PIPESTATUS[0]}" | tee "$ROUND_DIR/drain-client-exit.txt"
-date -Ins > "$ROUND_DIR/drain-client-end.txt"
+{
+  date -Ins > "$ROUND_DIR/drain-client-start.txt"
+  curl --noproxy '*' --connect-timeout 5 --max-time 900 -N -sS \
+    http://127.0.0.1:31000/generate \
+    -H 'Content-Type: application/json' \
+    -d '{"text":"Explain distributed inference in detail.","routed_dp_rank":0,"stream":true,"sampling_params":{"temperature":0,"max_new_tokens":1536,"ignore_eos":true}}' \
+    | tee "$ROUND_DIR/drain-stream.sse"
+  DRAIN_CURL_EXIT=${PIPESTATUS[0]}
+  date -Ins > "$ROUND_DIR/drain-client-end.txt"
+  printf 'curl exit=%s\n' "$DRAIN_CURL_EXIT" | tee "$ROUND_DIR/drain-client-exit.txt"
+}
 ```
 
 看到长请求持续输出时，终端 3：仅这次使用 1 秒排空期限。预期 HTTP 408、success=false、recover_drain_timeout；不拉新进程、不切组。它是预期的排空失败测试，确认结果后才发下一条正常 recover。
@@ -278,6 +283,8 @@ cat "$ROUND_DIR/drain-client-exit.txt"
 cat "$ROUND_DIR/drain-client-start.txt" "$ROUND_DIR/drain-client-end.txt" \
   "$ROUND_DIR/recover-start.txt" "$ROUND_DIR/recover-end.txt"
 ```
+
+recover-end.txt 只表示 curl 命令结束，不单独证明恢复成功。还需 recover.json 的 success=true、服务日志在本次 pending_requests=True 之后出现 drain complete，以及下面的四卡状态/PID/新 rank 生成检查；不要把前几轮 pending_requests=False 的 drain complete 当成本轮结果。
 恢复 success=true 后，终端 3 独立检查四卡 healthy，人工对照 PID：只有 rank 1 换进程，其余三个 PID/创建时间不变。
 
 ```bash
