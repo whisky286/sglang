@@ -329,6 +329,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Init running status
         self.init_running_status()
 
+        self.init_request_journal()
+
         # Init fault tolerance state. Disabled FT keeps this as None.
         self.init_fault_tolerance()
 
@@ -505,13 +507,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ),
         )
 
+    def init_request_journal(self):
+        self.request_journal = None
+        if getattr(self.server_args, "enable_npu_ft_request_journal", False):
+            from sglang.srt.fault_tolerance.request_journal import RequestJournal
+
+            self.request_journal = RequestJournal()
+            logger.info("NPU FT request journal enabled in recording mode")
+
     def _finish_npu_faulted_requests(self, reason):
         # A killed scheduler cannot send AbortReq for its requests. The CPU
         # frontend owns the complete set, including requests before first token.
+        journal = getattr(self, "request_journal", None)
         for rid in list(self.rid_to_state):
             self._handle_abort_req(
                 AbortReq(
-                    rid=rid,
+                    rid=journal.execution_id(rid) if journal is not None else rid,
                     finished_reason={
                         "type": "abort", "message": reason,
                         "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
@@ -741,6 +752,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Normalize the request
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
+        journal = getattr(self, "request_journal", None)
+        if journal is not None:
+            journal.validate_request_ids((obj.rid,) if obj.is_single else obj.rid)
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
             dp_size = self.elastic_worker_count
@@ -781,14 +795,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Tokenize the request and send it to the scheduler
                 if obj.is_single:
                     tokenized_obj = await self._tokenize_one_request(obj)
-                    if obj.rid not in self.rid_to_state:
+                    state = self.rid_to_state.get(obj.rid)
+                    if state is None or state.obj is not obj:
                         raise fastapi.HTTPException(
                             status_code=503, detail="Request ended during fault tolerance"
                         )
-                    state = self.rid_to_state[obj.rid]
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
-                    self._send_one_request(tokenized_obj)
+                    self._send_one_request(
+                        tokenized_obj, record_request=isinstance(obj, GenerateReqInput)
+                    )
                     async for response in self._wait_one_response(obj, request):
                         yield response
                 else:
@@ -1497,7 +1513,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _send_one_request(
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+        *,
+        record_request: bool = False,
     ):
+        journal = getattr(self, "request_journal", None)
+        if (
+            journal is not None
+            and record_request
+            and not tokenized_obj.rid.startswith(HEALTH_CHECK_RID_PREFIX)
+        ):
+            from sglang.srt.fault_tolerance.request_journal import RequestJournalFull
+
+            try:
+                tokenized_obj = journal.start(
+                    tokenized_obj,
+                    membership_epoch=self.fault_tolerance.state.membership_epoch,
+                )
+            except RequestJournalFull as exc:
+                raise fastapi.HTTPException(status_code=503, detail=str(exc)) from exc
         tokenized_obj.time_stats.set_api_server_dispatch_time()
         tokenized_obj = wrap_shm_features(tokenized_obj)
         time_stats = tokenized_obj.time_stats
@@ -1594,7 +1627,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ):
             # Delete the key to prevent resending abort request to the scheduler and
             # to ensure aborted request state is cleaned up.
-            if state.obj.rid in self.rid_to_state:
+            if self.rid_to_state.get(state.obj.rid) is state:
                 del self.rid_to_state[state.obj.rid]
 
             # Mark ongoing LoRA request as finished.
@@ -1630,7 +1663,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     and await request.is_disconnected()
                 ):
                     # Abort the request for disconnected requests (non-streaming, waiting queue)
-                    self.abort_request(obj.rid)
+                    if self.rid_to_state.get(obj.rid) is state:
+                        self.abort_request(obj.rid)
                     # Use exception to kill the whole call stack and asyncio task
                     raise ValueError(
                         f"Request is disconnected from the client side (type 1). Abort request {obj.rid=}"
@@ -1711,7 +1745,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     and await request.is_disconnected()
                 ):
                     # Abort the request for disconnected requests (non-streaming, running)
-                    self.abort_request(obj.rid)
+                    if self.rid_to_state.get(obj.rid) is state:
+                        self.abort_request(obj.rid)
                     # Use exception to kill the whole call stack and asyncio task
                     raise ValueError(
                         f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
@@ -1849,6 +1884,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and rid not in self.rid_to_state
         ):
             return
+        journal = getattr(self, "request_journal", None)
+        if journal is not None:
+            journal.cancel(rid, all_requests=abort_all)
+            if not abort_all:
+                rid = journal.execution_id(rid)
         req = AbortReq(rid=rid, abort_all=abort_all)
         self._dispatch_to_scheduler(req)
         if self.enable_metrics:
@@ -1881,7 +1921,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def fault_tolerance_status(self):
         if self.fault_tolerance is None:
             return 503, ft_failure("fault_tolerance_disabled")
-        return self.fault_tolerance.status()
+        status, body = self.fault_tolerance.status()
+        journal = getattr(self, "request_journal", None)
+        if journal is not None:
+            body["request_journal"] = journal.status()
+        return status, body
 
     async def fault_tolerance_apply(self, obj: Dict[str, Any]):
         if self.fault_tolerance is None:
@@ -1986,11 +2030,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Abort the request if the client is disconnected.
         async def abort_request():
             await asyncio.sleep(2)
-            if obj.is_single:
-                self.abort_request(obj.rid)
-            else:
-                for rid in obj.rid:
-                    self.abort_request(rid)
+            journal = getattr(self, "request_journal", None)
+            rids = (obj.rid,) if obj.is_single else obj.rid
+            for i, rid in enumerate(rids):
+                if journal is not None:
+                    state = self.rid_to_state.get(rid)
+                    if state is None or state.obj is not (obj if obj.is_single else obj[i]):
+                        continue
+                self.abort_request(rid)
 
         background_tasks = BackgroundTasks()
         background_tasks.add_task(abort_request)
@@ -2053,7 +2100,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             customized_info = None
         pending_notify: dict[str, ReqState] = {}
         batch_notify_size = self.server_args.batch_notify_size
+        journal = getattr(self, "request_journal", None)
         for i, rid in enumerate(recv_obj.rids):
+            if journal is not None:
+                rid = journal.resolve(rid)
+                if rid is None:
+                    continue
             state = self.rid_to_state.get(rid, None)
             if state is None:
                 # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
@@ -2173,6 +2225,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 incremental = is_stream and self.incremental_streaming_output
                 delta_text = recv_obj.output_strs[i]
                 delta_output_ids = list(recv_obj.output_ids[i])
+                if journal is not None:
+                    journal.commit_output(rid, delta_output_ids)
                 output_offset = state.last_output_offset
                 state.append_text(delta_text)
                 state.output_ids.extend(delta_output_ids)
@@ -2220,6 +2274,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 is_stream = getattr(state.obj, "stream", False)
                 incremental = is_stream and self.incremental_streaming_output
                 delta_output_ids = list(recv_obj.output_ids[i])
+                if journal is not None:
+                    journal.commit_output(rid, delta_output_ids)
                 output_offset = state.last_output_offset
                 state.output_ids.extend(delta_output_ids)
 
@@ -2305,6 +2361,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
 
                 del self.rid_to_state[rid]
+                if journal is not None:
+                    journal.finish(rid)
 
                 # Mark ongoing LoRA request as finished.
                 if self.enable_lora and state.obj.lora_path:
@@ -2924,7 +2982,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # and this abort echo. If the finish wins, the rid is already gone and
         # there is nothing left to abort. Common under mass client
         # disconnects, amplified by prefix / abort_all fan-out.
-        state = self.rid_to_state.get(recv_obj.rid)
+        journal = getattr(self, "request_journal", None)
+        rid = journal.resolve(recv_obj.rid) if journal is not None else recv_obj.rid
+        if rid is None:
+            return
+        state = self.rid_to_state.get(rid)
         if state is None:
             logger.info(
                 "Abort request for rid=%s not found in rid_to_state; "
@@ -2943,7 +3005,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if recv_obj.finished_reason:
             finish_reason = recv_obj.finished_reason
         meta_info = {
-            "id": recv_obj.rid,
+            "id": rid,
             "finish_reason": finish_reason,
             "weight_version": self.server_args.weight_version,
             "e2e_latency": state.time_stats.get_e2e_latency(),
@@ -2969,7 +3031,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "output_ids": [] if incremental_abort else output_ids,
             "meta_info": meta_info,
         }
-        del self.rid_to_state[recv_obj.rid]
+        del self.rid_to_state[rid]
+        if journal is not None:
+            journal.finish(rid)
 
         state.out_list.append(out)
         state.event.set()
@@ -3186,12 +3250,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         are removed, and the scheduler-response path looks up state with
         ``.get(...)`` so a later output for a discarded rid is ignored, not fatal.
         """
-        if not hasattr(obj, "is_single") or obj.is_single:
+        is_single = getattr(obj, "is_single", True)
+        if is_single:
             rids = [obj.rid]
         else:
             rids = obj.rid
-        for rid in rids:
+        journal = getattr(self, "request_journal", None)
+        for i, rid in enumerate(rids):
+            if journal is not None:
+                state = self.rid_to_state.get(rid)
+                if state is None or state.obj is not (obj if is_single else obj[i]):
+                    continue
             self.rid_to_state.pop(rid, None)
+            if journal is not None:
+                journal.finish(rid)
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]

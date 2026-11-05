@@ -1045,6 +1045,11 @@ class ServerArgs:
         "Fault-tolerance strategy for scheduler exceptions.",
         NS("parallel"),
     ] = "pause"
+    enable_npu_ft_request_journal: A[
+        bool,
+        "Save bounded CPU request snapshots and isolate execution IDs; does not enable automatic replay.",
+        NS("parallel"),
+    ] = False
     fault_tolerance_timeout: A[
         int,
         "Timeout in seconds for fault-tolerance control commands.",
@@ -3808,6 +3813,10 @@ class ServerArgs:
             return
 
     def _handle_fault_tolerance(self):
+        if getattr(self, "enable_npu_ft_request_journal", False) and not getattr(
+            self, "enable_npu_ft_recovery", False
+        ):
+            raise ValueError("NPU FT request journal requires --enable-npu-ft-recovery")
         if getattr(self, "enable_npu_ft_recovery", False):
             from sglang.srt.fault_tolerance.npu_recovery import recovery_config_error
 
