@@ -1,6 +1,6 @@
 # NPU 缩容与扩容：在途请求连续性实施方案
 
-原方案日期：2026-11-04；后续实现进展更新至 2026-11-05。原设计与后续实现/验证范围分别记录。
+原方案日期：2026-11-04；后续实现进展更新至 2026-11-11。原设计与后续实现/验证范围分别记录。
 
 ## 2026-11-05｜第二批实现与验收
 
@@ -8,7 +8,9 @@
 
 每次受记录的执行使用独立的内部编号，复用现有进程间通信的 rid 字段。客户端响应保留公开编号。Detokenizer 自然按不同内部编号维护各次解码状态。Tokenizer 丢弃已经退役的内部编号对应的输出和 Abort，也检查旧连接的延迟清理是否仍属于原请求。已分配的请求记录最多 128 条，输入与输出上限合计预留最多 262144 token，超出配额的记录请求返回 503。状态接口可查看活跃数、预留 token 数和丢弃的迟到消息数。
 
-本机隔离 CPU 回归 134 tests、103 subtests 通过，实际请求与采样结构的复制和 msgpack 往返通过。待用户实机验证普通生成、主动取消、故障收尾、缩容及补卡后复用编号。自动重试和流式前缀恢复是后续批次。下一批先做非流式自动重试，由成员提交触发重新派发。
+实现交付时本机隔离 CPU 回归 134 tests、103 subtests 通过，实际请求与采样结构的复制和 msgpack 往返通过。自动重试和流式前缀恢复是后续批次。下一批先做非流式自动重试，由成员提交触发重新派发。
+
+实机验证通过（2026-11-11，单机 node73-144 四卡，代码 `976f7f8afb`，目录 `artifacts/npu_ft/request-journal-20261111-222125`）：手册三个小节全部通过。启动日志确认 journal recording 模式，四卡 healthy、三项计数为 0。同一公开编号连发两次普通生成均正常结束、计数归零。长流请求取消前 active_requests=1、reserved_tokens=1546，abort 返回 HTTP 200，流以 abort 终态结束、计数归零。故障注入：流交付 46 token 后 kill -9 本轮 rank 1 Scheduler（588013），状态收敛为 rank 1 dead、0/2/3 unhealthy，故障流以 abort/503/SchedulerFault 明确收尾、curl exit=0，journal 同步释放。scale_down 发出后约 20 秒返回 success=true（22:29:28），三卡生成通过；随后单次 recover 约 40 秒返回 success=true（22:30:42），membership_epoch 递增至 2，四卡 healthy。PID 对照只有 rank 1 更换进程（588013→799325），rank 0/2/3 PID 与创建时间不变。复用故障请求公开编号 `journal-fault-check` 在新 rank 1 上生成通过，返回仍为同一公开编号。全程 stale_messages_dropped=0；本批按设计故障请求明确结束，不含自动续推与流式前缀恢复。
 
 完整手动命令见 [Gist 第 2 步](https://gist.github.com/whisky286/792bb31bb68f88ad9e6edf67c4f0f080#file-readme_npu_request_stage2-md) 和 [仓库副本](README_npu_request_stage2.md)。本轮需要启动一次新服务来加载新版本和开关。
 
