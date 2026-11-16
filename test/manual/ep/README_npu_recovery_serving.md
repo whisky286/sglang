@@ -2,6 +2,8 @@
 
 文章准备、三组对照实验、容量压测和数据口径见[容错特性文章与实验计划](PLAN_npu_ft_article_and_experiments.md)。
 
+2026-11-16 新增[Shell自动化实验入口](README_npu_ft_bench.md)：自动定位本轮 rank 1 PID，在生成期间注入故障，等待其余 rank 全部 unhealthy 后缩容，支持三组实验与补卡验证。脚本通过本机隔离 CPU 检查，尚未在 NPU 上完整运行；不替代下述已有手动实机结果。
+
 这里验证单机 eager 服务的 `4→3→4`：原 rank 退出后，三卡先恢复生成，再由控制器拉起同编号新进程、重建通信和 DeepEP buffer、加载当前专家布局，最后重新开放四卡请求路由。服务启动时需要 `--enable-npu-ft-recovery`。当前实机通过的是手动原 rank 1 流程；下方旧自动化材料使用 rank 2，不能视作同一实验已通过。
 
 **最新状态（2026-11-03 用户回传，服务器 ps 日期为 11 月 4 日）：单轮手动原 rank 1 恢复 4→3→4 已实机通过。** 三卡 dp_rank=0 生成 16 tokens；recover success=true、membership_epoch=2，四卡 healthy；只有 rank 1 的 PID 从 3109763 变为 3237419，0/2/3 保持原进程；指定新 rank 1 的请求返回 dp_rank=1、16 tokens、finish_reason=length。两次短输入的 output_ids 一致，不代表完整精度通过。
