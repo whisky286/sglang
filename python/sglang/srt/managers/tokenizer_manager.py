@@ -425,6 +425,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.asyncio.Context(2)
         self._zmq_context = context
+        self._ft_detokenizer_endpoint = port_args.detokenizer_ipc_name
         self._dpc_control_endpoints: Dict[int, str] = {}
         self._dpc_control_sockets: Dict[int, zmq.asyncio.Socket] = {}
         self.recv_from_detokenizer = get_zmq_socket(
@@ -477,12 +478,35 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def init_fault_tolerance(self):
         self.fault_tolerance: Optional[FaultToleranceManager] = None
+        self.request_recovery = None
         if not self.server_args.enable_fault_tolerance:
             return
+        if self.server_args.enable_ft_request_recovery:
+            from sglang.srt.fault_tolerance.request_recovery import (
+                RequestRecoveryCoordinator,
+            )
+            from sglang.srt.managers.io_struct import FTDecodeRetireReq
+
+            self._ft_decode_control = get_zmq_socket(
+                self._zmq_context, zmq.PUSH, self._ft_detokenizer_endpoint, False
+            )
+            self.request_recovery = RequestRecoveryCoordinator(
+                self,
+                retire=lambda ids: sock_send(
+                    self._ft_decode_control, FTDecodeRetireReq(execution_ids=ids)
+                ),
+            )
+            logger.info(
+                "FT request recovery enabled: CPU replay with private execution IDs"
+            )
         self.fault_tolerance = FaultToleranceManager(
             server_args=self.server_args,
             send_to_scheduler=self._async_dispatch_to_scheduler,
             send_to_dpc=self._async_send_to_dpc,
+            on_incident=self.request_recovery.freeze if self.request_recovery else None,
+            on_recovered=self.request_recovery.resume
+            if self.request_recovery
+            else None,
         )
 
     async def _async_send_to_dpc(
@@ -704,6 +728,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Normalize the request
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
+        recovery = getattr(self, "request_recovery", None)
+        if recovery is not None:
+            rids = [obj.rid] if obj.is_single else obj.rid
+            health = all(rid.startswith(HEALTH_CHECK_RID_PREFIX) for rid in rids)
+            if not health and (
+                not isinstance(obj, GenerateReqInput) or not obj.is_single
+            ):
+                raise ValueError(
+                    "FT request recovery supports single text generation requests"
+                )
+            if any(
+                rid.startswith("__sglang_ft_attempt__") or rid in self.rid_to_state
+                for rid in rids
+            ):
+                raise ValueError("Duplicate or reserved request ID")
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
             dp_size = self.elastic_worker_count
@@ -753,7 +792,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else:
                     async for response in self._handle_batch_request(obj, request):
                         yield response
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             # _init_req_state created a rid_to_state entry per (sub-)request up
             # front. The normal remover is the scheduler-response path
             # (_handle_batch_output), so a failure *before* a request reaches the
@@ -1451,7 +1490,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _send_one_request(
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+        *,
+        recovery_replay: bool = False,
     ):
+        recovery = getattr(self, "request_recovery", None)
+        if (
+            recovery is not None
+            and not recovery_replay
+            and not tokenized_obj.rid.startswith(HEALTH_CHECK_RID_PREFIX)
+    ):
+            from sglang.srt.fault_tolerance.request_recovery import (
+                RecoveryCapacityError,
+                RecoveryDeadlineError,
+            )
+
+            try:
+                tokenized_obj = recovery.prepare(tokenized_obj)
+            except RecoveryCapacityError as exc:
+                raise fastapi.HTTPException(status_code=503, detail=str(exc)) from exc
+            except RecoveryDeadlineError as exc:
+                raise fastapi.HTTPException(status_code=408, detail=str(exc)) from exc
+            if (
+                tokenized_obj is None
+            ):  # Accepted before the fault, tokenization finished during pause.
+                return
         tokenized_obj.time_stats.set_api_server_dispatch_time()
         tokenized_obj = wrap_shm_features(tokenized_obj)
         time_stats = tokenized_obj.time_stats
@@ -1548,7 +1610,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ):
             # Delete the key to prevent resending abort request to the scheduler and
             # to ensure aborted request state is cleaned up.
-            if state.obj.rid in self.rid_to_state:
+            if self.rid_to_state.get(state.obj.rid) is state:
                 del self.rid_to_state[state.obj.rid]
 
             # Mark ongoing LoRA request as finished.
@@ -1803,6 +1865,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and rid not in self.rid_to_state
         ):
             return
+        recovery = getattr(self, "request_recovery", None)
+        if recovery is not None:
+            rids = list(recovery.journal.records) if abort_all else [rid]
+            handled = False
+            for public_id in rids:
+                handled = (
+                    recovery.abort(public_id, "Request cancelled", status_code=None)
+                    or handled
+                )
+            if handled and not abort_all:
+                return
         req = AbortReq(rid=rid, abort_all=abort_all)
         self._dispatch_to_scheduler(req)
         if self.enable_metrics:
@@ -1835,7 +1908,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def fault_tolerance_status(self):
         if self.fault_tolerance is None:
             return 503, ft_failure("fault_tolerance_disabled")
-        return self.fault_tolerance.status()
+        code, body = self.fault_tolerance.status()
+        if self.request_recovery is not None:
+            body["request_recovery"] = self.request_recovery.journal.status()
+        return code, body
 
     async def fault_tolerance_apply(self, obj: Dict[str, Any]):
         if self.fault_tolerance is None:
@@ -1940,10 +2016,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Abort the request if the client is disconnected.
         async def abort_request():
             await asyncio.sleep(2)
-            if obj.is_single:
-                self.abort_request(obj.rid)
-            else:
-                for rid in obj.rid:
+            # StreamingResponse creates this task before generate_request starts.
+            # Match the original request object at cleanup time, including when
+            # a newer HTTP request has already reused the same public ID.
+            rids = [obj.rid] if obj.is_single else obj.rid
+            for i, rid in enumerate(rids):
+                state = self.rid_to_state.get(rid)
+                expected = obj if obj.is_single else obj[i]
+                if state is not None and state.obj is expected:
                     self.abort_request(rid)
 
         background_tasks = BackgroundTasks()
@@ -2006,8 +2086,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             customized_info = None
         pending_notify: dict[str, ReqState] = {}
+        recovery = getattr(self, "request_recovery", None)
         batch_notify_size = self.server_args.batch_notify_size
         for i, rid in enumerate(recv_obj.rids):
+            if recovery is not None:
+                rid = recovery.journal.resolve(rid)
+                if rid is None:
+                    continue
             state = self.rid_to_state.get(rid, None)
             if state is None:
                 # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
@@ -2018,6 +2103,35 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 continue
 
+            if recovery is not None and rid in recovery.journal.records:
+                failure = recovery.journal.failure(
+                    recovery.journal.records[rid], recovery.weight_key()
+                )
+                if failure:
+                    recovery.abort(rid, failure)
+                    continue
+                reason = recv_obj.finished_reasons[i]
+                if reason and reason.get("err_type") == "SchedulerFault":
+                    recovery.freeze()
+                    continue
+                checkpoints = getattr(recv_obj, "ft_decode_checkpoints", None)
+                checkpoint = checkpoints[i] if checkpoints else None
+                try:
+                    if reason is None and checkpoint is None:
+                        raise ValueError("Missing FT decode checkpoint")
+                    recovery.journal.commit_output(
+                        rid,
+                        list(recv_obj.output_ids[i]),
+                        checkpoint,
+                        recv_obj.completion_tokens[i],
+                        recv_obj.dp_ranks[i]
+                        if getattr(recv_obj, "dp_ranks", None)
+                        else None,
+                    )
+                except ValueError as exc:
+                    recovery.abort(rid, str(exc))
+                    continue
+
             # Build meta_info and return value
             meta_info = {
                 "id": rid,
@@ -2026,6 +2140,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "weight_version": self.server_args.weight_version,
                 "num_retractions": recv_obj.retraction_counts[i],
             }
+            if recovery is not None and rid in recovery.journal.records:
+                record = recovery.journal.records[rid]
+                meta_info["recovery_attempts"] = record.retries
+                meta_info["membership_epoch"] = record.epoch
 
             if self.enable_metrics:
                 if recv_obj.time_stats is not None:
@@ -2259,6 +2377,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
 
                 del self.rid_to_state[rid]
+                if recovery is not None:
+                    recovery.finish(rid)
 
                 # Mark ongoing LoRA request as finished.
                 if self.enable_lora and state.obj.lora_path:
@@ -2878,7 +2998,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # and this abort echo. If the finish wins, the rid is already gone and
         # there is nothing left to abort. Common under mass client
         # disconnects, amplified by prefix / abort_all fan-out.
-        state = self.rid_to_state.get(recv_obj.rid)
+        recovery = getattr(self, "request_recovery", None)
+        rid = recovery.journal.resolve(recv_obj.rid) if recovery else recv_obj.rid
+        if rid is None:
+            return
+        if (
+            recovery is not None
+            and rid in recovery.journal.records
+            and (recv_obj.finished_reason or {}).get("err_type") == "SchedulerFault"
+        ):
+            recovery.freeze()
+            return
+        state = self.rid_to_state.get(rid)
         if state is None:
             logger.info(
                 "Abort request for rid=%s not found in rid_to_state; "
@@ -2897,7 +3028,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if recv_obj.finished_reason:
             finish_reason = recv_obj.finished_reason
         meta_info = {
-            "id": recv_obj.rid,
+            "id": rid,
             "finish_reason": finish_reason,
             "weight_version": self.server_args.weight_version,
             "e2e_latency": state.time_stats.get_e2e_latency(),
@@ -2915,14 +3046,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         output_ids = state.output_ids
         meta_info["completion_tokens"] = len(output_ids)
-        if is_stream:
-            output_ids = [output_ids[-1]] if len(output_ids) > 0 else []
+        incremental = is_stream and self.incremental_streaming_output
+        if incremental:
+            output_ids = []
         out = {
-            "text": state.get_text(),
+            "text": "" if incremental else state.get_text(),
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
-        del self.rid_to_state[recv_obj.rid]
+        del self.rid_to_state[rid]
+        if recovery is not None:
+            recovery.finish(rid)
 
         state.out_list.append(out)
         state.event.set()
@@ -3144,6 +3278,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             rids = obj.rid
         for rid in rids:
+            state = self.rid_to_state.get(rid)
+            if state is not None and (
+                not getattr(obj, "is_single", True) or state.obj is obj
+            ):
+                recovery = getattr(self, "request_recovery", None)
+                if recovery is not None and rid in recovery.journal.records:
+                    execution_id = recovery.journal.records[rid].execution_id
+                    recovery.finish(rid)
+                    if execution_id:
+                        self._dispatch_to_scheduler(AbortReq(rid=execution_id))
             self.rid_to_state.pop(rid, None)
 
     def _should_dispatch_to_encoder(

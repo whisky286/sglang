@@ -80,6 +80,7 @@ class FaultToleranceState:
         self.pending_recovery_global_ranks: set[int] = set()
         self.unhealthy_dp_ranks: set[int] = set()
         self.ft_operation_in_progress = False
+        self.membership_epoch = 0
         self.cluster_paused = False
 
     def global_ranks_for_dp(self, dp_rank: int) -> range:

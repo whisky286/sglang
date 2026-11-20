@@ -2255,6 +2255,15 @@ def _execute_server_warmup(server_args: ServerArgs):
         ).tolist()
         json_data["sampling_params"]["max_new_tokens"] = 0
 
+    if server_args.enable_ft_request_recovery and request_name == "/generate":
+        from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+
+        # Internal batch warmup stays outside the single-request replay policy.
+        json_data["rid"] = [
+            f"{HEALTH_CHECK_RID_PREFIX}_WARMUP_{rank}"
+            for rank in range(server_args.dp_size)
+        ]
+
     # Send a warmup request
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:

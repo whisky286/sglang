@@ -796,6 +796,11 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     token_type_ids: Optional[List[int]]
     # The sampling parameters
     sampling_params: SamplingParams
+    # CPU-only request replay metadata. The original input remains input_ids.
+    ft_request_epoch: int = 0
+    ft_recovery_attempt: int = 0
+    ft_resume_output_ids: Optional[List[int]] = None
+    ft_decode_checkpoint: Optional[Dict[str, Any]] = None
     # Whether to return the logprobs
     return_logprob: bool
     # If return logprobs, the start location in the prompt for returning logprobs.
@@ -1207,6 +1212,7 @@ FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
 
 
 class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
+    ft_decode_checkpoints: Optional[List[Optional[Dict[str, Any]]]] = None
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
     # For incremental decoding
@@ -1298,6 +1304,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 
 
 class BatchStrOutput(BaseBatchReq, kw_only=True):
+    ft_decode_checkpoints: Optional[List[Optional[Dict[str, Any]]]] = None
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
     # The output decoded strings
@@ -1523,6 +1530,11 @@ class FaultToleranceCommandReqInput(BaseReq, kw_only=True):
     command: Literal["retry", "scale_down"]
     target_ranks: List[int]
     active_mask: Optional[List[bool]] = None
+    request_epoch: int = 0
+
+
+class FTDecodeRetireReq(BaseReq, kw_only=True):
+    execution_ids: List[str]
 
 
 class FaultToleranceCommandReqOutput(BaseReq, kw_only=True):
@@ -1535,6 +1547,7 @@ class FaultToleranceCommandReqOutput(BaseReq, kw_only=True):
 class FaultToleranceRankFaultOutput(BaseReq, kw_only=True):
     rank: int
     message: str = ""
+    request_epoch: Optional[int] = None
 
 
 class TokenizerWorkerRegistrationReq(BaseReq, kw_only=True):
@@ -1827,6 +1840,7 @@ class AbortReq(BaseReq, kw_only=True):
 class ActiveRanksOutput(BaseReq, kw_only=True):
     status: List[bool]
     request_id: Optional[str] = None
+    request_epoch: Optional[int] = None
 
 
 class ProcessActiveRanksOutput(BaseReq, kw_only=True):

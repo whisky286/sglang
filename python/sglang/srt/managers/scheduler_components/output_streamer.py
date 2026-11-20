@@ -267,6 +267,7 @@ class _GenerationStreamAccumulator:
     decoded_texts: list = field(default_factory=list)
     decode_ids_list: list = field(default_factory=list)
     read_offsets: list = field(default_factory=list)
+    ft_decode_checkpoints: list = field(default_factory=list)
     output_ids: list = field(default_factory=list)
     skip_special_tokens: list = field(default_factory=list)
     spaces_between_special_tokens: list = field(default_factory=list)
@@ -375,6 +376,8 @@ class _GenerationStreamAccumulator:
         decode_ids, read_offset = req.init_incremental_detokenize()
 
         self.decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+        self.ft_decode_checkpoints.append(getattr(req, "ft_decode_checkpoint", None))
+        req.ft_decode_checkpoint = None
 
         # Exclude the tokens after stop condition
         output_ids_ = req.output_ids_through_stop
@@ -572,6 +575,9 @@ class _GenerationStreamAccumulator:
             decoded_texts=self.decoded_texts,
             decode_ids=self.decode_ids_list,
             read_offsets=self.read_offsets,
+            ft_decode_checkpoints=(
+                self.ft_decode_checkpoints if any(self.ft_decode_checkpoints) else None
+            ),
             output_ids=self.output_ids,
             skip_special_tokens=self.skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,

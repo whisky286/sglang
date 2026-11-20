@@ -28,12 +28,17 @@ import zmq
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
+from sglang.srt.fault_tolerance.request_recovery import (
+    EXECUTION_PREFIX,
+    decode_checkpoint,
+)
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
     ConfigureLoggingReq,
     FreezeGCReq,
+    FTDecodeRetireReq,
     sock_recv,
     sock_send,
 )
@@ -140,6 +145,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def init_running_status(self, server_args: ServerArgs):
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
+        self._ft_retired = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
         self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
         self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
 
@@ -160,6 +166,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 (BatchTokenIDOutput, self.handle_batch_token_id_out),
                 (FreezeGCReq, self.handle_freeze_gc_req),
                 (ConfigureLoggingReq, self.handle_configure_logging_req),
+                (FTDecodeRetireReq, self.handle_ft_decode_retire),
             ]
         )
 
@@ -295,15 +302,32 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         read_ids, surr_ids = [], []
         for i in range(bs):
             rid = recv_obj.rids[i]
+            retired = rid in getattr(self, "_ft_retired", {})
+            checkpoints = getattr(recv_obj, "ft_decode_checkpoints", None)
+            checkpoint = checkpoints[i] if checkpoints else None
             if rid not in self.decode_status:
-                s = DecodeStatus(
-                    decoded_text=recv_obj.decoded_texts[i],
-                    decode_ids=self._clamp_decode_ids(
-                        recv_obj.decode_ids[i], vocab_size
-                    ),
-                    surr_offset=0,
-                    read_offset=recv_obj.read_offsets[i],
-                )
+                if checkpoint is not None and not retired:
+                    # Only the uncommitted decoding tail is needed. Previously
+                    # emitted text remains in the original Tokenizer ReqState.
+                    s = DecodeStatus(
+                        decoded_text="",
+                        decode_ids=list(checkpoint["decode_ids"]),
+                        surr_offset=0,
+                        read_offset=checkpoint["read_offset"],
+                        sent_offset=checkpoint["pending_chars"],
+                    )
+                    s.decode_ids.extend(
+                        self._clamp_decode_ids(recv_obj.decode_ids[i], vocab_size)
+                    )
+                else:
+                    s = DecodeStatus(
+                        decoded_text=recv_obj.decoded_texts[i],
+                        decode_ids=self._clamp_decode_ids(
+                            recv_obj.decode_ids[i], vocab_size
+                        ),
+                        surr_offset=0,
+                        read_offset=recv_obj.read_offsets[i],
+                    )
                 self.decode_status[rid] = s
             else:
                 s = self.decode_status[rid]
@@ -371,6 +395,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
                 )
             new_text = read_texts[i][len(surr_texts[i]) :]
+            if rid in getattr(self, "_ft_retired", {}):
+                self.decode_status.pop(rid, None)
+                output_strs.append("")
+                continue
             if recv_obj.finished_reasons[i] is None:
                 # Streaming. Invariant: sent_offset >= decoded_text_len. The
                 # gap (`pending`) is "printable but uncommitted" text emitted
@@ -436,11 +464,20 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         )
         routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
+        checkpoints = []
+        for rid in recv_obj.rids:
+            state = self.decode_status.get(rid)
+            checkpoints.append(
+                decode_checkpoint(state)
+                if rid.startswith(EXECUTION_PREFIX) and state is not None
+                else None
+            )
         return BatchStrOutput(
             rids=recv_obj.rids,
             http_worker_ipcs=recv_obj.http_worker_ipcs,
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
+            ft_decode_checkpoints=checkpoints if any(checkpoints) else None,
             output_ids=recv_obj.output_ids,
             prompt_tokens=recv_obj.prompt_tokens,
             reasoning_tokens=recv_obj.reasoning_tokens,
@@ -482,6 +519,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
         )
+
+    def handle_ft_decode_retire(self, recv_req: FTDecodeRetireReq):
+        for execution_id in recv_req.execution_ids:
+            self.decode_status.pop(execution_id, None)
+            self._ft_retired[execution_id] = True
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
         freeze_gc("Detokenizer Manager")

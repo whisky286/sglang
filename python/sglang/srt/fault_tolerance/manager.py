@@ -44,10 +44,20 @@ class PendingFTCommand:
 
 
 class FaultToleranceManager:
-    def __init__(self, *, server_args, send_to_scheduler, send_to_dpc):
+    def __init__(
+        self,
+        *,
+        server_args,
+        send_to_scheduler,
+        send_to_dpc,
+        on_incident=None,
+        on_recovered=None,
+    ):
         self.server_args = server_args
         self.send_to_scheduler = send_to_scheduler
         self.send_to_dpc = send_to_dpc
+        self.on_incident = on_incident
+        self.on_recovered = on_recovered
         self.state = FaultToleranceState(
             dp_size=server_args.dp_size,
             strategy=server_args.fault_tolerance_on_error_strategy,
@@ -73,12 +83,20 @@ class FaultToleranceManager:
         self.asyncio_tasks = set()
 
     def status(self) -> tuple[int, dict]:
-        return 200, self.state.status_response()
+        body = self.state.status_response()
+        body["membership_epoch"] = self.state.membership_epoch
+        return 200, body
 
     def _parse_apply_args(self, obj: Dict[str, Any]) -> Tuple[str, List[int], int]:
         instruction = obj["instruction"]
         if instruction not in ("retry", "scale_down"):
             raise ValueError(f"unsupported instruction: {instruction}")
+        if (
+            instruction == "retry"
+            and getattr(self.server_args, "enable_ft_request_recovery", False)
+            and getattr(self.server_args, "device", None) == "npu"
+        ):
+            raise ValueError("NPU request recovery requires scale_down")
         params = obj["params"]
         timeout = params.get("timeout", self.server_args.fault_tolerance_timeout)
         ranks = params.get("ranks", [])
@@ -98,8 +116,15 @@ class FaultToleranceManager:
 
         try:
             if instruction == "retry":
-                return await self._apply_retry(timeout)
-            return await self._apply_scale_down(ranks, timeout)
+                result = await self._apply_retry(timeout)
+            else:
+                result = await self._apply_scale_down(ranks, timeout)
+            if result[0] == 200:
+                self.state.membership_epoch += 1
+                result[1]["membership_epoch"] = self.state.membership_epoch
+                if self.on_recovered is not None:
+                    await self.on_recovered()
+            return result
         except Exception as exc:
             self._failstop(f"fault tolerance apply {instruction} failed: {exc}")
 
@@ -217,14 +242,18 @@ class FaultToleranceManager:
     def observe_active_ranks(
         self, ranks: ActiveRanksOutput
     ) -> Optional[ActiveRanksOutput]:
+        if self._stale_request_epoch(ranks):
+            return None
         # Scheduler-originated ActiveRanksOutput.status is a DP-rank mask.
         self.state.observe_native_active_dp_mask(list(ranks.status))
+        self._notify_incident()
         return self._route_after_observation(self._auto_recover_ready_dps())
 
     def observe_process_active_ranks(
         self, ranks: ProcessActiveRanksOutput
     ) -> Optional[ActiveRanksOutput]:
         self.state.observe_process_active_ranks(ranks.ranks, active=ranks.active)
+        self._notify_incident()
         self._finish_shutdown_if_ready()
         return self._route_after_observation(self._auto_recover_ready_dps())
 
@@ -292,9 +321,24 @@ class FaultToleranceManager:
             future.set_exception(RuntimeError(output.message))
 
     def handle_rank_fault(self, event: FaultToleranceRankFaultOutput) -> None:
+        if self._stale_request_epoch(event):
+            return
         self.state.observe_rank_fault(event.rank)
+        self._notify_incident()
         logger.warning(
             "FT observed scheduler exception on rank %s: %s", event.rank, event.message
+        )
+
+    def _notify_incident(self):
+        if self.on_incident is not None and self.state.has_incident():
+            self.on_incident()
+
+    def _stale_request_epoch(self, event):
+        epoch = getattr(event, "request_epoch", None)
+        return (
+            getattr(self.server_args, "enable_ft_request_recovery", False)
+            and epoch is not None
+            and epoch != self.state.membership_epoch
         )
 
     def _create_task(self, coro):
@@ -352,6 +396,7 @@ class FaultToleranceManager:
             # This command is consumed by per-scheduler Elastic EP control, so
             # its active_mask remains a physical scheduler/global-rank mask.
             active_mask=active_global_rank_mask,
+            request_epoch=self.state.membership_epoch + 1,
         )
         await self.send_to_scheduler(req)
         try:

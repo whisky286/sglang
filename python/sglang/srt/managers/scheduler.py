@@ -1038,6 +1038,7 @@ class Scheduler(
         self.forward_sleep_time = None
         self._engine_paused = False
         self._ft_pause_deadline: Optional[float] = None
+        self._ft_request_epoch = 0
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1584,6 +1585,7 @@ class Scheduler(
                         FaultToleranceRankFaultOutput(
                             rank=self.ps.dp_rank,
                             message=str(exc),
+                            request_epoch=getattr(self, "_ft_request_epoch", 0),
                         )
                     )
 
@@ -1608,6 +1610,7 @@ class Scheduler(
                     FaultToleranceRankFaultOutput(
                         rank=self.ps.dp_rank,
                         message=str(exc),
+                        request_epoch=getattr(self, "_ft_request_epoch", 0),
                     )
                 )
                 if should_continue:
@@ -1626,6 +1629,14 @@ class Scheduler(
             window_batches.extend(batch for batch, _ in result_queue)
 
         discarded_by_rid = {}
+        recover_requests = getattr(
+            getattr(self, "server_args", None), "enable_ft_request_recovery", False
+        )
+        if recover_requests:
+            # Queued requests also belong to the abandoned execution epoch.
+            window_batches.append(
+                ScheduleBatch(reqs=list(self.waiting_queue), batch_is_full=False)
+            )
         for batch in window_batches:
             if batch is None:
                 continue
@@ -1662,7 +1673,10 @@ class Scheduler(
                         deferred_reqs = {}
                         self._ft_deferred_kv_release_reqs = deferred_reqs
                     deferred_reqs.setdefault(req.rid, req)
-                else:
+                elif (
+                    not recover_requests
+                    or getattr(req, "req_pool_idx", None) is not None
+                ):
                     release_kv_cache(
                         req,
                         self.tree_cache,
@@ -1690,6 +1704,8 @@ class Scheduler(
             return False
 
         self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+        if recover_requests:
+            self.waiting_queue.clear()
         if self.chunked_req is not None and self.chunked_req.rid in discarded_by_rid:
             self.chunked_req = None
         if result_queue is not None:
@@ -1719,12 +1735,20 @@ class Scheduler(
             return
 
         for rid, req in list(deferred_reqs.items()):
-            release_kv_cache(
-                req,
-                self.tree_cache,
-                is_insert=False,
-                allow_non_spec_overallocated=True,
-            )
+            if (
+                not getattr(
+                    getattr(self, "server_args", None),
+                    "enable_ft_request_recovery",
+                    False,
+                )
+                or getattr(req, "req_pool_idx", None) is not None
+            ):
+                release_kv_cache(
+                    req,
+                    self.tree_cache,
+                    is_insert=False,
+                    allow_non_spec_overallocated=True,
+                )
             deferred_reqs.pop(rid, None)
 
     def _process_next_overlap_result(self) -> None:
@@ -2327,6 +2351,26 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        if (
+            self.server_args.enable_ft_request_recovery
+            and recv_req.rid.startswith("__sglang_ft_attempt__")
+            and (
+                recv_req.ft_request_epoch != self._ft_request_epoch
+                or self._engine_paused
+            )
+        ):
+            self.ipc_channels.send_to_tokenizer.send_output(
+                AbortReq(
+                    rid=recv_req.rid,
+                    finished_reason={
+                        "type": "abort",
+                        "status_code": 503,
+                        "err_type": "SchedulerFault",
+                        "message": "Retired FT request execution",
+                    },
+                )
+            )
+            return
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
@@ -2391,6 +2435,10 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.tokenizer = self.tokenizer
+            if recv_req.ft_resume_output_ids:
+                from sglang.srt.fault_tolerance.request_recovery import restore_request
+
+                restore_request(req, recv_req)
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -3770,7 +3818,8 @@ class Scheduler(
         if inst is not None and inst.active_ranks_cpu is not None:
             self.ipc_channels.send_to_tokenizer.send_output(
                 ActiveRanksOutput(
-                    status=[bool(x) for x in inst.active_ranks_cpu.tolist()]
+                    status=[bool(x) for x in inst.active_ranks_cpu.tolist()],
+                    request_epoch=getattr(self, "_ft_request_epoch", 0),
                 )
             )
         else:
@@ -4599,12 +4648,24 @@ class Scheduler(
         if rank not in recv_req.target_ranks:
             return None
 
+        recover_requests = getattr(
+            self.server_args, "enable_ft_request_recovery", False
+        )
+        if recover_requests:
+            self._engine_paused = True
+            if not self._ft_discard_inflight_window(
+                "retiring execution epoch before FT commit", defer_kv_release=True
+            ):
+                raise RuntimeError("Failed to retire the previous request epoch")
+
         if recv_req.command == "retry":
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
             state = ElasticEPStateManager.instance()
             state.active_ranks.copy_(state.last_active_ranks)
             state.active_ranks_cpu.copy_(state.last_active_ranks.detach().cpu())
+            if recover_requests:
+                self._ft_release_deferred_kv_cache()
             message = "retried"
         elif recv_req.command == "scale_down":
             model_runner = self.tp_worker.model_runner
@@ -4625,6 +4686,8 @@ class Scheduler(
                     )
             else:
                 model_runner.apply_fault_tolerance_scale_down(recv_req.active_mask)
+                if recover_requests:
+                    self._ft_release_deferred_kv_cache()
             message = "scaled down"
         else:
             logger.warning(
@@ -4633,6 +4696,8 @@ class Scheduler(
             return None
 
         self._engine_paused = False
+        if recover_requests:
+            self._ft_request_epoch = recv_req.request_epoch
         self._ft_pause_deadline = None
 
         if self.ps.attn_tp_rank != 0 or self.ps.attn_cp_rank != 0:

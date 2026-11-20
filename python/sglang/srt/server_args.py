@@ -1033,6 +1033,36 @@ class ServerArgs:
         "Enable the DP-only fault-tolerance control plane.",
         NS("parallel"),
     ] = False
+    enable_ft_request_recovery: A[
+        bool,
+        "Resume supported in-flight text requests after FT scale-down.",
+        NS("parallel"),
+    ] = False
+    ft_request_recovery_timeout: A[
+        float,
+        "Maximum cumulative fault-recovery wait per request, in seconds.",
+        NS("parallel"),
+    ] = 600
+    ft_request_timeout: A[
+        float,
+        "Absolute lifetime of a recoverable request, in seconds.",
+        NS("parallel"),
+    ] = 1800
+    ft_request_recovery_max_retries: A[
+        int,
+        "Maximum additional executions of a recoverable request.",
+        NS("parallel"),
+    ] = 2
+    ft_request_recovery_max_requests: A[
+        int,
+        "Maximum number of CPU request-recovery records.",
+        NS("parallel"),
+    ] = 128
+    ft_request_recovery_max_tokens: A[
+        int,
+        "Maximum reserved input plus output tokens in request recovery.",
+        NS("parallel"),
+    ] = 262144
     fault_tolerance_on_error_strategy: A[
         Literal["pause", "continue"],
         "Fault-tolerance strategy for scheduler exceptions.",
@@ -3801,6 +3831,9 @@ class ServerArgs:
             return
 
     def _handle_fault_tolerance(self):
+        from sglang.srt.fault_tolerance.request_recovery import validate_recovery_config
+
+        validate_recovery_config(self)
         if not self.enable_fault_tolerance:
             return
 
